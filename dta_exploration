@@ -1,0 +1,288 @@
+from pathlib import Path
+import pandas as pd
+import os
+
+# Set data directory paths
+dta_path = Path.home() / "dairc" / "rawdata"
+mri_path = dta_path / "phenotype"
+
+# Set output path
+output_path = os.path.join(os.getcwd(), "output")
+
+# Read participant information and get subject folders
+subs = pd.read_csv(dta_path / "participants.tsv", sep="\t")
+sub_folders = [f for f in dta_path.iterdir() if f.name in subs["participant_id"].values]
+
+## CHECK DATA AVAILABILITY
+# Find files with "fit" in the name
+fit_files = []
+
+for sub_folder in sub_folders[:100]:
+    sub_id = sub_folder.name
+    
+    # Search recursively for files with "fit" in the name
+    for fit_file in sub_folder.rglob("*fit*"):
+        if fit_file.is_file():
+            # Extract timepoint/session from file path
+            parts = fit_file.relative_to(sub_folder).parts
+            timepoint = next((p for p in parts if p.startswith("ses-")), "unknown")
+            
+            fit_files.append({
+                "subject": sub_id,
+                "timepoint": timepoint,
+                "filename": fit_file.name,
+                "filepath": str(fit_file)
+            })
+
+# Convert to DataFrame for easy inspection
+fit_df = pd.DataFrame(fit_files)
+
+# get unique timepoints per subject for fit files
+unique_timepoints = fit_df.groupby("subject")["timepoint"].unique().reset_index()
+print(unique_timepoints)
+
+# Find "scans" files
+scan_files = []
+
+for sub_folder in sub_folders[:100]:
+    sub_id = sub_folder.name
+    
+    # Search recursively for files with "scans" in the name
+    for scan_file in sub_folder.rglob("*scans*"):
+        if scan_file.is_file():
+            # check if "acq_time" column is empty in the file, if so, skip the file
+            temp_file = pd.read_csv(scan_file, sep="\t")
+            if temp_file.empty:
+                continue
+            temp_file["acq_time"] = pd.to_datetime(temp_file["acq_time"], errors="coerce")
+            if temp_file["acq_time"].isna().all():
+                continue
+            # Extract timepoint/session from file path
+            parts = scan_file.relative_to(sub_folder).parts
+            timepoint = next((p for p in parts if p.startswith("ses-")), "unknown")
+            
+            scan_files.append({
+                "subject": sub_id,
+                "timepoint": timepoint,
+                "filename": scan_file.name,
+                "filepath": str(scan_file)
+            })
+# Convert to DataFrame for easy inspection
+scan_df = pd.DataFrame(scan_files)
+
+pd.set_option("display.max_columns", 4)
+pd.set_option("display.max_rows", 10)
+pd.set_option("display.width", 150)
+
+# Get timepoints per subjects with both "fit" and "scans" files
+fit_timepoints = fit_df.groupby("subject")["timepoint"].unique().reset_index()
+scan_timepoints = scan_df.groupby("subject")["timepoint"].unique().reset_index()
+merged_timepoints = pd.merge(fit_timepoints, scan_timepoints, on="subject", how="inner", suffixes=("_fit", "_scan"))
+merged_timepoints["common_timepoints"] = merged_timepoints.apply(lambda row: set(row["timepoint_fit"]) & set(row["timepoint_scan"]), axis=1)
+print(merged_timepoints[["subject", "common_timepoints"]])
+
+# Keep only common fit and scan timepoints for further analysis
+fit_df = fit_df.merge(merged_timepoints[["subject", "common_timepoints"]], left_on="subject", right_on="subject", how="inner")
+fit_df = fit_df[fit_df.apply(lambda row: row["timepoint"] in row["common_timepoints"], axis=1)].drop(columns=["common_timepoints"])
+scan_df = scan_df.merge(merged_timepoints[["subject", "common_timepoints"]], left_on="subject", right_on="subject", how="inner")
+scan_df = scan_df[scan_df.apply(lambda row: row["timepoint"] in row["common_timepoints"], axis=1)].drop(columns=["common_timepoints"])
+
+# check if all subjects contain the same amount of "fit" files per timepoint
+fit_counts = fit_df.groupby(["subject", "timepoint"]).size().reset_index(name="fit_count")
+print(fit_counts[fit_counts["fit_count"] != 7])
+# drop timepoints with incomplete fit data
+incomplete_timepoints = fit_counts[fit_counts["fit_count"] != 7][["subject", "timepoint"]]
+fit_df = fit_df.merge(incomplete_timepoints, on=["subject", "timepoint"], how="left", indicator=True)
+fit_df = fit_df[fit_df["_merge"] == "left_only"].drop(columns=["_merge"])
+scan_df = scan_df.merge(incomplete_timepoints, on=["subject", "timepoint"], how="left", indicator=True)
+scan_df = scan_df[scan_df["_merge"] == "left_only"].drop(columns=["_merge"])
+
+# print how many timepoints are available per subject
+timepoint_counts = fit_df.groupby("subject")["timepoint"].nunique().reset_index(name="timepoint_count")
+print(timepoint_counts)
+# print how many subjects have more than 1 timepoint available
+subjects_multiple_timepoints = timepoint_counts[timepoint_counts["timepoint_count"] > 1]
+print(subjects_multiple_timepoints)
+# extract how many subjects have immediate follow-up timepoints
+
+
+# CHECK DATA QUALITY
+# Check recording duration per subject and timepoint
+fit_df["recording_start"] = None
+fit_df["recording_end"] = None
+fit_df["recording_duration"] = None 
+
+for file in fit_df["filepath"]:
+    temp_file = pd.read_csv(file, sep="\t")
+    if temp_file["Wear_Time"].dtype != "datetime64[ns]":
+        temp_file["Wear_Time"] = pd.to_datetime(temp_file["Wear_Time"])
+    fit_df.loc[fit_df["filepath"] == file, "recording_start"] = temp_file["Wear_Time"].min()
+    fit_df.loc[fit_df["filepath"] == file, "recording_end"] = temp_file["Wear_Time"].max()
+    duration = temp_file["Wear_Time"].max() - temp_file["Wear_Time"].min()
+    fit_df.loc[fit_df["filepath"] == file, "recording_duration"] = duration
+
+# Get wear time duration per subject and timepoint
+wear_time_summary = fit_df.groupby(["subject", "timepoint"])["recording_duration"].agg(["mean"]).reset_index()
+print(wear_time_summary)
+
+# Check time between fit file recordings and MRI sessions
+# Get session information per subject per timepoint
+scan_df["mri_date"] = None
+
+for file in scan_df["filepath"]:
+    temp_file = pd.read_csv(file, sep="\t")
+    if temp_file["acq_time"].dtype != "datetime64[ns]":
+        temp_file["acq_time"] = pd.to_datetime(temp_file["acq_time"])
+    mri_date = temp_file["acq_time"].min()
+    scan_df.loc[(scan_df["subject"] == scan_df.loc[scan_df["filepath"] == file, "subject"].values[0]) & 
+                (scan_df["timepoint"] == scan_df.loc[scan_df["filepath"] == file, "timepoint"].values[0]), "mri_date"] = mri_date
+    fit_df.loc[(fit_df["subject"] == scan_df.loc[scan_df["filepath"] == file, "subject"].values[0]) & 
+                (fit_df["timepoint"] == scan_df.loc[scan_df["filepath"] == file, "timepoint"].values[0]), "mri_date"] = mri_date
+
+print(fit_df[["subject", "timepoint", "recording_start", "recording_end", "mri_date"]])
+fit_df["time_to_mri"] = fit_df["mri_date"] - fit_df["recording_start"] 
+print(fit_df.groupby(["subject", "timepoint"])["time_to_mri"].mean())
+
+# extract recording start, end and mri calendar dates per subject and timepoint
+fit_df["recording_start"] = pd.to_datetime(fit_df["recording_start"], errors="coerce")
+fit_df["recording_end"] = pd.to_datetime(fit_df["recording_end"], errors="coerce")
+fit_df["mri_date"] = pd.to_datetime(fit_df["mri_date"], errors="coerce")
+fit_df["recording_start_date"] = fit_df["recording_start"].dt.date
+fit_df["recording_end_date"] = fit_df["recording_end"].dt.date
+fit_df["mri_date_date"] = fit_df["mri_date"].dt.date
+
+# check if recording start and end dates are consistent within subjects and timepoints
+if fit_df.groupby(["subject", "timepoint"])["recording_start_date"].nunique().max() > 1:
+    print("Inconsistent recording start dates found.")
+if fit_df.groupby(["subject", "timepoint"])["recording_end_date"].nunique().max() > 1:
+    print("Inconsistent recording end dates found.")
+
+# ------------------------------------------------------------------
+# ---- Exploratory analysis into recording duration missmatches ----
+# ------------------------------------------------------------------
+# get difference between max and min recording start and end times per subject and timepoint
+fit_df["recording_start_diff"] = fit_df.groupby(["subject", "timepoint"])["recording_start"].transform(lambda x: (x.max() - x.min()).total_seconds() / 3600)
+fit_df["recording_end_diff"] = fit_df.groupby(["subject", "timepoint"])["recording_end"].transform(lambda x: (x.max() - x.min()).total_seconds() / 3600)
+recording_diff = fit_df.groupby(["subject", "timepoint"])[["recording_start_diff", "recording_end_diff"]].max().reset_index()
+print(recording_diff)
+
+# get difference between max and min recording start and end dates per subject and timepoint
+fit_df["recording_start_date_diff"] = fit_df.groupby(["subject", "timepoint"])["recording_start_date"].transform(lambda x: (x.max() - x.min()).days)
+fit_df["recording_end_date_diff"] = fit_df.groupby(["subject", "timepoint"])["recording_end_date"].transform(lambda x: (x.max() - x.min()).days)
+recording_diff = fit_df.groupby(["subject", "timepoint"])[["recording_start_date_diff", "recording_end_date_diff"]].max().reset_index()
+print(recording_diff)
+
+# keep datetime dtype
+fit_df["recording_start"] = pd.to_datetime(fit_df["recording_start"], errors="coerce")
+fit_df["recording_end"] = pd.to_datetime(fit_df["recording_end"], errors="coerce")
+
+# Timedelta per subject/timepoint
+fit_df["recording_start_diff"] = fit_df.groupby(
+    ["subject", "timepoint"]
+)["recording_start"].transform(lambda x: x.max() - x.min())
+
+fit_df["recording_end_diff"] = fit_df.groupby(
+    ["subject", "timepoint"]
+)["recording_end"].transform(lambda x: x.max() - x.min())
+
+recording_diff = fit_df.groupby(["subject", "timepoint"])[
+    ["recording_start_diff", "recording_end_diff"]
+].max().reset_index()
+
+print(recording_diff)
+
+# create subset of fit_df without "slp" files for further analysis
+fit_df_wake = fit_df[~fit_df["filename"].str.contains("slp", case=False)]
+
+# check if recording start and end times are consistent within subjects and timepoints for wake files
+if fit_df_wake.groupby(["subject", "timepoint"])["recording_start_date"].nunique().max() > 1:
+    print("Inconsistent recording start times found in wake files.")
+else:    print("Recording start times are consistent in wake files.")   
+if fit_df_wake.groupby(["subject", "timepoint"])["recording_end_date"].nunique().max() > 1:
+    print("Inconsistent recording end times found in wake files.")
+else:    print("Recording end times are consistent in wake files.")
+
+# get filenames of fit files with max recording duration per subject and timetpoints
+fit_df_wake["max_recording_duration"] = fit_df_wake.groupby(["subject", "timepoint"])["recording_duration"].transform("max")
+fit_df_wake["max_recording_duration_file"] = fit_df_wake.apply(lambda row: row["filename"] if row["recording_duration"] == row["max_recording_duration"] else None, axis=1)
+max_recording_duration_files = fit_df_wake.groupby(["subject", "timepoint"])["max_recording_duration_file"].reset_index()
+print(max_recording_duration_files)
+
+# get difference between max and min recording duration per subject and timepoint
+fit_df["recording_duration_diff"] = fit_df.groupby(["subject", "timepoint"])["recording_duration"].transform(lambda x: x.max() - x.min())
+recording_duration_diff = fit_df.groupby(["subject", "timepoint"])["recording_duration_diff"].max().reset_index()
+print(recording_duration_diff)
+
+# get names of fit files that deviate from the min recording duration by subject and timepoint
+fit_df["min_recording_duration"] = fit_df.groupby(["subject", "timepoint"])["recording_duration"].transform("min")
+fit_df["deviating_recording_duration_file"] = fit_df.apply(lambda row: row["filename"] if row["recording_duration"] != row["min_recording_duration"] else None, axis=1)
+
+# Collect deviating filenames per group as a list
+deviating_recording_duration_files = fit_df[fit_df["deviating_recording_duration_file"].notna()].groupby(["subject", "timepoint"])["deviating_recording_duration_file"].apply(list).reset_index()
+deviating_recording_duration_files.rename(columns={"deviating_recording_duration_file": "deviating_files"}, inplace=True)
+print(deviating_recording_duration_files)
+deviating_recording_duration_files["count"] = deviating_recording_duration_files["deviating_files"].apply(len)
+# print subjects and timepoints and count of deviating files
+print(deviating_recording_duration_files[["subject", "timepoint", "count"]])
+
+# get names of fit files that deviate from the max recording duration by subject and timepoint
+fit_df["max_recording_duration"] = fit_df.groupby(["subject", "timepoint"])["recording_duration"].transform("max")
+fit_df["deviating_recording_duration_file_max"] = fit_df.apply(lambda row: row["filename"] if row["recording_duration"] != row["max_recording_duration"] else None, axis=1)
+# Collect deviating filenames per group as a list
+deviating_recording_duration_files_max = fit_df[fit_df["deviating_recording_duration_file_max"].notna()].groupby(["subject", "timepoint"])["deviating_recording_duration_file_max"].apply(list).reset_index()
+deviating_recording_duration_files_max.rename(columns={"deviating_recording_duration_file_max": "deviating_files_max"}, inplace=True)
+print(deviating_recording_duration_files_max)
+# print subjects and timepoints and count of deviating files
+deviating_recording_duration_files_max["count"] = deviating_recording_duration_files_max["deviating_files_max"].apply(len)
+print(deviating_recording_duration_files_max[["subject", "timepoint", "count"]])
+
+# print file names with minimum recording duration per subject and timepoint
+min_recording_duration_files = fit_df.groupby(["subject", "timepoint"])["filename"].apply(lambda x: x[fit_df.loc[x.index, "recording_duration"] == fit_df.loc[x.index, "recording_duration"].min()]).reset_index()
+min_recording_duration_files.rename(columns={"filename": "min_recording_duration_file"}, inplace=True)
+print(min_recording_duration_files)
+
+# print file names with maximum recording duration per subject and timepoint
+max_recording_duration_files = fit_df.groupby(["subject", "timepoint"])["filename"].apply(lambda x: x[fit_df.loc[x.index, "recording_duration"] == fit_df.loc[x.index, "recording_duration"].max()]).reset_index()
+max_recording_duration_files.rename(columns={"filename": "max_recording_duration_file"}, inplace=True)
+print(max_recording_duration_files)
+# print number of files with maximum recording duration per subject and timepoint
+max_recording_duration_files["count"] = max_recording_duration_files.groupby(["subject", "timepoint"])["max_recording_duration_file"].transform("count")
+print(max_recording_duration_files[["subject", "timepoint", "count"]])
+# when number of files with maximum recording duration is equal to 4, print the file names
+print(max_recording_duration_files[max_recording_duration_files["count"] == 4][["subject", "timepoint", "max_recording_duration_file"]])
+# when number of files with maximum recording duration is greater than 4, print the file names
+print(max_recording_duration_files[max_recording_duration_files["count"] > 4][["subject", "timepoint", "max_recording_duration_file"]])
+# when number of files with maximum recording duration is less than 4, print the file names
+print(max_recording_duration_files[max_recording_duration_files["count"] < 4][["subject", "timepoint", "max_recording_duration_file"]])
+
+
+'''
+Explanation for duration missmatch:
+- Cal1m, Int1m, METs1m, and Stps1m ("O") contain data for the entire recording duration (max. duration)
+    => same data foundation
+- HR1m contains less data (why is unknown atp)
+- Slp1m and Slp30s ("X") contain only a subset of the recording duration. 
+    Hypothesis: subjects took the watch off during the night to charge. Since these files only contain data, 
+    when sleep was detected, continuously not wearing the watch during the night either at the beginning or end
+    of recording would lead to late/early start and end times 
+Note: Duration was calculated as the difference between start and end datetime of the recording file. 
+Therefore, missingness or jumps in time (in the cases of slp files) do not affect the duration in this case
+'''
+
+# create summary table per subject per timepoint
+summary_table = fit_df.groupby(["subject", "timepoint"]).agg(
+    recording_start_min=("recording_start", "min"),
+    recording_start_max=("recording_start", "max"),
+    recording_start_diff=("recording_start_diff", "max"),
+    recording_end_min=("recording_end", "min"),
+    recording_end_max=("recording_end", "max"),
+    recording_end_diff=("recording_end_diff", "max"),
+    recording_duration_min=("recording_duration", "min"),
+    recording_duration_max=("recording_duration", "max"),
+    recording_duration_diff=("recording_duration_diff", "max"),
+    mri_date=("mri_date_date", "first"),
+    time_to_mri_O=("time_to_mri", "max"),
+    time_to_mri_X=("time_to_mri", "min")
+).reset_index()
+# save summary table to output directory
+summary_table.to_csv(os.path.join(output_path, "fit_scan_summary.csv"), index=False)
