@@ -14,6 +14,10 @@ subs = pd.read_csv(dta_path / "participants.tsv", sep="\t")
 sub_folders = [f for f in dta_path.iterdir() if f.name in subs["participant_id"].values]
 
 ## CHECK DATA AVAILABILITY
+
+n_toal_subs = len(sub_folders)
+print(f"Total number of subjects: {n_toal_subs}")
+
 # Find files with "fit" in the name
 fit_files = []
 
@@ -40,6 +44,10 @@ fit_df = pd.DataFrame(fit_files)
 # get unique timepoints per subject for fit files
 unique_timepoints = fit_df.groupby("subject")["timepoint"].unique().reset_index()
 print(unique_timepoints)
+
+n_fit_subs = fit_df["subject"].nunique()
+print(f"Number of subjects with 'fit' files: {n_fit_subs}")
+print(f"Average number of timepoints per subject with 'fit' files: {fit_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
 # Find "scans" files
 scan_files = []
@@ -70,6 +78,9 @@ for sub_folder in sub_folders[:100]:
 # Convert to DataFrame for easy inspection
 scan_df = pd.DataFrame(scan_files)
 
+print(f"Number of subjects with 'scans' files: {scan_df['subject'].nunique()}")
+print(f"Average number of timepoints per subject with 'scans' files: {scan_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+
 pd.set_option("display.max_columns", 4)
 pd.set_option("display.max_rows", 10)
 pd.set_option("display.width", 150)
@@ -97,12 +108,13 @@ fit_df = fit_df[fit_df["_merge"] == "left_only"].drop(columns=["_merge"])
 scan_df = scan_df.merge(incomplete_timepoints, on=["subject", "timepoint"], how="left", indicator=True)
 scan_df = scan_df[scan_df["_merge"] == "left_only"].drop(columns=["_merge"])
 
+print(f"Number of subjects with both 'fit' and 'scans' files: {fit_df['subject'].nunique()}")
 # print how many timepoints are available per subject
 timepoint_counts = fit_df.groupby("subject")["timepoint"].nunique().reset_index(name="timepoint_count")
-print(timepoint_counts)
+print(f"Timepoint counts per subject:\n{timepoint_counts}")
 # print how many subjects have more than 1 timepoint available
 subjects_multiple_timepoints = timepoint_counts[timepoint_counts["timepoint_count"] > 1]
-print(subjects_multiple_timepoints)
+print(f"Subjects with multiple timepoints:\n{subjects_multiple_timepoints}")
 # extract how many subjects have immediate follow-up timepoints
 
 
@@ -268,6 +280,31 @@ Explanation for duration missmatch:
 Note: Duration was calculated as the difference between start and end datetime of the recording file. 
 Therefore, missingness or jumps in time (in the cases of slp files) do not affect the duration in this case
 '''
+# ---------------------------------
+# ---- DEMOGRAPHIC INFORMATION ----
+# ---------------------------------
+
+# Get list of included subjects
+included_subjects = fit_df["subject"].unique()
+
+# import static demographic information
+stc_df = pd.read_csv(mri_path / "ab_g_stc.tsv", sep="\t")
+
+# create dataframe with sex and date of birth for included subjects
+demo_df = subs[subs["participant_id"].isin(included_subjects)][["participant_id", "sex"]].merge(
+    stc_df[stc_df["participant_id"].isin(included_subjects)][["participant_id", "ab_g_stc__cohort_dob"]],
+    on="participant_id",
+    how="left"
+)
+demo_df.rename(columns={"ab_g_stc__cohort_dob": "date_of_birth"}, inplace=True)
+print(demo_df)
+
+# add age at MRI scan (rounded to nearest year) per subject and timepoint to fit_df
+fit_df = fit_df.merge(demo_df, left_on="subject", right_on="participant_id", how="left")
+fit_df["date_of_birth"] = pd.to_datetime(fit_df["date_of_birth"], errors="coerce")
+fit_df["age_at_mri"] = (fit_df["mri_date"] - fit_df["date_of_birth"]).dt.days / 365.25
+fit_df["age_at_mri"] = fit_df["age_at_mri"].round()
+print(fit_df[["subject", "timepoint", "age_at_mri"]])
 
 # create summary table per subject per timepoint
 summary_table = fit_df.groupby(["subject", "timepoint"]).agg(
@@ -281,6 +318,7 @@ summary_table = fit_df.groupby(["subject", "timepoint"]).agg(
     recording_duration_max=("recording_duration", "max"),
     recording_duration_diff=("recording_duration_diff", "max"),
     mri_date=("mri_date_date", "first"),
+    age_at_mri=("age_at_mri", "min"),
     time_to_mri_O=("time_to_mri", "max"),
     time_to_mri_X=("time_to_mri", "min")
 ).reset_index()
