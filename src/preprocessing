@@ -1,0 +1,203 @@
+import pandas as pd
+
+# ---------------------
+# ---- IMPORT DATA ----
+# ---------------------
+
+def import_data(dta_path):
+    '''
+    Imports Demographic, Fitbit and MRI data from the ABCD dataset with first filters:
+    - Only subjects with both "fit" and "scans" files are included (=> subjects with both Fitbit and MRI data)
+    - Only timepoints/sessions with both "fit" and "scans" files are included (=> timepoints/sessions with both Fitbit and MRI data)
+
+    Parameters:
+    dta_path (Path): Path to the raw data directory
+    Returns:
+    dta_df (DataFrame): A DataFrame containing demographic, fitbit and MRI data for subjects and time points selected based on filter criteria
+    Creates the following files in the output directory:
+    subj_overview.txt: A text file containing an overview of the number of subjects and timepoints/sessions with both Fitbit and MRI data
+
+    Note:
+    - "fit" files contain fitbit data. Multiple fitbit files exist containing different types of data:
+        - Cal1m: calories measured in 1 minute intervals
+        - Int1m: intensity measured in 1 minute intervals
+        - Stps1m: steps measured in 1 minute intervals
+            => These files always are the same length 
+        - HR1m: heart rate measured in 1 minute intervals
+            => These files are often shorter than the other fitbit files (Reason unknown)
+        - Slp1m: sleep detection measured in 1 minute intervals (1 = asleep, 2 = restless, 3 = awake)
+        - Slp30s: sleep stage estimates with wake indices in 30s intervals (See ABCD data release 6.0 documentation for more details)
+            => These files are typically the shortest. Probably because participants took off the watch during the night to charge.
+            Since these files only contain data during the night, not wearing the watch at night at the start or end of recording, 
+            ends the files at an earlier date
+    '''
+    # Read participant information and get subject folders
+    subs = pd.read_csv(dta_path / "participants.tsv", sep="\t")
+    sub_folders = [f for f in dta_path.iterdir() if f.name in subs["participant_id"].values]
+
+    ## ---- CHECK DATA AVAILABILITY ----
+    print("Checking data availability...")
+
+    n_total_subs = len(sub_folders)
+    print(f"Total number of subjects made available: {n_total_subs}")
+
+    # GET "fit" FILES
+
+    # Find files with "fit" in the name
+    fit_files = []
+
+    for sub_folder in sub_folders[:100]:
+        sub_id = sub_folder.name
+        
+        # Search recursively for files with "fit" in the name
+        for fit_file in sub_folder.rglob("*fit*"):
+            if fit_file.is_file():
+                # Extract timepoint/session from file path
+                parts = fit_file.relative_to(sub_folder).parts
+                timepoint = next((p for p in parts if p.startswith("ses-")), "unknown")
+                
+                fit_files.append({
+                    "subject": sub_id,
+                    "timepoint": timepoint,
+                    "filename": fit_file.name,
+                    "filepath": str(fit_file)
+                })
+
+    # Convert to DataFrame for easy inspection
+    fit_df = pd.DataFrame(fit_files)
+
+    # get unique timepoints per subject for fit files
+    unique_timepoints = fit_df.groupby("subject")["timepoint"].unique().reset_index()
+    print(unique_timepoints)
+
+    n_fit_subs = fit_df["subject"].nunique()
+    print(f"Number of subjects with fitbit data: {n_fit_subs}")
+    print(f"Average number of timepoints per subject with fitbit data: {fit_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+
+    # check if all subjects contain the same amount of "fit" files per timepoint
+    fit_counts = fit_df.groupby(["subject", "timepoint"]).size().reset_index(name="fit_count")
+    # drop timepoints with incomplete fit data
+    incomplete_timepoints = fit_counts[fit_counts["fit_count"] != 7][["subject", "timepoint"]]
+    fit_df = fit_df.merge(incomplete_timepoints, on=["subject", "timepoint"], how="left", indicator=True)
+    fit_df = fit_df[fit_df["_merge"] == "left_only"].drop(columns=["_merge"])
+    scan_df = scan_df.merge(incomplete_timepoints, on=["subject", "timepoint"], how="left", indicator=True)
+    scan_df = scan_df[scan_df["_merge"] == "left_only"].drop(columns=["_merge"])
+    print(f"Dropped {len(incomplete_timepoints)} timepoints with incomplete fit data.")
+    print(f"Average number of timepoints per subject with fitbit data after dropping incomplete timepoints: {fit_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+
+    # GET "scans" FILES
+
+    # Find "scans" files
+    scan_files = []
+
+    for sub_folder in sub_folders[:100]:
+        sub_id = sub_folder.name
+        
+        # Search recursively for files with "scans" in the name
+        for scan_file in sub_folder.rglob("*scans*"):
+            if scan_file.is_file():
+                # check if "acq_time" column is empty in the file, if so, skip the file
+                temp_file = pd.read_csv(scan_file, sep="\t")
+                if temp_file.empty:
+                    continue
+                temp_file["acq_time"] = pd.to_datetime(temp_file["acq_time"], errors="coerce")
+                if temp_file["acq_time"].isna().all():
+                    continue
+                # Extract timepoint/session from file path
+                parts = scan_file.relative_to(sub_folder).parts
+                timepoint = next((p for p in parts if p.startswith("ses-")), "unknown")
+                
+                scan_files.append({
+                    "subject": sub_id,
+                    "timepoint": timepoint,
+                    "filename": scan_file.name,
+                    "filepath": str(scan_file)
+                })
+    # Convert to DataFrame for easy inspection
+    scan_df = pd.DataFrame(scan_files)
+
+    print(f"Number of subjects with 'scans' files: {scan_df['subject'].nunique()}")
+    print(f"Average number of timepoints per subject with 'scans' files: {scan_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+
+    # Get timepoints per subjects with both "fit" and "scans" files
+    fit_timepoints = fit_df.groupby("subject")["timepoint"].unique().reset_index()
+    scan_timepoints = scan_df.groupby("subject")["timepoint"].unique().reset_index()
+    merged_timepoints = pd.merge(fit_timepoints, scan_timepoints, on="subject", how="inner", suffixes=("_fit", "_scan"))
+    merged_timepoints["common_timepoints"] = merged_timepoints.apply(lambda row: set(row["timepoint_fit"]) & set(row["timepoint_scan"]), axis=1)
+
+    # Keep only common fit and scan timepoints for further analysis
+    fit_df = fit_df.merge(merged_timepoints[["subject", "common_timepoints"]], left_on="subject", right_on="subject", how="inner")
+    fit_df = fit_df[fit_df.apply(lambda row: row["timepoint"] in row["common_timepoints"], axis=1)].drop(columns=["common_timepoints"])
+    scan_df = scan_df.merge(merged_timepoints[["subject", "common_timepoints"]], left_on="subject", right_on="subject", how="inner")
+    scan_df = scan_df[scan_df.apply(lambda row: row["timepoint"] in row["common_timepoints"], axis=1)].drop(columns=["common_timepoints"])
+    print(f"Number of subjects with both 'fit' and 'scans' files: {fit_df['subject'].nunique()}")
+    print(f"Average number of common timepoints per subject with both 'fit' and 'scans' files: {fit_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+
+    # Get subjects with multiple timepoints/sessions with both "fit" and "scans" files
+    timepoint_counts = fit_df.groupby("subject")["timepoint"].nunique().reset_index(name="timepoint_count")
+    subjects_multiple_timepoints = timepoint_counts[timepoint_counts["timepoint_count"] > 1]
+    print(f"Subjects with multiple timepoints:\n{subjects_multiple_timepoints}")
+
+    # Get subjects with immediate follow-up timepoints (e.g., ses-01A and ses-02A)
+    def has_immediate_followup(timepoints):
+        timepoint_numbers = [int(tp.split("-")[1][:-1]) for tp in timepoints if tp.startswith("ses-")]
+        timepoint_numbers.sort()
+        return any((n2 - n1 == 1) for n1, n2 in zip(timepoint_numbers, timepoint_numbers[1:]))
+    subjects_immediate_followup = merged_timepoints[merged_timepoints["common_timepoints"].apply(has_immediate_followup)]
+    print(f"Subjects with immediate follow-up timepoints:\n{subjects_immediate_followup[['subject', 'common_timepoints']]}")
+
+    # ---- IMPORT DATA ----
+    print("Importing data for selected subjects...")
+    # GET DEMOGRAPHIC DATA
+
+    # Create dta_df with subject and time point information from fit_df
+    dta_df = fit_df[["subject", "timepoint"]].drop_duplicates().reset_index(drop=True)
+
+    # Get list of included subjects
+    included_subjects = dta_df["subject"].unique()
+
+    # import static demographic information
+    mri_path = dta_path / "phenotype"
+    stc_df = pd.read_csv(mri_path / "ab_g_stc.tsv", sep="\t")
+
+    # create dataframe with sex and date of birth for included subjects
+    demo_df = subs[subs["participant_id"].isin(included_subjects)][["participant_id", "sex"]].merge(
+        stc_df[stc_df["participant_id"].isin(included_subjects)][["participant_id", "ab_g_stc__cohort_dob"]],
+        on="participant_id",
+        how="left"
+    )
+    demo_df.rename(columns={"ab_g_stc__cohort_dob": "date_of_birth"}, inplace=True)
+    print(demo_df)
+
+    # add sex and age at MRI scan (rounded to nearest year) per subject and timepoint to dta_df
+    dta_df = dta_df.merge(demo_df, left_on="subject", right_on="participant_id", how="left")
+    dta_df["date_of_birth"] = pd.to_datetime(dta_df["date_of_birth"], errors="coerce")
+    dta_df["age_at_mri"] = (dta_df["mri_date"] - dta_df["date_of_birth"]).dt.days / 365.25
+    dta_df["age_at_mri"] = dta_df["age_at_mri"].round()
+    print(dta_df[["subject", "timepoint", "sex", "age_at_mri"]])
+
+    # GET NEUROIMAGING DATA
+    # Define tabular MRI data files to import
+    mri_files = list("mr_y_dti__fs__fa__at.tsv", # DTI (Full shell) - Fractional Anisotropy (AtlasTrack) [Youth]
+                     "mr_y_smri__vol__aseg.tsv", # sMRI - Volume (Subcortical) [Youth]
+                     "mr_y_rsfmri__corr__gpnet.tsv", # Resting State fMRI - Correlations (Gordon network) [Youth] 
+                     "mr_y_rsfmri__corr__gpnet__aseg.tsv" # Resting State fMRI - Correlations (Gordon network to Subcortical) [Youth]
+                     )  # Add more files as needed
+
+    # Define MRI ROIs as dictionary with variale names and descriptions
+    mri_rois = {
+        "mr_y_dti__fs__fa__atmr_y_dti__fs__fa__at__cc_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Corpus callosum",
+        "mr_y_smri__vol__dst__gsca__lh_sum":"Total volume of Destrieux ROI: Anterior part of the cingulate gyrus and sulcus (Left hemisphere)",
+        "mr_y_smri__vol__dst__gsca__rh_sum":"Total volume of Destrieux ROI: Anterior part of the cingulate gyrus and sulcus (Right hemisphere)"
+        # Add more ROIs and descriptions as needed
+    }
+
+    # Get tabular MRI data from mri_path
+    for mri_file in mri_files:
+        temp_df = pd.read_csv(mri_path / mri_file, sep="\t")
+        temp_df = temp_df[temp_df["participant_id"].isin(included_subjects)]
+        # Only keep ROIs defined in mri_rois
+        temp_df = temp_df[["participant_id"] + [col for col in temp_df.columns if col in mri_rois.keys()]]
+        # Merge MRI data with dta_df
+        dta_df = dta_df.merge(temp_df, left_on="subject", right_on="participant_id", how="left").drop(columns=["participant_id"])
+        
