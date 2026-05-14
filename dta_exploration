@@ -299,15 +299,16 @@ demo_df = subs[subs["participant_id"].isin(included_subjects)][["participant_id"
 demo_df.rename(columns={"ab_g_stc__cohort_dob": "date_of_birth"}, inplace=True)
 print(demo_df)
 
-# add age at MRI scan (rounded to nearest year) per subject and timepoint to fit_df
+# add sex and age at MRI scan (rounded to nearest year) per subject and timepoint to fit_df
 fit_df = fit_df.merge(demo_df, left_on="subject", right_on="participant_id", how="left")
 fit_df["date_of_birth"] = pd.to_datetime(fit_df["date_of_birth"], errors="coerce")
 fit_df["age_at_mri"] = (fit_df["mri_date"] - fit_df["date_of_birth"]).dt.days / 365.25
 fit_df["age_at_mri"] = fit_df["age_at_mri"].round()
-print(fit_df[["subject", "timepoint", "age_at_mri"]])
+print(fit_df[["subject", "timepoint", "sex", "age_at_mri"]])
 
 # create summary table per subject per timepoint
 summary_table = fit_df.groupby(["subject", "timepoint"]).agg(
+    sex=("sex", "first"),
     recording_start_min=("recording_start", "min"),
     recording_start_max=("recording_start", "max"),
     recording_start_diff=("recording_start_diff", "max"),
@@ -324,3 +325,9 @@ summary_table = fit_df.groupby(["subject", "timepoint"]).agg(
 ).reset_index()
 # save summary table to output directory
 summary_table.to_csv(os.path.join(output_path, "fit_scan_summary.csv"), index=False)
+
+# ---------------------------
+# ---- MRI DATA ANALYSIS ----
+# ---------------------------
+
+

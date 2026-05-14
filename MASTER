@@ -1,0 +1,9 @@
+from pathlib import Path
+import pandas as pd
+import os
+
+# Set data directory paths
+dta_path = Path.home() / "dairc" / "rawdata"
+
+# Set output path
+output_path = os.path.join(os.getcwd(), "output")
