@@ -1,24 +1,29 @@
 import pandas as pd
+from pathlib import Path
+import os
 
-# ---------------------
-# ---- IMPORT DATA ----
-# ---------------------
+# ------------------------
+# ---- DATA WRANGLING ----
+# ------------------------
 
-def import_data(dta_path):
+def select_subjects(dta_path, test=False):
     '''
-    Imports Demographic, Fitbit and MRI data from the ABCD dataset with first filters:
-    - Only subjects with both "fit" and "scans" files are included (=> subjects with both Fitbit and MRI data)
-    - Only timepoints/sessions with both "fit" and "scans" files are included (=> timepoints/sessions with both Fitbit and MRI data)
+    This function selects subjects and time points based on selection criteria (below) and extracts demographic and meta information for fitbit and mri data
+        - Only subjects with both "fit" and "scans" files are included (=> subjects with both Fitbit and MRI data)
+        - Only timepoints/sessions with both "fit" and "scans" files are included (=> timepoints/sessions with both Fitbit and MRI data)
+        - Only subjects/sessions with complete "fit" data (i.e., all 7 "fit" files present) are included (=> complete Fitbit data for included subjects/sessions)
+        - Only "scans" files with non-empty "acq_time" column are included (=> valid MRI acquisition date for included sessions)
+        - Only subjects/timepoints with more than 7 days of Fitbit data are included (=> sufficient Fitbit data for included sessions)
 
     Parameters:
-    dta_path (Path): Path to the raw data directory
+        dta_path (Path): Path to the raw data directory
     Returns:
-    dta_df (DataFrame): A DataFrame containing demographic, fitbit and MRI data for subjects and time points selected based on filter criteria
-    Creates the following files in the output directory:
-    subj_overview.txt: A text file containing an overview of the number of subjects and timepoints/sessions with both Fitbit and MRI data
+        demo_df (DataFrame): DataFrame containing demographic data for included subjects (sex, age)
+        mri_meta_df (DataFrame): DataFrame containing MRI date and  age at MRI scan for included subjects and timepoints/sessions
+        fit_meta_df (DataFrame): DataFrame containing filepaths for Fitbit data for included subjects and timepoints/sessions
 
     Note:
-    - "fit" files contain fitbit data. Multiple fitbit files exist containing different types of data:
+        "fit" files contain fitbit data. Multiple fitbit files exist containing different types of data:
         - Cal1m: calories measured in 1 minute intervals
         - Int1m: intensity measured in 1 minute intervals
         - Stps1m: steps measured in 1 minute intervals
@@ -34,19 +39,18 @@ def import_data(dta_path):
     # Read participant information and get subject folders
     subs = pd.read_csv(dta_path / "participants.tsv", sep="\t")
     sub_folders = [f for f in dta_path.iterdir() if f.name in subs["participant_id"].values]
-
-    ## ---- CHECK DATA AVAILABILITY ----
-    print("Checking data availability...")
+    if test:
+        sub_folders = sub_folders[:10] # Use only first 10 subjects for testing
 
     n_total_subs = len(sub_folders)
     print(f"Total number of subjects made available: {n_total_subs}")
 
-    # GET "fit" FILES
+    # GET FITBIT METADATA
 
     # Find files with "fit" in the name
     fit_files = []
 
-    for sub_folder in sub_folders[:100]:
+    for sub_folder in sub_folders:
         sub_id = sub_folder.name
         
         # Search recursively for files with "fit" in the name
@@ -64,33 +68,37 @@ def import_data(dta_path):
                 })
 
     # Convert to DataFrame for easy inspection
-    fit_df = pd.DataFrame(fit_files)
+    fit_meta_df = pd.DataFrame(fit_files)
 
     # get unique timepoints per subject for fit files
-    unique_timepoints = fit_df.groupby("subject")["timepoint"].unique().reset_index()
-    print(unique_timepoints)
-
-    n_fit_subs = fit_df["subject"].nunique()
+    n_fit_subs = fit_meta_df["subject"].nunique()
     print(f"Number of subjects with fitbit data: {n_fit_subs}")
-    print(f"Average number of timepoints per subject with fitbit data: {fit_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+    print(f"Average number of timepoints per subject with fitbit data: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
     # check if all subjects contain the same amount of "fit" files per timepoint
-    fit_counts = fit_df.groupby(["subject", "timepoint"]).size().reset_index(name="fit_count")
+    fit_counts = fit_meta_df.groupby(["subject", "timepoint"]).size().reset_index(name="fit_count")
+
     # drop timepoints with incomplete fit data
     incomplete_timepoints = fit_counts[fit_counts["fit_count"] != 7][["subject", "timepoint"]]
-    fit_df = fit_df.merge(incomplete_timepoints, on=["subject", "timepoint"], how="left", indicator=True)
-    fit_df = fit_df[fit_df["_merge"] == "left_only"].drop(columns=["_merge"])
-    scan_df = scan_df.merge(incomplete_timepoints, on=["subject", "timepoint"], how="left", indicator=True)
-    scan_df = scan_df[scan_df["_merge"] == "left_only"].drop(columns=["_merge"])
+    fit_meta_df = fit_meta_df.merge(incomplete_timepoints, on=["subject", "timepoint"], how="left", indicator=True)
+    fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
     print(f"Dropped {len(incomplete_timepoints)} timepoints with incomplete fit data.")
-    print(f"Average number of timepoints per subject with fitbit data after dropping incomplete timepoints: {fit_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+    print(f"Average number of timepoints per subject with fitbit data after dropping incomplete timepoints: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
-    # GET "scans" FILES
+    # get recording duration in days for each fit file and drop timepoints with less than 7 days of data
+    fit_meta_df["recording_duration_days"] = fit_meta_df["filepath"].apply(lambda x: (pd.to_datetime(pd.read_csv(x, sep="\t")["time"].max()) - pd.to_datetime(pd.read_csv(x, sep="\t")["time"].min())).days)
+    short_recordings = fit_meta_df[fit_meta_df["recording_duration_days"] < 7][["subject", "timepoint"]].drop_duplicates()
+    fit_meta_df = fit_meta_df.merge(short_recordings, on=["subject", "timepoint"], how="left", indicator=True)
+    fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
+    print(f"Dropped {len(short_recordings)} timepoints with less than 7 days of fitbit data.")
+    print(f"Average number of timepoints per subject with fitbit data after dropping short recordings: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+
+    # GET MRI METADATA
 
     # Find "scans" files
     scan_files = []
 
-    for sub_folder in sub_folders[:100]:
+    for sub_folder in sub_folders:
         sub_id = sub_folder.name
         
         # Search recursively for files with "scans" in the name
@@ -114,27 +122,28 @@ def import_data(dta_path):
                     "filepath": str(scan_file)
                 })
     # Convert to DataFrame for easy inspection
-    scan_df = pd.DataFrame(scan_files)
+    mri_meta_df = pd.DataFrame(scan_files)
+    print(mri_meta_df.columns)
 
-    print(f"Number of subjects with 'scans' files: {scan_df['subject'].nunique()}")
-    print(f"Average number of timepoints per subject with 'scans' files: {scan_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+    print(f"Number of subjects with 'scans' files: {mri_meta_df['subject'].nunique()}")
+    print(f"Average number of timepoints per subject with 'scans' files: {mri_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
     # Get timepoints per subjects with both "fit" and "scans" files
-    fit_timepoints = fit_df.groupby("subject")["timepoint"].unique().reset_index()
-    scan_timepoints = scan_df.groupby("subject")["timepoint"].unique().reset_index()
+    fit_timepoints = fit_meta_df.groupby("subject")["timepoint"].unique().reset_index()
+    scan_timepoints = mri_meta_df.groupby("subject")["timepoint"].unique().reset_index()
     merged_timepoints = pd.merge(fit_timepoints, scan_timepoints, on="subject", how="inner", suffixes=("_fit", "_scan"))
     merged_timepoints["common_timepoints"] = merged_timepoints.apply(lambda row: set(row["timepoint_fit"]) & set(row["timepoint_scan"]), axis=1)
 
     # Keep only common fit and scan timepoints for further analysis
-    fit_df = fit_df.merge(merged_timepoints[["subject", "common_timepoints"]], left_on="subject", right_on="subject", how="inner")
-    fit_df = fit_df[fit_df.apply(lambda row: row["timepoint"] in row["common_timepoints"], axis=1)].drop(columns=["common_timepoints"])
-    scan_df = scan_df.merge(merged_timepoints[["subject", "common_timepoints"]], left_on="subject", right_on="subject", how="inner")
-    scan_df = scan_df[scan_df.apply(lambda row: row["timepoint"] in row["common_timepoints"], axis=1)].drop(columns=["common_timepoints"])
-    print(f"Number of subjects with both 'fit' and 'scans' files: {fit_df['subject'].nunique()}")
-    print(f"Average number of common timepoints per subject with both 'fit' and 'scans' files: {fit_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+    fit_meta_df = fit_meta_df.merge(merged_timepoints[["subject", "common_timepoints"]], left_on="subject", right_on="subject", how="inner")
+    fit_meta_df = fit_meta_df[fit_meta_df.apply(lambda row: row["timepoint"] in row["common_timepoints"], axis=1)].drop(columns=["common_timepoints"])
+    mri_meta_df = mri_meta_df.merge(merged_timepoints[["subject", "common_timepoints"]], left_on="subject", right_on="subject", how="inner")
+    mri_meta_df = mri_meta_df[mri_meta_df.apply(lambda row: row["timepoint"] in row["common_timepoints"], axis=1)].drop(columns=["common_timepoints"])
+    print(f"Number of subjects with both 'fit' and 'scans' files: {fit_meta_df['subject'].nunique()}")
+    print(f"Average number of common timepoints per subject with both 'fit' and 'scans' files: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
     # Get subjects with multiple timepoints/sessions with both "fit" and "scans" files
-    timepoint_counts = fit_df.groupby("subject")["timepoint"].nunique().reset_index(name="timepoint_count")
+    timepoint_counts = fit_meta_df.groupby("subject")["timepoint"].nunique().reset_index(name="timepoint_count")
     subjects_multiple_timepoints = timepoint_counts[timepoint_counts["timepoint_count"] > 1]
     print(f"Subjects with multiple timepoints:\n{subjects_multiple_timepoints}")
 
@@ -146,15 +155,10 @@ def import_data(dta_path):
     subjects_immediate_followup = merged_timepoints[merged_timepoints["common_timepoints"].apply(has_immediate_followup)]
     print(f"Subjects with immediate follow-up timepoints:\n{subjects_immediate_followup[['subject', 'common_timepoints']]}")
 
-    # ---- IMPORT DATA ----
-    print("Importing data for selected subjects...")
     # GET DEMOGRAPHIC DATA
-
-    # Create dta_df with subject and time point information from fit_df
-    dta_df = fit_df[["subject", "timepoint"]].drop_duplicates().reset_index(drop=True)
-
+    
     # Get list of included subjects
-    included_subjects = dta_df["subject"].unique()
+    included_subjects = fit_meta_df["subject"].unique()
 
     # import static demographic information
     mri_path = dta_path / "phenotype"
@@ -167,82 +171,85 @@ def import_data(dta_path):
         how="left"
     )
     demo_df.rename(columns={"ab_g_stc__cohort_dob": "date_of_birth"}, inplace=True)
-    print(demo_df)
 
-    # add sex and age at MRI scan (rounded to nearest year) per subject and timepoint to dta_df
-    dta_df = dta_df.merge(demo_df, left_on="subject", right_on="participant_id", how="left")
-    dta_df["date_of_birth"] = pd.to_datetime(dta_df["date_of_birth"], errors="coerce")
-    dta_df["age_at_mri"] = (dta_df["mri_date"] - dta_df["date_of_birth"]).dt.days / 365.25
-    dta_df["age_at_mri"] = dta_df["age_at_mri"].round()
-    print(dta_df[["subject", "timepoint", "sex", "age_at_mri"]])
+    # Extract MRI acquisition date and add to mri_meta_df
+    for file in mri_meta_df["filepath"]:
+        temp_file = pd.read_csv(file, sep="\t")
+        if temp_file["acq_time"].dtype != "datetime64[ns]":
+            temp_file["acq_time"] = pd.to_datetime(temp_file["acq_time"])
+        mri_date = temp_file["acq_time"].min()
+        mri_meta_df.loc[mri_meta_df["filepath"] == file, "mri_date"] = mri_date
 
-    # GET NEUROIMAGING DATA
-    # Define tabular MRI data files to import
-    mri_files = list("mr_y_smri__vol__dst.tsv", # Structural MRI - Volumes (Destrieux) [Youth]
-                     "mr_y_smri__thk__dst.tsv", # Structural MRI - Cortical Thickness (Destrieux) [Youth]
-                     "mr_y_dti__fs__fa__at.tsv", # DTI (Full shell) - Fractional Anisotropy (AtlasTrack) [Youth]
-                     "mr_y_rsfmri__corr__gpnet.tsv", # Resting State fMRI - Correlations (Gordon network) [Youth] 
-                     "mr_y_rsfmri__corr__gpnet__aseg.tsv" # Resting State fMRI - Correlations (Gordon network to Subcortical) [Youth]
-                     )  # Add more files as needed
+    # add age at MRI scan (rounded to nearest year) to mri_meta_df
+    mri_meta_df = mri_meta_df.merge(demo_df[["participant_id", "date_of_birth"]], left_on="subject", right_on="participant_id", how="left")
+    mri_meta_df["mri_date"] = pd.to_datetime(mri_meta_df["mri_date"], errors="coerce")
+    mri_meta_df["date_of_birth"] = pd.to_datetime(mri_meta_df["date_of_birth"], errors="coerce")
+    mri_meta_df["age_at_mri"] = (mri_meta_df["mri_date"] - mri_meta_df["date_of_birth"].dt.day / 365.25).round(0).astype("Int64")
+    mri_meta_df = mri_meta_df.drop(columns=["participant_id", "date_of_birth"])
 
-    # Define MRI ROIs as dictionary with variale names and descriptions
-    mri_rois = {
-        # Structural MRI - Volumes (Destrieux) [Youth]
-        "mr_y_smri__vol__dst__gsca__lh_sum":"Total volume of Destrieux ROI: Anterior part of the cingulate gyrus and sulcus (Left hemisphere)",
-        "mr_y_smri__vol__dst__gilsci__rh_sum":"Total volume of Destrieux ROI: Long insular gyrus and central sulcus of the insula (Right hemisphere)",
-        "mr_y_smri__vol__dst__gis__rh_sum":"Total volume of Destrieux ROI: Short insular gyri (Right hemisphere)",
-        "mr_y_smri__vol__dst__gilsci__lh_sum":"Total volume of Destrieux ROI: Long insular gyrus and central sulcus of the insula (Left hemisphere)",
-        "mr_y_smri__vol__dst__gis__lh_sum":"Total volume of Destrieux ROI: Short insular gyri (Left hemisphere)",
-        "mr_y_smri__vol__dst__gfs__rh_sum":"Total volume of Destrieux ROI: Superior frontal gyrus (Right hemisphere)",
-        "mr_y_smri__vol__dst__gfs__lh_sum":"Total volume of Destrieux ROI: Superior frontal gyrus (Left hemisphere)",
-        # Structural MRI - Cortical Thickness (Destrieux) [Youth]
-        "mr_y_smri__thk__dst__gsca__rh_mean":"Average cortical thickness of Destrieux ROI: Anterior part of the cingulate gyrus and sulcus (Right hemisphere)",
-        "mr_y_smri__thk__dst__gsca__lh_mean":"Average cortical thickness of Destrieux ROI: Anterior part of the cingulate gyrus and sulcus (Left hemisphere)",
-        "mr_y_smri__thk__dst__gilsci__rh_mean":"Average cortical thickness of Destrieux ROI: Long insular gyrus and central sulcus of the insula (Right hemisphere)",
-        "mr_y_smri__thk__dst__gis__rh_mean":"Average cortical thickness of Destrieux ROI: Short insular gyri (Right hemisphere)",
-        "mr_y_smri__thk__dst__gilsci__lh_mean":"Average cortical thickness of Destrieux ROI: Long insular gyrus and central sulcus of the insula (Left hemisphere)",
-        "mr_y_smri__thk__dst__gis__lh_mean":"Average cortical thickness of Destrieux ROI: Short insular gyri (Left hemisphere)",
-        "mr_y_smri__thk__dst__go__rh_mean":"Average cortical thickness in Destrieux ROI: Orbital gyri (Right hemisphere)",
-        "mr_y_smri__thk__dst__gr__rh_mean":"Average cortical thickness in Destrieux ROI: Rectus gyrus (Right hemisphere)",
-        "mr_y_smri__thk__dst__go__lh_mean":"Average cortical thickness in Destrieux ROI: Orbital gyri (Left hemisphere)",
-        "mr_y_smri__thk__dst__gr__lh_mean":"Average cortical thickness in Destrieux ROI: Rectus gyrus (Left hemisphere)",
-        # DTI (Full shell) - Fractional Anisotropy (AtlasTrack) [Youth]
-        "mr_y_dti__fs__fa__atmr_y_dti__fs__fa__at__cc_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Corpus callosum",
-        "mr_y_dti__fs__fa__at__atr__lh_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Anterior thalamic radiation (left hemisphere)",
-        "mr_y_dti__fs__fa__at__cst__lh_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Corticospinal tract (left hemisphere)",
-        "mr_y_dti__fs__fa__at__ifo__rh_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Inferior fronto-occipital fasciculus (right hemisphere)",
-        "mr_y_dti__fs__fa__at__cgc__rh_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Cingulate cingulum (Right hemisphere)",
-        "mr_y_dti__fs__fa__at__cgh__rh_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Parahpcm cingulum (Right hemisphere)",
-        # Resting State fMRI - Correlations (Gordon network) [Youth]
-        "mr_y_rsfmri__corr__gpnet__def__def_mean":"Average correlation between Gordon networks: Default & default",
-        "mr_y_rsfmri__corr__gpnet__def__doa_mean":"Average correlation between Gordon networks: Default & dorsal attention",
-        "mr_y_rsfmri__corr__gpnet__def__vea_mean":"Average correlation between Gordon networks: Default & ventral attention",
-        "mr_y_rsfmri__corr__gpnet__def__sal_mean":"Average correlation between Gordon networks: Default & salience",
-        "mr_y_rsfmri__corr__gpnet__doa__doa_mean":"Average correlation between Gordon networks: Dorsal attention & dorsal attention",
-        "mr_y_rsfmri__corr__gpnet__doa__sal_mean":"Average correlation between Gordon networks: Dorsal attention & salience",
-        "mr_y_rsfmri__corr__gpnet__doa__vea_mean":"Average correlation between Gordon networks: Dorsal attention & ventral attention",
-        "mr_y_rsfmri__corr__gpnet__doa__frp_mean":"Average correlation between Gordon networks: Dorsal attention & frontoparietal",
-        "mr_y_rsfmri__corr__gpnet__doa__smh_mean":"Average correlation between Gordon networks: Dorsal attention & somatomotor hand",
-        "mr_y_rsfmri__corr__gpnet__doa__smm_mean":"Average correlation between Gordon networks: Dorsal attention & somatomotor mouth",
-        "mr_y_rsfmri__corr__gpnet__vea__vea_mean":"Average correlation between Gordon networks: Ventral attention & ventral attention",
-        # Resting State fMRI - Correlations (Gordon network to Subcortical) [Youth]
-        "mr_y_rsfmri__corr__gpnet__aseg__doa__hc__lh_mean":"Average correlation between Gordon network: Dorsal attention & Subcortical ROI: Hippocampus (Left hemisphere)",
-        "mr_y_rsfmri__corr__gpnet__aseg__smh__ag__lh_mean":"Average correlation between Gordon network: Sensorimotor hand & Subcortical ROI: Amygdala (Left hemisphere)",
-        "mr_y_rsfmri__corr__gpnet__aseg__smm__ag__lh_mean":"Average correlation between Gordon network: Sensorimotor mouth & Subcortical ROI: Amygdala (Left hemisphere)",
-        "mr_y_rsfmri__corr__gpnet__aseg__sal__ag__lh_mean":"Average correlation between Gordon network: Salience & Subcortical ROI: Amygdala (Left hemisphere)",
-        "mr_y_rsfmri__corr__gpnet__aseg__doa__hc__rh_mean":"Average correlation between Gordon network: Dorsal attention & Subcortical ROI: Hippocampus (Right hemisphere)",
-        "mr_y_rsfmri__corr__gpnet__aseg__smh__ag__rh_mean":"Average correlation between Gordon network: Sensorimotor hand & Subcortical ROI: Amygdala (Right hemisphere)",
-        "mr_y_rsfmri__corr__gpnet__aseg__smm__ag__rh_mean":"Average correlation between Gordon network: Sensorimotor mouth & Subcortical ROI: Amygdala (Right hemisphere)",
-        "mr_y_rsfmri__corr__gpnet__aseg__sal__ag__rh_mean":"Average correlation between Gordon network: Salience & Subcortical ROI: Amygdala (Right hemisphere)"
+    # Check that subjects and timepoints in mri_meta_df and fit_meta_df match
+    assert set(mri_meta_df["subject"].unique()) == set(fit_meta_df["subject"].unique()), "Subjects in mri_meta_df and fit_meta_df do not match"
+    assert set(mri_meta_df["timepoint"].unique()) == set(fit_meta_df["timepoint"].unique()), "Timepoints in mri_meta_df and fit_meta_df do not match"
 
-    }
+    # drop filepath and filename columns from mri_meta_df
+    mri_meta_df = mri_meta_df.drop(columns=["filepath", "filename"])
 
-    # Get tabular MRI data from mri_path
-    for mri_file in mri_files:
-        temp_df = pd.read_csv(mri_path / mri_file, sep="\t")
-        temp_df = temp_df[temp_df["participant_id"].isin(included_subjects)]
-        # Only keep ROIs defined in mri_rois
-        temp_df = temp_df[["participant_id"] + [col for col in temp_df.columns if col in mri_rois.keys()]]
-        # Merge MRI data with dta_df
-        dta_df = dta_df.merge(temp_df, left_on="subject", right_on="participant_id", how="left").drop(columns=["participant_id"])
-        
+    return demo_df, mri_meta_df, fit_meta_df
+
+def transform_fit_dta(dta_path, fit_meta_df):
+    '''
+    This function combines all fitbit files for each subject and timepoint into a single parquet file based on datetime index for easier querying with DuckDB.
+    It adds two columns to each combined parquet file: "subject" and "timepoint", which are extracted from the file paths of the original fitbit files, for easy filtering in DuckDB.
+    The combined parquet file is saved in a new hive-style directory structure at the top of the dta_path: "processed_fitbit_data/subject=SUBJECT_ID/timepoint=TIMEPOINT/combined_fitbit.parquet"
+    '''
+    output_dir = dta_path / "processed_fitbit_data"
+    output_dir.mkdir(exist_ok=True)
+
+    for _, row in fit_meta_df.iterrows():
+        subject = row["subject"]
+        timepoint = row["timepoint"]
+        filepath = row["filepath"]
+
+        # Read the fitbit file
+        fit_df = pd.read_csv(filepath, sep="\t")
+
+        # Convert time column to datetime and keep it as the merge key
+        fit_df["Wear_Time"] = pd.to_datetime(fit_df["Wear_Time"], errors="coerce")
+        fit_df = fit_df.dropna(subset=["Wear_Time"]).sort_values("Wear_Time")
+
+        value_cols = [
+            col for col in fit_df.columns
+            if col != "Wear_Time" and fit_df[col].notna().any()
+        ]
+        if not value_cols:
+            continue
+
+        stem = Path(filepath).stem
+        metric_name = stem.split("task-fitb", 1)[1].split("_", 1)[0]
+        fit_df = fit_df[["Wear_Time", *value_cols]].rename(
+            columns={col: f"{col}_{metric_name}" for col in value_cols}
+        )
+
+        # Add subject and timepoint columns
+        fit_df["subject"] = subject
+        fit_df["timepoint"] = timepoint
+
+        # Define output path for combined parquet file
+        subject_dir = output_dir / f"subject={subject}"
+        timepoint_dir = subject_dir / f"timepoint={timepoint}"
+        timepoint_dir.mkdir(parents=True, exist_ok=True)
+        output_file = timepoint_dir / "combined_fitbit.parquet"
+
+        # Save combined dataframe as parquet file aligned on Wear_Time
+        if output_file.exists():
+            existing_df = pd.read_parquet(output_file)
+            existing_df["Wear_Time"] = pd.to_datetime(existing_df["Wear_Time"], errors="coerce")
+            existing_core = existing_df.drop(columns=["subject", "timepoint"], errors="ignore")
+            new_core = fit_df.drop(columns=["subject", "timepoint"], errors="ignore")
+            combined_df = pd.merge(existing_core, new_core, on="Wear_Time", how="outer", sort=True)
+            combined_df["subject"] = subject
+            combined_df["timepoint"] = timepoint
+            combined_df.to_parquet(output_file, index=False)
+        else:
+            fit_df.to_parquet(output_file, index=False)
+
