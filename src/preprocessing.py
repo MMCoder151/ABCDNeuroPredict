@@ -1,11 +1,9 @@
 import pandas as pd
 from pathlib import Path
-import os
 from src.mri_rois import mri_rois
+import duckdb
 
-# ------------------------
 # ---- DATA WRANGLING ----
-# ------------------------
 
 def select_subjects(dta_path, test=False):
     '''
@@ -41,7 +39,7 @@ def select_subjects(dta_path, test=False):
     subs = pd.read_csv(dta_path / "participants.tsv", sep="\t")
     sub_folders = [f for f in dta_path.iterdir() if f.name in subs["participant_id"].values]
     if test:
-        sub_folders = sub_folders[:10] # Use only first 10 subjects for testing
+        sub_folders = sub_folders[:100] # Use only first 100 subjects for testing
 
     n_total_subs = len(sub_folders)
     print(f"Total number of subjects made available: {n_total_subs}")
@@ -87,7 +85,7 @@ def select_subjects(dta_path, test=False):
     print(f"Average number of timepoints per subject with fitbit data after dropping incomplete timepoints: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
     # get recording duration in days for each fit file and drop timepoints with less than 7 days of data
-    fit_meta_df["recording_duration_days"] = fit_meta_df["filepath"].apply(lambda x: (pd.to_datetime(pd.read_csv(x, sep="\t")["time"].max()) - pd.to_datetime(pd.read_csv(x, sep="\t")["time"].min())).days)
+    fit_meta_df["recording_duration_days"] = fit_meta_df["filepath"].apply(lambda x: (pd.to_datetime(pd.read_csv(x, sep="\t")["Wear_Time"].max()) - pd.to_datetime(pd.read_csv(x, sep="\t")["Wear_Time"].min())).days)
     short_recordings = fit_meta_df[fit_meta_df["recording_duration_days"] < 7][["subject", "timepoint"]].drop_duplicates()
     fit_meta_df = fit_meta_df.merge(short_recordings, on=["subject", "timepoint"], how="left", indicator=True)
     fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
@@ -185,7 +183,7 @@ def select_subjects(dta_path, test=False):
     mri_meta_df = mri_meta_df.merge(demo_df[["participant_id", "date_of_birth"]], left_on="subject", right_on="participant_id", how="left")
     mri_meta_df["mri_date"] = pd.to_datetime(mri_meta_df["mri_date"], errors="coerce")
     mri_meta_df["date_of_birth"] = pd.to_datetime(mri_meta_df["date_of_birth"], errors="coerce")
-    mri_meta_df["age_at_mri"] = (mri_meta_df["mri_date"] - mri_meta_df["date_of_birth"].dt.day / 365.25).round(0).astype("Int64")
+    mri_meta_df["age_at_mri"] = ((mri_meta_df["mri_date"] - mri_meta_df["date_of_birth"]).dt.days / 365.25).round(0).astype("Int64")
     mri_meta_df = mri_meta_df.drop(columns=["participant_id", "date_of_birth"])
 
     # Check that subjects and timepoints in mri_meta_df and fit_meta_df match
@@ -197,19 +195,30 @@ def select_subjects(dta_path, test=False):
 
     return demo_df, mri_meta_df, fit_meta_df
 
-def transform_dta(dta_path, fit_meta_df):
+def setup_duckdb(dta_path, fit_meta_df):
     '''
-    This function combines all fitbit files for each selected subject and timepoint into a single parquet file based on datetime index for easier querying with DuckDB.
-    It adds two columns to each combined parquet file: "subject" and "timepoint", which are extracted from the file paths of the original fitbit files, for easy filtering in DuckDB.
-    The combined parquet file is saved in a new hive-style directory structure at the top of the dta_path: "processed_fitbit_data/subject=SUBJECT_ID/timepoint=TIMEPOINT/combined_fitbit.parquet"
+    This function transforms the raw fitbit and MRI data to make it easier to query with DuckDB for downstream analysis
+    and sets up a DuckDB connection with views for the transformed fitbit and MRI data.
+        - For fitbit data, it combines all fitbit files for each selected subject and timepoint into a single parquet file 
+        based on datetime index for easier querying with DuckDB. It adds two columns to each combined parquet file: "subject" and "timepoint", 
+        which are extracted from the file paths of the original fitbit files, for easy filtering in DuckDB. 
+        The combined parquet file is saved in a new hive-style directory structure at the top of the dta_path: "processed_fitbit_data/subject=SUBJECT_ID/timepoint=TIMEPOINT/combined_fitbit.parquet"
+        - For MRI data, it extracts the MRI ROIs specified in mri_rois for each subject and timepoint and saves it in a similar hive-style directory structure 
+        at the top of the dta_path: "processed_mri_data/subject=SUBJECT_ID/timepoint=TIMEPOINT/combined_mri.parquet"
+    Parameters:
+        dta_path (Path): Path to the raw data directory
+        fit_meta_df (DataFrame): DataFrame containing metadata for the selected fitbit files (subjects, timepoints, filepaths) -> also used for mri data to get selected subjects
+    Returns:
+        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
+    '''
 
-    It also extracts MRI data (specified in mri_rois) for each subject and timepoint and saves it in a similar hive-style directory structure at the top of the dta_path: "processed_mri_data/subject=SUBJECT_ID/timepoint=TIMEPOINT/combined_mri.parquet"
-    '''
+    # Create output directories for fitbit and mri data
     output_dir_fit = dta_path / "processed_fitbit_data"
     output_dir_mri = dta_path / "processed_mri_data"
     output_dir_fit.mkdir(exist_ok=True)
     output_dir_mri.mkdir(exist_ok=True)
 
+    # Combine fitbit files for each subject and timepoint into a single parquet file based on datetime index
     for _, row in fit_meta_df.iterrows():
         subject = row["subject"]
         timepoint = row["timepoint"]
@@ -229,6 +238,7 @@ def transform_dta(dta_path, fit_meta_df):
         if not value_cols:
             continue
 
+        # Extract metric name from filename (e.g., "Cal1m", "HR1m", etc.) and rename value columns to include metric name for easier identification after merging
         stem = Path(filepath).stem
         metric_name = stem.split("task-fitb", 1)[1].split("_", 1)[0]
         fit_df = fit_df[["Wear_Time", *value_cols]].rename(
@@ -240,28 +250,23 @@ def transform_dta(dta_path, fit_meta_df):
         fit_df["timepoint"] = timepoint
 
         # Define output path for combined parquet file
-        subject_dir = output_dir_fit / f"subject={subject}"
-        timepoint_dir = subject_dir / f"timepoint={timepoint}"
+        subject_dir = output_dir_fit / f"{subject}"
+        timepoint_dir = subject_dir / f"{timepoint}"
         timepoint_dir.mkdir(parents=True, exist_ok=True)
         output_file = timepoint_dir / "combined_fitbit.parquet"
 
-        # Save combined dataframe as parquet file aligned on Wear_Time
-        if output_file.exists():
-            existing_df = pd.read_parquet(output_file)
-            existing_df["Wear_Time"] = pd.to_datetime(existing_df["Wear_Time"], errors="coerce")
-            existing_core = existing_df.drop(columns=["subject", "timepoint"], errors="ignore")
-            new_core = fit_df.drop(columns=["subject", "timepoint"], errors="ignore")
-            combined_df = pd.merge(existing_core, new_core, on="Wear_Time", how="outer", sort=True)
-            combined_df["subject"] = subject
-            combined_df["timepoint"] = timepoint
-            combined_df.to_parquet(output_file, index=False)
-        else:
-            fit_df.to_parquet(output_file, index=False)
-     
+        # Save combined dataframe as parquet file aligned on Wear_Time (overwrites existing files)
+        fit_df.to_parquet(output_file, index=False)
+    
+    # Get MRI ROIs and files to import
     mri_files, mri_rois_dict = mri_rois()
+
+    # Extract MRI data for each subject and timepoint and save in hive-style directory structure
     for file in mri_files:
         mri_df = pd.read_csv(dta_path / "phenotype" / file, sep="\t")
-        mri_df = mri_df[["participant_id", "session_id", *mri_rois_dict.keys()]]
+        # Select only columns that exist in the dataframe
+        available_cols = ["participant_id", "session_id"] + [col for col in mri_rois_dict.keys() if col in mri_df.columns]
+        mri_df = mri_df[available_cols]
         mri_df = mri_df.merge(
             fit_meta_df[["subject", "timepoint"]].drop_duplicates(),
             left_on=["participant_id", "session_id"],
@@ -271,9 +276,34 @@ def transform_dta(dta_path, fit_meta_df):
         for _, row in mri_df.iterrows():
             subject = row["subject"]
             timepoint = row["timepoint"]
-            subject_dir = output_dir_mri / f"subject={subject}"
-            timepoint_dir = subject_dir / f"timepoint={timepoint}"
+            subject_dir = output_dir_mri / f"{subject}"
+            timepoint_dir = subject_dir / f"{timepoint}"
             timepoint_dir.mkdir(parents=True, exist_ok=True)
             output_file = timepoint_dir / "combined_mri.parquet"
             row.to_frame().T.to_parquet(output_file, index=False)
+    
+    # Setup DuckDB connection to query the combined fitbit and mri data
+    con = duckdb.connect()
+    con.execute(f"CREATE OR REPLACE VIEW fitbit_data AS SELECT * FROM '{output_dir_fit}/**/combined_fitbit.parquet'")
+    con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM '{output_dir_mri}/**/combined_mri.parquet'")
 
+    # Sanity check
+    n_fitbit = con.execute("SELECT COUNT(DISTINCT subject) FROM fitbit_data").fetchone()[0]
+    n_mri    = con.execute("SELECT COUNT(DISTINCT subject) FROM mri_data").fetchone()[0]
+    print(f"✓ DuckDB ready — {n_fitbit} Fitbit subjects, {n_mri} MRI subjects")
+
+    return con
+
+# ---- DATA ANALYSIS ----
+
+def normative_selection(con):
+    '''
+    This function performs normative modeling with composite absolute z-score selection of subjects based on their MRI data. 
+    It selects the top 10% (based on prevalence) of subjects with the highest cumulative z-score.
+    These subjects are considered to have abnormal development in the selected MRI ROIs associated with depression.
+
+    Parameters:
+        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
+    Returns:
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
+    '''

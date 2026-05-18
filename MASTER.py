@@ -1,8 +1,6 @@
 from pathlib import Path
 import os
-import sys
-
-from src.preprocessing import select_subjects, transform_dta
+from src.preprocessing import select_subjects, setup_duckdb
 
 test = True # Set to False to run on full dataset
 
@@ -11,9 +9,11 @@ dta_path = Path.home() / "dairc" / "rawdata"
 
 # Set output path
 output_path = os.path.join(os.getcwd(), "output")
+if not os.path.exists(output_path):
+    os.makedirs(output_path)
 
 # Select subjects based on inclusion criteria and extract metadata
-dem_df, fit_meta_df, mri_meta_df = select_subjects(dta_path)
+dem_df, mri_meta_df, fit_meta_df = select_subjects(dta_path, test=test)
 
-# Transform fitbit data to make it easier to query with DuckDB
-transform_dta(dta_path, fit_meta_df)
+# Transform data to make it easier to query with DuckDB
+con = setup_duckdb(dta_path, fit_meta_df)
