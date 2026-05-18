@@ -1,6 +1,7 @@
 import pandas as pd
 from pathlib import Path
 import os
+from src.mri_rois import mri_rois
 
 # ------------------------
 # ---- DATA WRANGLING ----
@@ -196,14 +197,18 @@ def select_subjects(dta_path, test=False):
 
     return demo_df, mri_meta_df, fit_meta_df
 
-def transform_fit_dta(dta_path, fit_meta_df):
+def transform_dta(dta_path, fit_meta_df):
     '''
-    This function combines all fitbit files for each subject and timepoint into a single parquet file based on datetime index for easier querying with DuckDB.
+    This function combines all fitbit files for each selected subject and timepoint into a single parquet file based on datetime index for easier querying with DuckDB.
     It adds two columns to each combined parquet file: "subject" and "timepoint", which are extracted from the file paths of the original fitbit files, for easy filtering in DuckDB.
     The combined parquet file is saved in a new hive-style directory structure at the top of the dta_path: "processed_fitbit_data/subject=SUBJECT_ID/timepoint=TIMEPOINT/combined_fitbit.parquet"
+
+    It also extracts MRI data (specified in mri_rois) for each subject and timepoint and saves it in a similar hive-style directory structure at the top of the dta_path: "processed_mri_data/subject=SUBJECT_ID/timepoint=TIMEPOINT/combined_mri.parquet"
     '''
-    output_dir = dta_path / "processed_fitbit_data"
-    output_dir.mkdir(exist_ok=True)
+    output_dir_fit = dta_path / "processed_fitbit_data"
+    output_dir_mri = dta_path / "processed_mri_data"
+    output_dir_fit.mkdir(exist_ok=True)
+    output_dir_mri.mkdir(exist_ok=True)
 
     for _, row in fit_meta_df.iterrows():
         subject = row["subject"]
@@ -235,7 +240,7 @@ def transform_fit_dta(dta_path, fit_meta_df):
         fit_df["timepoint"] = timepoint
 
         # Define output path for combined parquet file
-        subject_dir = output_dir / f"subject={subject}"
+        subject_dir = output_dir_fit / f"subject={subject}"
         timepoint_dir = subject_dir / f"timepoint={timepoint}"
         timepoint_dir.mkdir(parents=True, exist_ok=True)
         output_file = timepoint_dir / "combined_fitbit.parquet"
@@ -252,4 +257,23 @@ def transform_fit_dta(dta_path, fit_meta_df):
             combined_df.to_parquet(output_file, index=False)
         else:
             fit_df.to_parquet(output_file, index=False)
+     
+    mri_files, mri_rois_dict = mri_rois()
+    for file in mri_files:
+        mri_df = pd.read_csv(dta_path / "phenotype" / file, sep="\t")
+        mri_df = mri_df[["participant_id", "session_id", *mri_rois_dict.keys()]]
+        mri_df = mri_df.merge(
+            fit_meta_df[["subject", "timepoint"]].drop_duplicates(),
+            left_on=["participant_id", "session_id"],
+            right_on=["subject", "timepoint"],
+            how="inner",
+        ).drop(columns=["participant_id", "session_id"])
+        for _, row in mri_df.iterrows():
+            subject = row["subject"]
+            timepoint = row["timepoint"]
+            subject_dir = output_dir_mri / f"subject={subject}"
+            timepoint_dir = subject_dir / f"timepoint={timepoint}"
+            timepoint_dir.mkdir(parents=True, exist_ok=True)
+            output_file = timepoint_dir / "combined_mri.parquet"
+            row.to_frame().T.to_parquet(output_file, index=False)
 

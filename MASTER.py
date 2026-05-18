@@ -1,9 +1,8 @@
 from pathlib import Path
-import pandas as pd
 import os
 import sys
 
-from src.preprocessing import select_subjects, import_data, transform_fit_dta
+from src.preprocessing import select_subjects, transform_dta
 
 test = True # Set to False to run on full dataset
 
@@ -17,7 +16,4 @@ output_path = os.path.join(os.getcwd(), "output")
 dem_df, fit_meta_df, mri_meta_df = select_subjects(dta_path)
 
 # Transform fitbit data to make it easier to query with DuckDB
-transform_fit_dta(dta_path, fit_meta_df)
-
-# Import data
-demo_df, mri_meta_df, fit_meta_df = import_data(dta_path, test=test)
+transform_dta(dta_path, fit_meta_df)
