@@ -30,7 +30,7 @@ def mri_rois():
         "mr_y_smri__thk__dst__go__lh_mean":"Average cortical thickness in Destrieux ROI: Orbital gyri (Left hemisphere)",
         "mr_y_smri__thk__dst__gr__lh_mean":"Average cortical thickness in Destrieux ROI: Rectus gyrus (Left hemisphere)",
         # DTI (Full shell) - Fractional Anisotropy (AtlasTrack) [Youth]
-        "mr_y_dti__fs__fa__atmr_y_dti__fs__fa__at__cc_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Corpus callosum",
+        "mr_y_dti__fs__fa__at__cc_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Corpus callosum",
         "mr_y_dti__fs__fa__at__atr__lh_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Anterior thalamic radiation (left hemisphere)",
         "mr_y_dti__fs__fa__at__cst__lh_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Corticospinal tract (left hemisphere)",
         "mr_y_dti__fs__fa__at__ifo__rh_wmean":"Weighted average fractional anisotropy (Full shell DTI) in AtlasTrack fiber tract: Inferior fronto-occipital fasciculus (right hemisphere)",

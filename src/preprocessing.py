@@ -2,6 +2,8 @@ import pandas as pd
 from pathlib import Path
 from src.mri_rois import mri_rois
 import duckdb
+from pcntoolkit import NormativeModel, BLR, Runner
+from pcntoolkit.dataio.norm_data import NormData
 
 # ---- DATA WRANGLING ----
 
@@ -169,7 +171,7 @@ def select_subjects(dta_path, test=False):
         on="participant_id",
         how="left"
     )
-    demo_df.rename(columns={"ab_g_stc__cohort_dob": "date_of_birth"}, inplace=True)
+    demo_df.rename(columns={"ab_g_stc__cohort_dob": "date_of_birth", "participant_id": "subject"}, inplace=True)
 
     # Extract MRI acquisition date and add to mri_meta_df
     for file in mri_meta_df["filepath"]:
@@ -179,12 +181,12 @@ def select_subjects(dta_path, test=False):
         mri_date = temp_file["acq_time"].min()
         mri_meta_df.loc[mri_meta_df["filepath"] == file, "mri_date"] = mri_date
 
-    # add age at MRI scan (rounded to nearest year) to mri_meta_df
-    mri_meta_df = mri_meta_df.merge(demo_df[["participant_id", "date_of_birth"]], left_on="subject", right_on="participant_id", how="left")
+    # add sex and age at MRI scan (rounded to nearest year) to mri_meta_df
+    mri_meta_df = mri_meta_df.merge(demo_df[["subject", "sex", "date_of_birth"]], left_on="subject", right_on="subject", how="left")
     mri_meta_df["mri_date"] = pd.to_datetime(mri_meta_df["mri_date"], errors="coerce")
     mri_meta_df["date_of_birth"] = pd.to_datetime(mri_meta_df["date_of_birth"], errors="coerce")
     mri_meta_df["age_at_mri"] = ((mri_meta_df["mri_date"] - mri_meta_df["date_of_birth"]).dt.days / 365.25).round(0).astype("Int64")
-    mri_meta_df = mri_meta_df.drop(columns=["participant_id", "date_of_birth"])
+    mri_meta_df = mri_meta_df.drop(columns=["date_of_birth"])
 
     # Check that subjects and timepoints in mri_meta_df and fit_meta_df match
     assert set(mri_meta_df["subject"].unique()) == set(fit_meta_df["subject"].unique()), "Subjects in mri_meta_df and fit_meta_df do not match"
@@ -215,9 +217,9 @@ def setup_duckdb(dta_path, fit_meta_df):
     # Create output directories for fitbit and mri data
     output_dir_fit = dta_path / "processed_fitbit_data"
     output_dir_mri = dta_path / "processed_mri_data"
-    output_dir_fit.mkdir(exist_ok=True)
-    output_dir_mri.mkdir(exist_ok=True)
-
+    output_dir_fit.mkdir(parents=True, exist_ok=True)
+    output_dir_mri.mkdir(parents=True, exist_ok=True)
+    
     # Combine fitbit files for each subject and timepoint into a single parquet file based on datetime index
     for _, row in fit_meta_df.iterrows():
         subject = row["subject"]
@@ -261,7 +263,10 @@ def setup_duckdb(dta_path, fit_meta_df):
     # Get MRI ROIs and files to import
     mri_files, mri_rois_dict = mri_rois()
 
-    # Extract MRI data for each subject and timepoint and save in hive-style directory structure
+    # Accumulate MRI data for each subject-timepoint across all phenotype files
+    mri_data_accumulator = {}  # {(subject, timepoint): {columns from all files}}
+    
+    # Extract MRI data for each subject and timepoint and accumulate across all files
     for file in mri_files:
         mri_df = pd.read_csv(dta_path / "phenotype" / file, sep="\t")
         # Select only columns that exist in the dataframe
@@ -273,19 +278,41 @@ def setup_duckdb(dta_path, fit_meta_df):
             right_on=["subject", "timepoint"],
             how="inner",
         ).drop(columns=["participant_id", "session_id"])
+        
+        # Accumulate this file's data for each subject-timepoint
         for _, row in mri_df.iterrows():
             subject = row["subject"]
             timepoint = row["timepoint"]
-            subject_dir = output_dir_mri / f"{subject}"
-            timepoint_dir = subject_dir / f"{timepoint}"
-            timepoint_dir.mkdir(parents=True, exist_ok=True)
-            output_file = timepoint_dir / "combined_mri.parquet"
-            row.to_frame().T.to_parquet(output_file, index=False)
+            key = (subject, timepoint)
+            
+            if key not in mri_data_accumulator:
+                mri_data_accumulator[key] = {}
+            
+            # Merge this row's data into the accumulator
+            for col in row.index:
+                if col not in ["subject", "timepoint"]:
+                    mri_data_accumulator[key][col] = row[col]
+    
+    # Write accumulated MRI data to parquet files
+    for (subject, timepoint), data_dict in mri_data_accumulator.items():
+        subject_dir = output_dir_mri / f"{subject}"
+        timepoint_dir = subject_dir / f"{timepoint}"
+        timepoint_dir.mkdir(parents=True, exist_ok=True)
+        output_file = timepoint_dir / "combined_mri.parquet"
+        
+        # Add subject and timepoint back in
+        data_dict["subject"] = subject
+        data_dict["timepoint"] = timepoint
+        
+        # Convert to a single-row DataFrame and save
+        row_df = pd.DataFrame([data_dict])
+        row_df.to_parquet(output_file, index=False)
     
     # Setup DuckDB connection to query the combined fitbit and mri data
     con = duckdb.connect()
-    con.execute(f"CREATE OR REPLACE VIEW fitbit_data AS SELECT * FROM '{output_dir_fit}/**/combined_fitbit.parquet'")
-    con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM '{output_dir_mri}/**/combined_mri.parquet'")
+    # Use read_parquet with union_by_name=True to allow files with differing schemas
+    con.execute(f"CREATE OR REPLACE VIEW fitbit_data AS SELECT * FROM read_parquet('{output_dir_fit}/**/combined_fitbit.parquet', union_by_name => TRUE)")
+    con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/**/combined_mri.parquet', union_by_name => TRUE)")
 
     # Sanity check
     n_fitbit = con.execute("SELECT COUNT(DISTINCT subject) FROM fitbit_data").fetchone()[0]
@@ -296,9 +323,9 @@ def setup_duckdb(dta_path, fit_meta_df):
 
 # ---- DATA ANALYSIS ----
 
-def normative_selection(con):
+def normative_selection(con, mri_meta_df):
     '''
-    This function performs normative modeling with composite absolute z-score selection of subjects based on their MRI data. 
+    This function performs normative modeling and selects subjects based on their composite absolute z-score. 
     It selects the top 10% (based on prevalence) of subjects with the highest cumulative z-score.
     These subjects are considered to have abnormal development in the selected MRI ROIs associated with depression.
 
@@ -307,3 +334,71 @@ def normative_selection(con):
     Returns:
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
     '''
+    # Get MRI ROIs to include in the normative model
+    _, mri_rois_dict = mri_rois()
+    mri_roi_cols = list(mri_rois_dict.keys())
+    
+    # Query MRI data for the first timepoint for each subject
+    query = f"""
+    SELECT *
+    FROM mri_data
+    WHERE {"timepoint"} = (
+        SELECT MIN(m2.{"timepoint"})
+        FROM mri_data m2
+        WHERE m2.{"subject"} = mri_data.{"subject"}
+    )
+    """
+    mri_df = con.execute(query).df()
+    print(f"MRI data loaded: {len(mri_df)} subjects")
+
+    # Merge MRI data with demographic data
+    df = mri_df.merge(
+    mri_meta_df[["subject", "sex", "age_at_mri"]].drop_duplicates(),
+    on="subject",
+    how="inner"    
+    )
+
+    # Encode categorical covariates to numeric if needed
+    if df['sex'].dtype.name == 'category' or df['sex'].dtype == object:
+        df['sex'] = df['sex'].astype('category').cat.codes
+
+    # Prepare data for normative modeling
+    data = NormData.from_dataframe(
+        name="mri_norm",
+        dataframe=df,
+        covariates=["sex", "age_at_mri"],
+        response_vars=mri_roi_cols,
+        subject_ids="subject",
+        remove_Nan=True,
+    )
+    
+    # setup normative model
+    model = NormativeModel(
+        BLR(),
+        # Whether to save the model after fitting.
+        savemodel=True,
+        # Whether to evaluate the model after fitting.
+        evaluate_model=True,
+        # Whether to save the results after evaluation.
+        saveresults=True,
+        # Whether to save the plots after fitting.
+        saveplots=True,
+        # The directory to save the model, results, and plots.
+        save_dir="resources/blr/save_dir",
+        # The scaler to use for the input data. Can be either one of "standardize", "minmax", "robminmax", "none"
+        inscaler="standardize",
+        # The scaler to use for the output data. Can be either one of "standardize", "minmax", "robminmax", "none"
+        outscaler="standardize",
+        )
+
+    model.fit(data)
+
+    # create a runner
+    runner = Runner(cross_validate = True)
+
+    # fit the model 
+    runner.fit(model, data)
+
+
+
+    
