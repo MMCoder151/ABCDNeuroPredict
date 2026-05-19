@@ -323,7 +323,7 @@ def setup_duckdb(dta_path, fit_meta_df):
 
 # ---- DATA ANALYSIS ----
 
-def normative_selection(con, mri_meta_df):
+def normative_selection(con, mri_meta_df, output_path):
     '''
     This function performs normative modeling and selects subjects based on their composite absolute z-score. 
     It selects the top 10% (based on prevalence) of subjects with the highest cumulative z-score.
@@ -331,6 +331,8 @@ def normative_selection(con, mri_meta_df):
 
     Parameters:
         con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
+        mri_meta_df (DataFrame): DataFrame containing MRI metadata
+        output_path (str): Path to the output directory where the normative model results will be saved
     Returns:
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
     '''
@@ -358,9 +360,24 @@ def normative_selection(con, mri_meta_df):
     how="inner"    
     )
 
-    # Encode categorical covariates to numeric if needed
-    if df['sex'].dtype.name == 'category' or df['sex'].dtype == object:
-        df['sex'] = df['sex'].astype('category').cat.codes
+    missing_cols = set(mri_roi_cols) - set(df.columns)
+    if missing_cols:
+        print(f"Warning: The following MRI ROI columns are missing from the dataframe: {missing_cols}")
+
+    # Encode sex explicitly so F/M map to 1/2 before passing data to NormData.
+    sex_map = {'F': 1, 'M': 2}
+    if not pd.api.types.is_numeric_dtype(df['sex']):
+        sex_values = df['sex'].astype('string').str.strip().str.upper()
+        mapped_sex = sex_values.map(sex_map)
+        if mapped_sex.isna().any():
+            unexpected_values = sorted(sex_values[mapped_sex.isna()].dropna().unique().tolist())
+            raise ValueError(
+                f"Unmapped sex values found: {unexpected_values}. Expected F/M or numeric input."
+            )
+        df['sex'] = mapped_sex.astype('Int64')
+
+    df['sex'] = pd.to_numeric(df['sex'], errors='raise').astype(float)
+    df['age_at_mri'] = pd.to_numeric(df['age_at_mri'], errors='raise').astype(float)
 
     # Prepare data for normative modeling
     data = NormData.from_dataframe(
@@ -371,7 +388,12 @@ def normative_selection(con, mri_meta_df):
         subject_ids="subject",
         remove_Nan=True,
     )
-    
+
+    normative_output_dir = Path(output_path) / "normative_modelling"
+    if not normative_output_dir.exists():
+        normative_output_dir.mkdir(parents=True)
+    normative_output_dir_str = str(normative_output_dir)
+
     # setup normative model
     model = NormativeModel(
         BLR(),
@@ -384,7 +406,7 @@ def normative_selection(con, mri_meta_df):
         # Whether to save the plots after fitting.
         saveplots=True,
         # The directory to save the model, results, and plots.
-        save_dir="resources/blr/save_dir",
+        save_dir=normative_output_dir_str,
         # The scaler to use for the input data. Can be either one of "standardize", "minmax", "robminmax", "none"
         inscaler="standardize",
         # The scaler to use for the output data. Can be either one of "standardize", "minmax", "robminmax", "none"
@@ -394,11 +416,21 @@ def normative_selection(con, mri_meta_df):
     model.fit(data)
 
     # create a runner
-    runner = Runner(cross_validate = True)
+    #runner = Runner(cross_validate = True)
 
     # fit the model 
-    runner.fit(model, data)
+    #runner.fit(model, data)
 
+    # Read in centile file from normative modeling 
+    centiles_df = pd.read_csv(normative_output_dir / "results" / "Z_mri_norm.csv")
+    # Calculate composite absolute z-score across all MRI ROIs for each subject
+    centiles_df["composite_z"] = centiles_df[mri_roi_cols].abs().sum(axis=1)
+    # Select top 10% of subjects with the highest composite z-score
+    threshold = centiles_df["composite_z"].quantile(0.9)
+    selected_subjects = centiles_df[centiles_df["composite_z"] >= threshold].copy()
+    print(f"Selected {len(selected_subjects)} subjects with composite z-score >= {threshold:.2f} (top 10%)")
+
+    return selected_subjects
 
 
     

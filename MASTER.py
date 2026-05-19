@@ -19,4 +19,4 @@ dem_df, mri_meta_df, fit_meta_df = select_subjects(dta_path, test=test)
 con = setup_duckdb(dta_path, fit_meta_df)
 
 # Select subjects based on normative modeling and composite z-scores
-#selected_subjects = normative_selection(con, dem_df)
+selected_subjects = normative_selection(con, mri_meta_df, output_path)
