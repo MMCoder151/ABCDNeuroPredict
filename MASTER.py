@@ -18,3 +18,6 @@ con = setup_duckdb(dta_path, fit_meta_df, overwrite=True)
 
 # Select subjects based on normative modeling and composite z-scores
 selected_subjects = normative_selection(con, mri_meta_df, output_path)
+
+# Save selected subjects to CSV
+selected_subjects.to_csv(os.path.join(output_path, "selected_subjects.csv"), index=False)

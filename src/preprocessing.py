@@ -175,12 +175,12 @@ def select_subjects(dta_path, test=False):
     # Filter both metadata tables to the intersection of pairs
     fit_meta_df = fit_meta_df.merge(common_pairs, on=["subject", "timepoint"], how="inner")
     mri_meta_df = mri_meta_df.merge(common_pairs, on=["subject", "timepoint"], how="inner")
-    print(f"Filtered to {len(common_pairs)} common subject-timepoint pairs present in both fitbit and MRI metadata.")
+    print(f"Number of subjects with both fitbit and mri files: {fit_meta_df['subject'].nunique()}")
 
     # Get subjects with multiple timepoints/sessions with both "fit" and "scans" files
     timepoint_counts = fit_meta_df.groupby("subject")["timepoint"].nunique().reset_index(name="timepoint_count")
     subjects_multiple_timepoints = timepoint_counts[timepoint_counts["timepoint_count"] > 1]
-    print(f"Subjects with multiple timepoints:\n{subjects_multiple_timepoints}")
+    print(f"Number of subjects with multiple timepoints/sessions with both fitbit and mri files: {len(subjects_multiple_timepoints)}")
 
     # Get subjects with immediate follow-up timepoints (e.g., ses-01A and ses-02A)
     def has_immediate_followup(timepoints):
@@ -188,7 +188,7 @@ def select_subjects(dta_path, test=False):
         timepoint_numbers.sort()
         return any((n2 - n1 == 1) for n1, n2 in zip(timepoint_numbers, timepoint_numbers[1:]))
     subjects_immediate_followup = merged_timepoints[merged_timepoints["common_timepoints"].apply(has_immediate_followup)]
-    print(f"Subjects with immediate follow-up timepoints:\n{subjects_immediate_followup[['subject', 'common_timepoints']]}")
+    print(f"Number of subjects with immediate follow-up timepoints: {len(subjects_immediate_followup)}")
 
     # GET DEMOGRAPHIC DATA
     
