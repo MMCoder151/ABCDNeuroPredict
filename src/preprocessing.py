@@ -4,6 +4,7 @@ from src.mri_rois import mri_rois
 import duckdb
 from pcntoolkit import NormativeModel, BLR, Runner
 from pcntoolkit.dataio.norm_data import NormData
+from tqdm import tqdm
 
 # ---- DATA WRANGLING ----
 
@@ -109,28 +110,29 @@ def select_subjects(dta_path, test=False):
     incomplete_timepoints = fit_counts[fit_counts["fit_count"] != 7][["subject", "timepoint"]]
     fit_meta_df = fit_meta_df.merge(incomplete_timepoints, on=["subject", "timepoint"], how="left", indicator=True)
     fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
-    print(f"Dropped {len(incomplete_timepoints)} timepoints with incomplete fit data.")
+    print(f"Dropped {len(incomplete_timepoints)} timepoints with incomplete fitbit data.")
     print(f"Number of subjects remaining after dropping incomplete timepoints: {fit_meta_df['subject'].nunique()}")
     print(f"Average number of timepoints per subject with fitbit data after dropping incomplete timepoints: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
     # get recording duration in days for each fit file and drop timepoints with less than 7 days of data
+    print("Computing Fitbit recording durations...")
     fit_meta_df["recording_duration_days"] = [
         (lambda df: (df["Wear_Time"].max() - df["Wear_Time"].min()).days)(_load_fitbit_df(x))
-        for x in fit_meta_df["filepath"]
+        for x in tqdm(fit_meta_df["filepath"], total=len(fit_meta_df["filepath"]), desc="Fitbit files")
     ]
     short_recordings = fit_meta_df[fit_meta_df["recording_duration_days"] < 7][["subject", "timepoint"]].drop_duplicates()
     fit_meta_df = fit_meta_df.merge(short_recordings, on=["subject", "timepoint"], how="left", indicator=True)
     fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
     print(f"Dropped {len(short_recordings)} timepoints with less than 7 days of fitbit data.")
     print(f"Number of subjects remaining after dropping short recordings: {fit_meta_df['subject'].nunique()}")
-    print(f"Average number of timepoints per subject with fitbit data after dropping short recordings: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+    print(f"Average number of timepoints per subject after dropping short recordings: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
     # GET MRI METADATA
 
     # Find "scans" files
     scan_files = []
 
-    for sub_folder in sub_folders:
+    for sub_folder in tqdm(sub_folders, total=len(sub_folders), desc="Searching MRI subjects"):
         sub_id = sub_folder.name
         
         # Search recursively for files with "scans" in the name
@@ -166,13 +168,14 @@ def select_subjects(dta_path, test=False):
     merged_timepoints = pd.merge(fit_timepoints, scan_timepoints, on="subject", how="inner", suffixes=("_fit", "_scan"))
     merged_timepoints["common_timepoints"] = merged_timepoints.apply(lambda row: set(row["timepoint_fit"]) & set(row["timepoint_scan"]), axis=1)
 
-    # Keep only common fit and scan timepoints for further analysis
-    fit_meta_df = fit_meta_df.merge(merged_timepoints[["subject", "common_timepoints"]], left_on="subject", right_on="subject", how="inner")
-    fit_meta_df = fit_meta_df[fit_meta_df.apply(lambda row: row["timepoint"] in row["common_timepoints"], axis=1)].drop(columns=["common_timepoints"])
-    mri_meta_df = mri_meta_df.merge(merged_timepoints[["subject", "common_timepoints"]], left_on="subject", right_on="subject", how="inner")
-    mri_meta_df = mri_meta_df[mri_meta_df.apply(lambda row: row["timepoint"] in row["common_timepoints"], axis=1)].drop(columns=["common_timepoints"])
-    print(f"Number of subjects with both 'fit' and 'scans' files: {fit_meta_df['subject'].nunique()}")
-    print(f"Average number of common timepoints per subject with both 'fit' and 'scans' files: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+    # Ensure we keep only exact matching (subject, timepoint) pairs that exist in BOTH fit and MRI metadata.
+    fit_pairs = fit_meta_df[["subject", "timepoint"]].drop_duplicates()
+    mri_pairs = mri_meta_df[["subject", "timepoint"]].drop_duplicates()
+    common_pairs = pd.merge(fit_pairs, mri_pairs, on=["subject", "timepoint"], how="inner")
+    # Filter both metadata tables to the intersection of pairs
+    fit_meta_df = fit_meta_df.merge(common_pairs, on=["subject", "timepoint"], how="inner")
+    mri_meta_df = mri_meta_df.merge(common_pairs, on=["subject", "timepoint"], how="inner")
+    print(f"Filtered to {len(common_pairs)} common subject-timepoint pairs present in both fitbit and MRI metadata.")
 
     # Get subjects with multiple timepoints/sessions with both "fit" and "scans" files
     timepoint_counts = fit_meta_df.groupby("subject")["timepoint"].nunique().reset_index(name="timepoint_count")
@@ -219,16 +222,17 @@ def select_subjects(dta_path, test=False):
     mri_meta_df["age_at_mri"] = ((mri_meta_df["mri_date"] - mri_meta_df["date_of_birth"]).dt.days / 365.25).round(0).astype("Int64")
     mri_meta_df = mri_meta_df.drop(columns=["date_of_birth"])
 
-    # Check that subjects and timepoints in mri_meta_df and fit_meta_df match
-    assert set(mri_meta_df["subject"].unique()) == set(fit_meta_df["subject"].unique()), "Subjects in mri_meta_df and fit_meta_df do not match"
-    assert set(mri_meta_df["timepoint"].unique()) == set(fit_meta_df["timepoint"].unique()), "Timepoints in mri_meta_df and fit_meta_df do not match"
+    # Check that subject/timepoint PAIRS in mri_meta_df and fit_meta_df match exactly
+    pairs_fit = set(map(tuple, fit_meta_df[["subject","timepoint"]].drop_duplicates().values))
+    pairs_mri = set(map(tuple, mri_meta_df[["subject","timepoint"]].drop_duplicates().values))
+    assert pairs_fit == pairs_mri, "Subject-timepoint pairs in mri_meta_df and fit_meta_df do not match"
 
     # drop filepath and filename columns from mri_meta_df
     mri_meta_df = mri_meta_df.drop(columns=["filepath", "filename"])
 
     return demo_df, mri_meta_df, fit_meta_df
 
-def setup_duckdb(dta_path, fit_meta_df):
+def setup_duckdb(dta_path, fit_meta_df, overwrite = False):
     '''
     This function transforms the raw fitbit and MRI data to make it easier to query with DuckDB for downstream analysis
     and sets up a DuckDB connection with views for the transformed fitbit and MRI data.
@@ -244,6 +248,13 @@ def setup_duckdb(dta_path, fit_meta_df):
     Returns:
         con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
     '''
+    if overwrite == False:
+        print("DuckDB setup skipped (overwrite=False). To re-run data transformation and DuckDB setup, set overwrite=True.")
+        con = duckdb.connect()
+        con.execute(f"CREATE OR REPLACE VIEW fitbit_data AS SELECT * FROM read_parquet('{output_dir_fit}/**/combined_fitbit.parquet', union_by_name => TRUE)")
+        con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/**/combined_mri.parquet', union_by_name => TRUE)")
+
+        return con
 
     # Create output directories for fitbit and mri data
     output_dir_fit = dta_path / "processed_fitbit_data"
@@ -252,7 +263,7 @@ def setup_duckdb(dta_path, fit_meta_df):
     output_dir_mri.mkdir(parents=True, exist_ok=True)
     
     # Combine fitbit files for each subject and timepoint into a single parquet file based on datetime index
-    for _, row in fit_meta_df.iterrows():
+    for _, row in tqdm(fit_meta_df.iterrows(), total=len(fit_meta_df), desc="Combining Fitbit files"):
         subject = row["subject"]
         timepoint = row["timepoint"]
         filepath = row["filepath"]
@@ -294,7 +305,7 @@ def setup_duckdb(dta_path, fit_meta_df):
     mri_data_accumulator = {}  # {(subject, timepoint): {columns from all files}}
     
     # Extract MRI data for each subject and timepoint and accumulate across all files
-    for file in mri_files:
+    for file in tqdm(mri_files, total=len(mri_files), desc="Processing MRI phenotype files"):
         mri_df = pd.read_csv(dta_path / "phenotype" / file, sep="\t")
         # Select only columns that exist in the dataframe
         available_cols = ["participant_id", "session_id"] + [col for col in mri_rois_dict.keys() if col in mri_df.columns]
@@ -321,7 +332,7 @@ def setup_duckdb(dta_path, fit_meta_df):
                     mri_data_accumulator[key][col] = row[col]
     
     # Write accumulated MRI data to parquet files
-    for (subject, timepoint), data_dict in mri_data_accumulator.items():
+    for (subject, timepoint), data_dict in tqdm(mri_data_accumulator.items(), total=len(mri_data_accumulator), desc="Writing MRI data"):
         subject_dir = output_dir_mri / f"{subject}"
         timepoint_dir = subject_dir / f"{timepoint}"
         timepoint_dir.mkdir(parents=True, exist_ok=True)

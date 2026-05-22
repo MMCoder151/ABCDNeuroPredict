@@ -14,7 +14,7 @@ if not os.path.exists(output_path):
 dem_df, mri_meta_df, fit_meta_df = select_subjects(dta_path, test=False)
 
 # Transform data to make it easier to query with DuckDB
-con = setup_duckdb(dta_path, fit_meta_df)
+con = setup_duckdb(dta_path, fit_meta_df, overwrite=True)
 
 # Select subjects based on normative modeling and composite z-scores
 selected_subjects = normative_selection(con, mri_meta_df, output_path)
