@@ -7,6 +7,32 @@ from pcntoolkit.dataio.norm_data import NormData
 
 # ---- DATA WRANGLING ----
 
+def _load_fitbit_df(filepath):
+    '''
+    Helper function meant to deal with inconsistencies in fitbit file naming schemes
+    and formats. It loads a fitbit file, finds the correct time column, renames it to "Wear_Time" for consistency, 
+    converts it to datetime format, drops rows with invalid or missing time values, and sorts by time.
+    '''
+    # Define possible names for time column in fitbit files
+    FITBIT_TIME_COLUMNS = ("Wear_Time", "ActivityMinute", "Time", "date")
+    # Helper function to find the correct time column in the fitbit dataframe
+    def _get_fitbit_time_column(columns):
+        normalized_columns = {str(column).strip().lower(): column for column in columns}
+        for candidate in FITBIT_TIME_COLUMNS:
+            match = normalized_columns.get(candidate.lower())
+            if match is not None:
+                return match
+        raise KeyError(f"No known Fitbit time column found. Available columns: {list(columns)}")
+    # Load the fitbit file, find the correct time column, rename it to "Wear_Time", convert it to datetime format, drop rows with invalid or missing time values, and sort by time
+    fit_df = pd.read_csv(filepath, sep="\t")
+    time_col = _get_fitbit_time_column(fit_df.columns)
+    if time_col != "Wear_Time":
+        fit_df = fit_df.rename(columns={time_col: "Wear_Time"})
+    fit_df["Wear_Time"] = pd.to_datetime(fit_df["Wear_Time"], errors="coerce", format="mixed")
+    fit_df = fit_df.dropna(subset=["Wear_Time"]).sort_values("Wear_Time")
+    return fit_df
+
+
 def select_subjects(dta_path, test=False):
     '''
     This function selects subjects and time points based on selection criteria (below) and extracts demographic and meta information for fitbit and mri data
@@ -84,14 +110,19 @@ def select_subjects(dta_path, test=False):
     fit_meta_df = fit_meta_df.merge(incomplete_timepoints, on=["subject", "timepoint"], how="left", indicator=True)
     fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
     print(f"Dropped {len(incomplete_timepoints)} timepoints with incomplete fit data.")
+    print(f"Number of subjects remaining after dropping incomplete timepoints: {fit_meta_df['subject'].nunique()}")
     print(f"Average number of timepoints per subject with fitbit data after dropping incomplete timepoints: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
     # get recording duration in days for each fit file and drop timepoints with less than 7 days of data
-    fit_meta_df["recording_duration_days"] = fit_meta_df["filepath"].apply(lambda x: (pd.to_datetime(pd.read_csv(x, sep="\t")["Wear_Time"].max()) - pd.to_datetime(pd.read_csv(x, sep="\t")["Wear_Time"].min())).days)
+    fit_meta_df["recording_duration_days"] = [
+        (lambda df: (df["Wear_Time"].max() - df["Wear_Time"].min()).days)(_load_fitbit_df(x))
+        for x in fit_meta_df["filepath"]
+    ]
     short_recordings = fit_meta_df[fit_meta_df["recording_duration_days"] < 7][["subject", "timepoint"]].drop_duplicates()
     fit_meta_df = fit_meta_df.merge(short_recordings, on=["subject", "timepoint"], how="left", indicator=True)
     fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
     print(f"Dropped {len(short_recordings)} timepoints with less than 7 days of fitbit data.")
+    print(f"Number of subjects remaining after dropping short recordings: {fit_meta_df['subject'].nunique()}")
     print(f"Average number of timepoints per subject with fitbit data after dropping short recordings: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
     # GET MRI METADATA
@@ -227,11 +258,7 @@ def setup_duckdb(dta_path, fit_meta_df):
         filepath = row["filepath"]
 
         # Read the fitbit file
-        fit_df = pd.read_csv(filepath, sep="\t")
-
-        # Convert time column to datetime and keep it as the merge key
-        fit_df["Wear_Time"] = pd.to_datetime(fit_df["Wear_Time"], errors="coerce")
-        fit_df = fit_df.dropna(subset=["Wear_Time"]).sort_values("Wear_Time")
+        fit_df = _load_fitbit_df(filepath)
 
         value_cols = [
             col for col in fit_df.columns
@@ -335,6 +362,7 @@ def normative_selection(con, mri_meta_df, output_path):
         output_path (str): Path to the output directory where the normative model results will be saved
     Returns:
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
+        normative_modelling (Folder): Folder containing the normative model, results, and plots created in the output directory
     '''
     # Get MRI ROIs to include in the normative model
     _, mri_rois_dict = mri_rois()
@@ -421,7 +449,7 @@ def normative_selection(con, mri_meta_df, output_path):
     # fit the model 
     #runner.fit(model, data)
 
-    # Read in centile file from normative modeling 
+    # Read in z-score file from normative modeling 
     centiles_df = pd.read_csv(normative_output_dir / "results" / "Z_mri_norm.csv")
     # Calculate composite absolute z-score across all MRI ROIs for each subject
     centiles_df["composite_z"] = centiles_df[mri_roi_cols].abs().sum(axis=1)
