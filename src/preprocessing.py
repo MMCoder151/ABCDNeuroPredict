@@ -5,6 +5,7 @@ import duckdb
 from pcntoolkit import NormativeModel, BLR, Runner
 from pcntoolkit.dataio.norm_data import NormData
 from tqdm import tqdm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 # ---- DATA WRANGLING ----
 
@@ -417,6 +418,9 @@ def normative_selection(con, mri_meta_df, output_path):
 
     df['sex'] = pd.to_numeric(df['sex'], errors='raise').astype(float)
     df['age_at_mri'] = pd.to_numeric(df['age_at_mri'], errors='raise').astype(float)
+    ############
+    # ADD SCAN SITES AS COVARIATES
+    ############
 
     # Prepare data for normative modeling
     data = NormData.from_dataframe(
@@ -469,7 +473,138 @@ def normative_selection(con, mri_meta_df, output_path):
     selected_subjects = centiles_df[centiles_df["composite_z"] >= threshold].copy()
     print(f"Selected {len(selected_subjects)} subjects with composite z-score >= {threshold:.2f} (top 10%)")
 
+    # Create summary table with mean, std, min, and max per mri_roi for the selected subjects
+    stats_selected = (
+        selected_subjects[mri_roi_cols]
+        .agg(['mean', 'std', 'min', 'max'])
+        .transpose()
+        .reset_index()
+        .rename(columns={"index": "mri_roi"})
+    )
+    stats_selected.to_csv(normative_output_dir / "results" / "mri_roi_statistics.csv", index=False)
+
+    # Create results summary table with mean, std, min, and max per metric
+    stats_df = pd.read_csv(normative_output_dir / "results" / "statistics_mri_norm.csv")
+    summary = stats_df.assign(
+        mean = stats_df[mri_roi_cols].mean(axis=1),
+        std  = stats_df[mri_roi_cols].std(axis=1),
+        min  = stats_df[mri_roi_cols].min(axis=1),
+        max  = stats_df[mri_roi_cols].max(axis=1),
+    )[["statistic", "mean", "std", "min", "max"]]
+    summary.to_csv(normative_output_dir / "results" / "statistics_summary.csv", index=False)
+
     return selected_subjects
 
+def create_mri_composites(con, selected_subjects):
+    '''
+    This function creates composite scores out of selected subject's z-scores based on 
+    variance inflation factors (VIF) to account for multicollinearity between MRI ROIs.
 
+    Parameters:
+        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
+    Returns:
+        composite_scores_df (DataFrame): DataFrame containing the selected subjects and their composite scores based on the selected MRI ROIs
+        composite_dict (dict): Dictionary mapping composite score names to the MRI ROIs included in each composite
+    '''
+
+    # Get MRI ROIs to include in the normative model
+    _, mri_rois_dict = mri_rois()
+    mri_roi_cols = list(mri_rois_dict.keys())
+
+    # Calculate variance inflation factors (VIF) for the selected MRI ROIs
+    vif_data = selected_subjects[mri_roi_cols].dropna()
+    vif_df = pd.DataFrame({
+        "mri_roi": vif_data.columns,
+        "vif": [variance_inflation_factor(vif_data.values, i) for i in range(vif_data.shape[1])]
+    }).sort_values("vif", ascending=False)
+    vif_df.head
+
+    # Replace variables with a vif above 10 with their average until all variables have a vif below 10
+    composite_dict = {}
+    while vif_df["vif"].max() > 10:
+        # Get the variable with the highest VIF
+        high_vif_roi = vif_df.iloc[0]["mri_roi"]
+        # Create a composite score by averaging this variable with the variable it is most correlated with
+        correlations = vif_data.corr()[high_vif_roi].drop(high_vif_roi).abs()
+        most_correlated_roi = correlations.idxmax()
+        composite_name = f"composite_{high_vif_roi}_{most_correlated_roi}"
+        selected_subjects[composite_name] = selected_subjects[[high_vif_roi, most_correlated_roi]].mean(axis=1)
+        composite_dict[composite_name] = [high_vif_roi, most_correlated_roi]
+        # Drop the original variable with high VIF from the data used to calculate VIFs in the next iteration
+        vif_data = vif_data.drop(columns=[high_vif_roi])
+        # Recalculate VIFs
+        vif_df = pd.DataFrame({
+            "mri_roi": vif_data.columns,
+            "vif": [variance_inflation_factor(vif_data.values, i) for i in range(vif_data.shape[1])]
+        }).sort_values("vif", ascending=False)
+    print(f"Final MRI ROIs included in composites: {vif_df['mri_roi'].tolist()}")
+    print(f"Composites created: {composite_dict}")
+
+    return selected_subjects, composite_dict
     
+def extr_fitbit_features(con, selected_subjects):
+    '''
+    This function extracts features from the fitbit data for the selected subjects.
+        1. Creates daily mean, std, min, and max for each fitbit metric
+        2. Conducts weekly Seasonal Trend Decomposition using Loess (STL) for each daily fitbit metric
+        3. Creates mean, stdm, min, and max for the trend, seasonal, and residual components of the STL decomposition for each fitbit metric
+    Parameters:
+        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
+        selected_subjects (DataFrame): DataFrame containing the selected subjects
+    Returns:
+        fitbit_features_df (DataFrame): DataFrame containing the extracted fitbit features for each subject
+    '''
+    # Get list of selected subjects
+    selected_subjects_list = selected_subjects["subject"].tolist()
+    # Query fitbit data for the selected subjects
+    query = f"""
+    SELECT *
+    FROM fitbit_data
+    WHERE subject IN ({', '.join(f"'{s}'" for s in selected_subjects_list)})
+    """
+    fitbit_df = con.execute(query).df()
+    print(f"Fitbit data loaded for selected subjects: {len(fitbit_df)} rows")
+
+    # Get fitbit metric columns (exclude subject, timepoint, and Wear_Time)
+    fitbit_metric_cols = [col for col in fitbit_df.columns if col not in ["subject", "timepoint", "Wear_Time"]]
+
+    # Create a dataframe to hold the extracted features
+    features_list = []
+
+    # Loop through each subject and timepoint to extract features
+    for (subject, timepoint), group in tqdm(fitbit_df.groupby(["subject", "timepoint"]), total=fitbit_df.groupby(["subject", "timepoint"]).ngroups, desc="Extracting Fitbit features"):
+        feature_dict = {"subject": subject, "timepoint": timepoint}
+        for metric in fitbit_metric_cols:
+            if metric in group.columns:
+                daily_data = group[["Wear_Time", metric]].dropna()
+                if not daily_data.empty:
+                    daily_data.set_index("Wear_Time", inplace=True)
+                    daily_stats = daily_data.resample("D").agg(['mean', 'std', 'min', 'max'])
+                    daily_stats.columns = ['_'.join(col) for col in daily_stats.columns]
+                    feature_dict.update(daily_stats.mean().to_dict())
+                    # STL decomposition
+                    try:
+                        from statsmodels.tsa.seasonal import STL
+                        stl = STL(daily_data[metric], period=7, robust=True)
+                        result = stl.fit()
+                        stl_features = {
+                            f"{metric}_trend_mean": result.trend.mean(),
+                            f"{metric}_trend_std": result.trend.std(),
+                            f"{metric}_trend_min": result.trend.min(),
+                            f"{metric}_trend_max": result.trend.max(),
+                            f"{metric}_seasonal_mean": result.seasonal.mean(),
+                            f"{metric}_seasonal_std": result.seasonal.std(),
+                            f"{metric}_seasonal_min": result.seasonal.min(),
+                            f"{metric}_seasonal_max": result.seasonal.max(),
+                            f"{metric}_resid_mean": result.resid.mean(),
+                            f"{metric}_resid_std": result.resid.std(),
+                            f"{metric}_resid_min": result.resid.min(),
+                            f"{metric}_resid_max": result.resid.max(),
+                        }
+                        feature_dict.update(stl_features)
+                    except Exception as e:
+                        print(f"STL decomposition failed for subject {subject}, timepoint {timepoint}, metric {metric}: {e}")
+        features_list.append(feature_dict)
+    fitbit_features_df = pd.DataFrame(features_list)
+    return fitbit_features_df
