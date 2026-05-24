@@ -1,7 +1,7 @@
 import pandas as pd
 from pathlib import Path
 import os
-from src.preprocessing import select_subjects, setup_duckdb, normative_selection, create_mri_composites
+from src.preprocessing import select_subjects, setup_duckdb, normative_selection, create_mri_composites, extr_fitbit_features
 
 # Set data directory paths
 dta_path = Path.home() / "dairc" / "rawdata"
@@ -35,3 +35,6 @@ selected_subjects, composite_dict = create_mri_composites(con, selected_subjects
 
 # Save selected subjects to CSV
 selected_subjects.to_csv(os.path.join(output_path, "selected_subjects.csv"), index=False)
+
+# Extract features from selected subjects fitbit data
+fitbit_features_df = extr_fitbit_features(con, selected_subjects)

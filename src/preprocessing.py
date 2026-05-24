@@ -6,6 +6,7 @@ from pcntoolkit import NormativeModel, BLR, Runner
 from pcntoolkit.dataio.norm_data import NormData
 from tqdm import tqdm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.tsa.seasonal import STL
 
 # ---- DATA WRANGLING ----
 
@@ -34,6 +35,10 @@ def _load_fitbit_df(filepath):
     fit_df = fit_df.dropna(subset=["Wear_Time"]).sort_values("Wear_Time")
     return fit_df
 
+def recode_fitbit_data(fit_df):
+    '''
+    Recodes Fitbit data according to specific rules.
+    '''
 
 def select_subjects(dta_path, test=False):
     '''
@@ -249,6 +254,13 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite = False):
     Returns:
         con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
     '''
+
+    # Create output directories for fitbit and mri data
+    output_dir_fit = dta_path / "processed_fitbit_data"
+    output_dir_mri = dta_path / "processed_mri_data"
+    output_dir_fit.mkdir(parents=True, exist_ok=True)
+    output_dir_mri.mkdir(parents=True, exist_ok=True)
+
     if overwrite == False:
         print("DuckDB setup skipped (overwrite=False). To re-run data transformation and DuckDB setup, set overwrite=True.")
         con = duckdb.connect()
@@ -256,12 +268,6 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite = False):
         con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/**/combined_mri.parquet', union_by_name => TRUE)")
 
         return con
-
-    # Create output directories for fitbit and mri data
-    output_dir_fit = dta_path / "processed_fitbit_data"
-    output_dir_mri = dta_path / "processed_mri_data"
-    output_dir_fit.mkdir(parents=True, exist_ok=True)
-    output_dir_mri.mkdir(parents=True, exist_ok=True)
     
     # Combine fitbit files for each subject and timepoint into a single parquet file based on datetime index
     for _, row in tqdm(fit_meta_df.iterrows(), total=len(fit_meta_df), desc="Combining Fitbit files"):
@@ -538,7 +544,6 @@ def create_mri_composites(con, selected_subjects):
             "mri_roi": vif_data.columns,
             "vif": [variance_inflation_factor(vif_data.values, i) for i in range(vif_data.shape[1])]
         }).sort_values("vif", ascending=False)
-    print(f"Final MRI ROIs included in composites: {vif_df['mri_roi'].tolist()}")
     print(f"Composites created: {composite_dict}")
 
     return selected_subjects, composite_dict
@@ -556,7 +561,7 @@ def extr_fitbit_features(con, selected_subjects):
         fitbit_features_df (DataFrame): DataFrame containing the extracted fitbit features for each subject
     '''
     # Get list of selected subjects
-    selected_subjects_list = selected_subjects["subject"].tolist()
+    selected_subjects_list = selected_subjects["subject_ids"].tolist()
     # Query fitbit data for the selected subjects
     query = f"""
     SELECT *
@@ -573,7 +578,8 @@ def extr_fitbit_features(con, selected_subjects):
     features_list = []
 
     # Loop through each subject and timepoint to extract features
-    for (subject, timepoint), group in tqdm(fitbit_df.groupby(["subject", "timepoint"]), total=fitbit_df.groupby(["subject", "timepoint"]).ngroups, desc="Extracting Fitbit features"):
+    grouped = fitbit_df.groupby(["subject", "timepoint"])
+    for (subject, timepoint), group in tqdm(grouped, total=grouped.ngroups, desc="Extracting Fitbit features"):
         feature_dict = {"subject": subject, "timepoint": timepoint}
         for metric in fitbit_metric_cols:
             if metric in group.columns:
@@ -607,4 +613,5 @@ def extr_fitbit_features(con, selected_subjects):
                         print(f"STL decomposition failed for subject {subject}, timepoint {timepoint}, metric {metric}: {e}")
         features_list.append(feature_dict)
     fitbit_features_df = pd.DataFrame(features_list)
+    
     return fitbit_features_df
