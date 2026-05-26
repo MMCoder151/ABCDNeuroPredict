@@ -7,6 +7,7 @@ from pcntoolkit.dataio.norm_data import NormData
 from tqdm import tqdm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.tsa.seasonal import STL
+import pathlib
 
 # ---- DATA WRANGLING ----
 
@@ -40,7 +41,7 @@ def recode_fitbit_data(fit_df):
     Recodes Fitbit data according to specific rules.
     '''
 
-def select_subjects(dta_path, test=False):
+def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Path("output")):
     '''
     This function selects subjects and time points based on selection criteria (below) and extracts demographic and meta information for fitbit and mri data
         - Only subjects with both "fit" and "scans" files are included (=> subjects with both Fitbit and MRI data)
@@ -51,6 +52,9 @@ def select_subjects(dta_path, test=False):
 
     Parameters:
         dta_path (Path): Path to the raw data directory
+        test (bool): Whether to run in test mode (only uses first 100 subjects for faster testing)
+        overwrite (bool): Whether to overwrite existing metadata files (if False, will load existing metadata files if they exist and skip the selection process)
+        output_path (Path): Path to the output directory to reimport metadata files if overwrite=False
     Returns:
         demo_df (DataFrame): DataFrame containing demographic data for included subjects (sex, age)
         mri_meta_df (DataFrame): DataFrame containing MRI date and  age at MRI scan for included subjects and timepoints/sessions
@@ -70,6 +74,13 @@ def select_subjects(dta_path, test=False):
             Since these files only contain data during the night, not wearing the watch at night at the start or end of recording, 
             ends the files at an earlier date
     '''
+    if overwrite == False:
+        print("Subject selection skipped (overwrite=False). To re-run subject selection, set overwrite=True.")
+        demo_df = pd.read_csv(output_path / "demographics_metadata.csv")
+        mri_meta_df = pd.read_csv(output_path / "mri_metadata.csv")
+        fit_meta_df = pd.read_csv(output_path / "fitbit_metadata.csv")
+        return demo_df, mri_meta_df, fit_meta_df
+
     # Read participant information and get subject folders
     subs = pd.read_csv(dta_path / "participants.tsv", sep="\t")
     sub_folders = [f for f in dta_path.iterdir() if f.name in subs["participant_id"].values]
@@ -205,13 +216,21 @@ def select_subjects(dta_path, test=False):
     mri_path = dta_path / "phenotype"
     stc_df = pd.read_csv(mri_path / "ab_g_stc.tsv", sep="\t")
 
-    # create dataframe with sex and date of birth for included subjects
+    # import scansite information
+    scan_site_df = pd.read_csv(mri_path / "ab_g_dyn.tsv", sep="\t")
+
+    # create dataframe with sex, date of birth, and scan site for included subjects
     demo_df = subs[subs["participant_id"].isin(included_subjects)][["participant_id", "sex"]].merge(
         stc_df[stc_df["participant_id"].isin(included_subjects)][["participant_id", "ab_g_stc__cohort_dob"]],
         on="participant_id",
         how="left"
     )
-    demo_df.rename(columns={"ab_g_stc__cohort_dob": "date_of_birth", "participant_id": "subject"}, inplace=True)
+    demo_df = demo_df.merge(
+        scan_site_df[scan_site_df["participant_id"].isin(included_subjects)][["participant_id", "ab_g_dyn__design_site"]],
+        on="participant_id",
+        how="left"
+    )
+    demo_df.rename(columns={"ab_g_stc__cohort_dob": "date_of_birth", "participant_id": "subject", "ab_g_dyn__design_site": "scan_site"}, inplace=True)
 
     # Extract MRI acquisition date and add to mri_meta_df
     for file in mri_meta_df["filepath"]:
@@ -222,7 +241,7 @@ def select_subjects(dta_path, test=False):
         mri_meta_df.loc[mri_meta_df["filepath"] == file, "mri_date"] = mri_date
 
     # add sex and age at MRI scan (rounded to nearest year) to mri_meta_df
-    mri_meta_df = mri_meta_df.merge(demo_df[["subject", "sex", "date_of_birth"]], left_on="subject", right_on="subject", how="left")
+    mri_meta_df = mri_meta_df.merge(demo_df[["subject", "sex", "date_of_birth", "scan_site"]], left_on="subject", right_on="subject", how="left")
     mri_meta_df["mri_date"] = pd.to_datetime(mri_meta_df["mri_date"], errors="coerce")
     mri_meta_df["date_of_birth"] = pd.to_datetime(mri_meta_df["date_of_birth"], errors="coerce")
     mri_meta_df["age_at_mri"] = ((mri_meta_df["mri_date"] - mri_meta_df["date_of_birth"]).dt.days / 365.25).round(0).astype("Int64")
@@ -235,6 +254,12 @@ def select_subjects(dta_path, test=False):
 
     # drop filepath and filename columns from mri_meta_df
     mri_meta_df = mri_meta_df.drop(columns=["filepath", "filename"])
+
+    # save metadata to csv
+    output_path.mkdir(parents=True, exist_ok=True)
+    demo_df.to_csv(output_path / "demographics_metadata.csv", index=False)
+    mri_meta_df.to_csv(output_path / "mri_metadata.csv", index=False)
+    fit_meta_df.to_csv(output_path / "fitbit_metadata.csv", index=False)
 
     return demo_df, mri_meta_df, fit_meta_df
 
@@ -401,7 +426,7 @@ def normative_selection(con, mri_meta_df, output_path):
 
     # Merge MRI data with demographic data
     df = mri_df.merge(
-    mri_meta_df[["subject", "sex", "age_at_mri"]].drop_duplicates(),
+    mri_meta_df[["subject", "sex", "age_at_mri", "scan_site"]].drop_duplicates(),
     on="subject",
     how="inner"    
     )
@@ -424,15 +449,13 @@ def normative_selection(con, mri_meta_df, output_path):
 
     df['sex'] = pd.to_numeric(df['sex'], errors='raise').astype(float)
     df['age_at_mri'] = pd.to_numeric(df['age_at_mri'], errors='raise').astype(float)
-    ############
-    # ADD SCAN SITES AS COVARIATES
-    ############
+    df['scan_site'] = pd.to_numeric(df['scan_site'], errors='raise').astype(float)
 
     # Prepare data for normative modeling
     data = NormData.from_dataframe(
         name="mri_norm",
         dataframe=df,
-        covariates=["sex", "age_at_mri"],
+        covariates=["sex", "age_at_mri", "scan_site"],
         response_vars=mri_roi_cols,
         subject_ids="subject",
         remove_Nan=True,
@@ -547,7 +570,18 @@ def create_mri_composites(con, selected_subjects):
     print(f"Composites created: {composite_dict}")
 
     return selected_subjects, composite_dict
-    
+
+def mri_subtyping(con, selected_subjects):
+    '''
+    This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data and composite scores.
+
+    Parameters:
+        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
+    Returns:
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their assigned cluster labels based on their MRI ROI data and composite scores
+    '''
+
 def extr_fitbit_features(con, selected_subjects):
     '''
     This function extracts features from the fitbit data for the selected subjects.
