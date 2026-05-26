@@ -8,6 +8,10 @@ from tqdm import tqdm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.tsa.seasonal import STL
 import pathlib
+from pyampute.exploration.mcar_statistical_tests import MCARTest
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import spearmanr
 
 # ---- DATA WRANGLING ----
 
@@ -32,14 +36,40 @@ def _load_fitbit_df(filepath):
     time_col = _get_fitbit_time_column(fit_df.columns)
     if time_col != "Wear_Time":
         fit_df = fit_df.rename(columns={time_col: "Wear_Time"})
-    fit_df["Wear_Time"] = pd.to_datetime(fit_df["Wear_Time"], errors="coerce", format="mixed")
+    fit_df["Wear_Time"] = pd.to_datetime(fit_df["Wear_Time"], errors="coerce", format = "mixed")
     fit_df = fit_df.dropna(subset=["Wear_Time"]).sort_values("Wear_Time")
     return fit_df
 
-def recode_fitbit_data(fit_df):
+def _recode_fitbit_data(fit_df):
     '''
-    Recodes Fitbit data according to specific rules.
+    Recodes Fitbit data according to specific rules from the ABCD Data Release 6.0 documentation:
+        - MET1m: Divide values by 10
+        - Slp1m: Recode "deep", "light", "rem" to 1 and 2, 3, "restless", "wake" to 0
     '''
+
+    # Recode MET1m values by dividing by 10
+    met_cols = [col for col in fit_df.columns if "METs" in col]
+    fit_df[met_cols] = fit_df[met_cols] / 10
+
+    # Recode Slp1m values
+    slp1m_cols = [col for col in fit_df.columns if "deep" in col or "light" in col or "rem" in col or "restless" in col or "wake" in col or 1 in col or 2 in col or 3 in col]
+    slp1m_mapping = {
+        "deep": 1,
+        "light": 1,
+        "rem": 1,
+        2: 0,
+        3: 0,
+        "restless": 0,
+        "wake": 0
+    }
+    for col in slp1m_cols:
+        fit_df[col] = fit_df[col].replace(slp1m_mapping)
+
+    # drop unnecessary meta columns
+    cols_to_drop = ["pGUID", "logId"]
+    fit_df = fit_df.drop(columns=[col for col in cols_to_drop if col in fit_df.columns])
+
+    return fit_df
 
 def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Path("output")):
     '''
@@ -48,8 +78,8 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
         - Only timepoints/sessions with both "fit" and "scans" files are included (=> timepoints/sessions with both Fitbit and MRI data)
         - Only subjects/sessions with complete "fit" data (i.e., all 7 "fit" files present) are included (=> complete Fitbit data for included subjects/sessions)
         - Only "scans" files with non-empty "acq_time" column are included (=> valid MRI acquisition date for included sessions)
-        - Only subjects/timepoints with more than 7 days of Fitbit data are included (=> sufficient Fitbit data for included sessions)
-
+        - Only subjects/timepoints with more than 7 days of actually recorded Fitbit data are included (=> sufficient Fitbit data for included sessions)
+        - Drops Slp30s files, due to unusable data according to ABCD Data Release 6.0 documentation
     Parameters:
         dta_path (Path): Path to the raw data directory
         test (bool): Whether to run in test mode (only uses first 100 subjects for faster testing)
@@ -59,7 +89,7 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
         demo_df (DataFrame): DataFrame containing demographic data for included subjects (sex, age)
         mri_meta_df (DataFrame): DataFrame containing MRI date and  age at MRI scan for included subjects and timepoints/sessions
         fit_meta_df (DataFrame): DataFrame containing filepaths for Fitbit data for included subjects and timepoints/sessions
-
+        demo_df, mri_meta_df, and fit_meta_df are saved as CSV files in the output directory for easy re-import if overwrite=False
     Note:
         "fit" files contain fitbit data. Multiple fitbit files exist containing different types of data:
         - Cal1m: calories measured in 1 minute intervals
@@ -120,11 +150,14 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
     print(f"Number of subjects with fitbit data: {n_fit_subs}")
     print(f"Average number of timepoints per subject with fitbit data: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
+    # Drop "Slp30s" files from fit_meta_df, since they are unusable
+    fit_meta_df = fit_meta_df[~fit_meta_df["filename"].str.contains("Slp30s", case=False)]
+
     # check if all subjects contain the same amount of "fit" files per timepoint
     fit_counts = fit_meta_df.groupby(["subject", "timepoint"]).size().reset_index(name="fit_count")
 
     # drop timepoints with incomplete fit data
-    incomplete_timepoints = fit_counts[fit_counts["fit_count"] != 7][["subject", "timepoint"]]
+    incomplete_timepoints = fit_counts[fit_counts["fit_count"] != 6][["subject", "timepoint"]]
     fit_meta_df = fit_meta_df.merge(incomplete_timepoints, on=["subject", "timepoint"], how="left", indicator=True)
     fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
     print(f"Dropped {len(incomplete_timepoints)} timepoints with incomplete fitbit data.")
@@ -133,14 +166,22 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
 
     # get recording duration in days for each fit file and drop timepoints with less than 7 days of data
     print("Computing Fitbit recording durations...")
-    fit_meta_df["recording_duration_days"] = [
-        (lambda df: (df["Wear_Time"].max() - df["Wear_Time"].min()).days)(_load_fitbit_df(x))
-        for x in tqdm(fit_meta_df["filepath"], total=len(fit_meta_df["filepath"]), desc="Fitbit files")
-    ]
-    short_recordings = fit_meta_df[fit_meta_df["recording_duration_days"] < 7][["subject", "timepoint"]].drop_duplicates()
+
+    for file in tqdm(fit_meta_df["filepath"], total=len(fit_meta_df["filepath"]), desc="Fitbit files"):
+        temp_df = _load_fitbit_df(file)
+        # Get length of recording
+        recording_length = (temp_df["Wear_Time"].max() - temp_df["Wear_Time"].min()).days
+        fit_meta_df.loc[fit_meta_df["filepath"] == file, "recording_duration_days"] = recording_length
+        # Check amount of actually present days
+        actual_days = set(temp_df["Wear_Time"].dt.floor("D").unique())
+        recording_duration_days = len(actual_days)
+        fit_meta_df.loc[fit_meta_df["filepath"] == file, "present_recording_days"] = recording_duration_days
+
+    fit_meta_df["missing_days_percentage"] = 100 * (1 - (fit_meta_df["present_recording_days"] / fit_meta_df["recording_duration_days"]))
+    short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 7) | (fit_meta_df["missing_days_percentage"] < 0.6)][["subject", "timepoint"]].drop_duplicates()
     fit_meta_df = fit_meta_df.merge(short_recordings, on=["subject", "timepoint"], how="left", indicator=True)
     fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
-    print(f"Dropped {len(short_recordings)} timepoints with less than 7 days of fitbit data.")
+    print(f"Dropped {len(short_recordings)} timepoints with less than 7 days and/or >60% missings of fitbit data.")
     print(f"Number of subjects remaining after dropping short recordings: {fit_meta_df['subject'].nunique()}")
     print(f"Average number of timepoints per subject after dropping short recordings: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
@@ -263,7 +304,7 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
 
     return demo_df, mri_meta_df, fit_meta_df
 
-def setup_duckdb(dta_path, fit_meta_df, overwrite = False):
+def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
     '''
     This function transforms the raw fitbit and MRI data to make it easier to query with DuckDB for downstream analysis
     and sets up a DuckDB connection with views for the transformed fitbit and MRI data.
@@ -302,6 +343,9 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite = False):
 
         # Read the fitbit file
         fit_df = _load_fitbit_df(filepath)
+
+        # Recode fitbit data
+        fit_df = _recode_fitbit_data(fit_df)
 
         value_cols = [
             col for col in fit_df.columns
@@ -582,12 +626,137 @@ def mri_subtyping(con, selected_subjects):
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their assigned cluster labels based on their MRI ROI data and composite scores
     '''
 
+def missingness_analysis(con, selected_subjects):
+    '''
+    This function analyzes the missingness patterns in the fitbit data for the selected subjects for MCAR, MAR, or MNAR missingness
+    using Littles test from pyampute.
+
+    Parameters:
+        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
+    Returns:
+        missingness_df (DataFrame): DataFrame containing the missingness patterns in the fitbit data for the selected subjects.
+    '''
+    # Do missingness analysis per sensor domain (actigraphy: Int1m, METs1m, Stps1m;
+    # heart rate: HR1m; sleep: Slp1m). The function will:
+    #  - run Little's MCAR test on the full dataset
+    #  - run Little's MCAR test per sensor domain
+    #  - create temporal missingness heatmaps per domain (hour x day_of_week)
+
+    # Get list of selected subjects
+    selected_subjects_list = selected_subjects["subject_ids"].tolist()
+    # Query fitbit data for the selected subjects
+    query = f"""
+    SELECT *
+    FROM fitbit_data WHERE subject IN ({', '.join(f"'{s}'" for s in selected_subjects_list)})
+    """
+    fitbit_df = con.execute(query).df()
+    print(f"Fitbit data loaded for selected subjects: {len(fitbit_df)} rows")
+
+    # Ensure Wear_Time is datetime
+    if "Wear_Time" in fitbit_df.columns:
+        fitbit_df["Wear_Time"] = pd.to_datetime(fitbit_df["Wear_Time"], errors="coerce")
+
+    # Conduct Little's test for MCAR on the full set of metric columns (drop non-metric cols)
+    metric_cols = [c for c in fitbit_df.columns if c not in ("subject", "timepoint", "Wear_Time")]
+    full_df_for_mcar = fitbit_df[metric_cols].dropna(axis=1, how="all")
+    if full_df_for_mcar.shape[1] == 0:
+        raise ValueError("No metric columns found in fitbit data for MCAR testing")
+
+    mcar_test = MCARTest()
+    try:
+        overall_missingness = mcar_test.fit_transform(full_df_for_mcar)
+        overall_p = overall_missingness["p_value"].iloc[0]
+        print(f"Overall Little's MCAR test p-value: {overall_p:.4f}")
+    except Exception as e:
+        print(f"Overall MCAR test failed: {e}")
+        overall_missingness = None
+
+    # Define sensor domains and patterns to detect columns
+    domains = {
+        "actigraphy": ["int1m", "mets1m", "stps1m", "steps", "intensity", "mets", "stps"],
+        "heart_rate": ["hr1m", "hr", "heartrate", "heart"],
+        "sleep": ["slp1m", "slp", "sleep"],
+    }
+
+    output_path = pathlib.Path("output")
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    domain_results = []
+
+    for domain, patterns in domains.items():
+        domain_cols = [c for c in metric_cols if any(p in c.lower() for p in patterns)]
+        domain_cols = [c for c in domain_cols if c in fitbit_df.columns]
+
+        if not domain_cols:
+            print(f"No columns found for domain '{domain}', skipping.")
+            continue
+
+        # Dataframe for MCAR test: drop columns that are entirely missing
+        domain_df_for_mcar = fitbit_df[domain_cols].dropna(axis=1, how="all")
+        if domain_df_for_mcar.shape[1] == 0:
+            print(f"All columns for domain '{domain}' are empty, skipping MCAR test.")
+            continue
+
+        # Run Little's MCAR test for this domain
+        try:
+            domain_mcar = MCARTest().fit_transform(domain_df_for_mcar)
+            domain_p = domain_mcar["p_value"].iloc[0]
+            print(f"Domain '{domain}' Little's MCAR p-value: {domain_p:.4f}")
+        except Exception as e:
+            print(f"MCAR test failed for domain '{domain}': {e}")
+            domain_p = None
+
+        # Temporal pattern analysis: mark a timestamp as missing for this domain when ALL domain metrics are NA
+        mask_missing_domain = fitbit_df[domain_cols].isna().all(axis=1).astype(int)
+        if "Wear_Time" in fitbit_df.columns:
+            fitbit_df["hour"] = fitbit_df["Wear_Time"].dt.hour
+            fitbit_df["day_of_week"] = fitbit_df["Wear_Time"].dt.dayofweek
+            temporal = (
+                pd.DataFrame({"missing": mask_missing_domain, "hour": fitbit_df["hour"], "day_of_week": fitbit_df["day_of_week"]})
+                .groupby(["hour", "day_of_week"])["missing"]
+                .mean()
+                .unstack()
+            )
+            plt.figure(figsize=(10, 6))
+            sns.heatmap(temporal, annot=False, fmt=".2f", cmap="viridis")
+            plt.title(f"Missingness Heatmap for {domain} by Hour and Day")
+            plt.xlabel("Day of Week (0=Monday, 6=Sunday)")
+            plt.ylabel("Hour of Day")
+            plt.tight_layout()
+            plt.savefig(Path(output_path) / f"missingness_heatmap_{domain}.png")
+            plt.close()
+
+            # spearman correlation between missingness and hour/day
+            try:
+                spearman_hour = spearmanr(fitbit_df["hour"].fillna(-1), mask_missing_domain)
+                spearman_day = spearmanr(fitbit_df["day_of_week"].fillna(-1), mask_missing_domain)
+                print(f"{domain}: Spearman missing vs hour rho={spearman_hour.correlation:.4f}, p={spearman_hour.pvalue:.4f}")
+                print(f"{domain}: Spearman missing vs day rho={spearman_day.correlation:.4f}, p={spearman_day.pvalue:.4f}")
+            except Exception as e:
+                print(f"Spearman correlation failed for domain '{domain}': {e}")
+
+        else:
+            print("Wear_Time column missing; skipping temporal analysis.")
+
+        domain_results.append({"domain": domain, "p_value": domain_p, "n_columns": len(domain_cols)})
+
+    domain_results_df = pd.DataFrame(domain_results)
+    domain_results_df.to_csv(output_path / "missingness_domain_results.csv", index=False)
+
+    # Return overall MCAR test result along with per-domain results
+    return {
+        "overall": overall_missingness,
+        "domains": domain_results_df,
+    }
+
 def extr_fitbit_features(con, selected_subjects):
     '''
     This function extracts features from the fitbit data for the selected subjects.
         1. Creates daily mean, std, min, and max for each fitbit metric
-        2. Conducts weekly Seasonal Trend Decomposition using Loess (STL) for each daily fitbit metric
-        3. Creates mean, stdm, min, and max for the trend, seasonal, and residual components of the STL decomposition for each fitbit metric
+        2. Imputes missing days 
+        3. Conducts weekly Seasonal Trend Decomposition using Loess (STL) for each daily fitbit metric
+        4. Creates mean, stdm, min, and max for the trend, seasonal, and residual components of the STL decomposition for each fitbit metric
     Parameters:
         con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
         selected_subjects (DataFrame): DataFrame containing the selected subjects

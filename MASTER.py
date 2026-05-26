@@ -14,13 +14,8 @@ if not os.path.exists(output_path):
 # Select subjects based on inclusion criteria and extract metadata
 dem_df, mri_meta_df, fit_meta_df = select_subjects(dta_path, test=False, overwrite=True)
 
-# Save metadata to CSV
-dem_df.to_csv(os.path.join(output_path, "demographics_metadata.csv"), index=False)
-mri_meta_df.to_csv(os.path.join(output_path, "mri_metadata.csv"), index=False)
-fit_meta_df.to_csv(os.path.join(output_path, "fitbit_metadata.csv"), index=False)
-
 # Transform data to make it easier to query with DuckDB
-con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
+con = setup_duckdb(dta_path, fit_meta_df, overwrite=True)
 
 # Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
 selected_subjects = normative_selection(con, mri_meta_df, output_path)
