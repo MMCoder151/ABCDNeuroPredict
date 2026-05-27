@@ -1,4 +1,6 @@
+import os
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from src.mri_rois import mri_rois
 import duckdb
@@ -12,6 +14,14 @@ from pyampute.exploration.mcar_statistical_tests import MCARTest
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import spearmanr
+from sklearn.mixture import BayesianGaussianMixture
+import hdbscan
+from sklearn.metrics import confusion_matrix
+from scipy.optimize import linear_sum_assignment
+from sklearn.metrics import jaccard_score
+from pyampute.exploration.mcar_statistical_tests import MCARTest
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.impute import IterativeImputer
 
 # ---- DATA WRANGLING ----
 
@@ -44,30 +54,41 @@ def _recode_fitbit_data(fit_df):
     '''
     Recodes Fitbit data according to specific rules from the ABCD Data Release 6.0 documentation:
         - MET1m: Divide values by 10
-        - Slp1m: Recode "deep", "light", "rem" to 1 and 2, 3, "restless", "wake" to 0
+        - Slp1m: Recode values to binary asleep (1) vs. awake/restless (0), with "unknown" as missing (None)
+        and drops unncessary meta columns (pGUID, logId)
     '''
+    # TODO: Extract all column names with non-numeric content
+
+    # drop unnecessary meta columns
+    cols_to_drop = ["pGUID", "logId"]
+    fit_df = fit_df.drop(columns=[col for col in cols_to_drop if col in fit_df.columns])
 
     # Recode MET1m values by dividing by 10
     met_cols = [col for col in fit_df.columns if "METs" in col]
     fit_df[met_cols] = fit_df[met_cols] / 10
 
     # Recode Slp1m values
-    slp1m_cols = [col for col in fit_df.columns if "deep" in col or "light" in col or "rem" in col or "restless" in col or "wake" in col or 1 in col or 2 in col or 3 in col]
+    slp1m_cols = [
+        col
+        for col in fit_df.columns
+        if any(token in str(col).lower() for token in ("deep", "light", "rem", "restless", "wake", "1", "2", "3"))
+    ]
     slp1m_mapping = {
+        "asleep": 1,
         "deep": 1,
         "light": 1,
         "rem": 1,
-        2: 0,
-        3: 0,
+        "2": 0,
+        "3": 0,
         "restless": 0,
-        "wake": 0
+        "wake": 0,
+        "wake": 0,
+        "unknown": None
     }
     for col in slp1m_cols:
         fit_df[col] = fit_df[col].replace(slp1m_mapping)
-
-    # drop unnecessary meta columns
-    cols_to_drop = ["pGUID", "logId"]
-    fit_df = fit_df.drop(columns=[col for col in cols_to_drop if col in fit_df.columns])
+    # Rename "level" column to "value" for consistency with other fitbit files
+    fit_df = fit_df.rename(columns={col: col.replace("Level", "value") for col in slp1m_cols})
 
     return fit_df
 
@@ -76,17 +97,17 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
     This function selects subjects and time points based on selection criteria (below) and extracts demographic and meta information for fitbit and mri data
         - Only subjects with both "fit" and "scans" files are included (=> subjects with both Fitbit and MRI data)
         - Only timepoints/sessions with both "fit" and "scans" files are included (=> timepoints/sessions with both Fitbit and MRI data)
-        - Only subjects/sessions with complete "fit" data (i.e., all 7 "fit" files present) are included (=> complete Fitbit data for included subjects/sessions)
-        - Only "scans" files with non-empty "acq_time" column are included (=> valid MRI acquisition date for included sessions)
-        - Only subjects/timepoints with more than 7 days of actually recorded Fitbit data are included (=> sufficient Fitbit data for included sessions)
         - Drops Slp30s files, due to unusable data according to ABCD Data Release 6.0 documentation
+        - Only subjects/sessions with complete "fit" data (i.e., all 6 "fit" files present) are included (=> complete Fitbit data for included subjects/sessions)
+        - Only "scans" files with non-empty "acq_time" column are included (=> valid MRI acquisition date for included sessions)
+        - Only subjects/timepoints with more than 7 days of actually recorded Fitbit data and/or <60% missing data are included (=> sufficient Fitbit data for included sessions)
     Parameters:
         dta_path (Path): Path to the raw data directory
         test (bool): Whether to run in test mode (only uses first 100 subjects for faster testing)
         overwrite (bool): Whether to overwrite existing metadata files (if False, will load existing metadata files if they exist and skip the selection process)
         output_path (Path): Path to the output directory to reimport metadata files if overwrite=False
     Returns:
-        demo_df (DataFrame): DataFrame containing demographic data for included subjects (sex, age)
+        demo_df (DataFrame): DataFrame containing demographic data for included subjects (sex, age at mri, scan site)
         mri_meta_df (DataFrame): DataFrame containing MRI date and  age at MRI scan for included subjects and timepoints/sessions
         fit_meta_df (DataFrame): DataFrame containing filepaths for Fitbit data for included subjects and timepoints/sessions
         demo_df, mri_meta_df, and fit_meta_df are saved as CSV files in the output directory for easy re-import if overwrite=False
@@ -178,10 +199,12 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
         fit_meta_df.loc[fit_meta_df["filepath"] == file, "present_recording_days"] = recording_duration_days
 
     fit_meta_df["missing_days_percentage"] = 100 * (1 - (fit_meta_df["present_recording_days"] / fit_meta_df["recording_duration_days"]))
-    short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 7) | (fit_meta_df["missing_days_percentage"] < 0.6)][["subject", "timepoint"]].drop_duplicates()
+    short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 14)][["subject", "timepoint"]].drop_duplicates()
+    # short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 7) | (fit_meta_df["missing_days_percentage"] < 0.6)][["subject", "timepoint"]].drop_duplicates()
     fit_meta_df = fit_meta_df.merge(short_recordings, on=["subject", "timepoint"], how="left", indicator=True)
     fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
-    print(f"Dropped {len(short_recordings)} timepoints with less than 7 days and/or >60% missings of fitbit data.")
+    print(f"Dropped {len(short_recordings)} timepoints with less than 14 days of fitbit data.")
+    #print(f"Dropped {len(short_recordings)} timepoints with less than 7 days and/or >60% missings of fitbit data.")
     print(f"Number of subjects remaining after dropping short recordings: {fit_meta_df['subject'].nunique()}")
     print(f"Average number of timepoints per subject after dropping short recordings: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
@@ -296,6 +319,12 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
     # drop filepath and filename columns from mri_meta_df
     mri_meta_df = mri_meta_df.drop(columns=["filepath", "filename"])
 
+    # Drop duplicates from mri_meta_df and demo_df
+    mri_meta_df.drop_duplicates(subset=["subject", "timepoint"], inplace=True)
+    demo_df.drop_duplicates(subset=["subject"], inplace=True)
+
+    print(f"Final number of subjects included after selection: {demo_df['subject'].nunique()}")
+
     # save metadata to csv
     output_path.mkdir(parents=True, exist_ok=True)
     demo_df.to_csv(output_path / "demographics_metadata.csv", index=False)
@@ -312,6 +341,7 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
         based on datetime index for easier querying with DuckDB. It adds two columns to each combined parquet file: "subject" and "timepoint", 
         which are extracted from the file paths of the original fitbit files, for easy filtering in DuckDB. 
         The combined parquet file is saved in a new hive-style directory structure at the top of the dta_path: "processed_fitbit_data/subject=SUBJECT_ID/timepoint=TIMEPOINT/combined_fitbit.parquet"
+        - Also recodes the fitbit data according to specific rules from the ABCD Data Release 6.0 documentation and drops unnecessary meta columns
         - For MRI data, it extracts the MRI ROIs specified in mri_rois for each subject and timepoint and saves it in a similar hive-style directory structure 
         at the top of the dta_path: "processed_mri_data/subject=SUBJECT_ID/timepoint=TIMEPOINT/combined_mri.parquet"
     Parameters:
@@ -329,9 +359,14 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
 
     if overwrite == False:
         print("DuckDB setup skipped (overwrite=False). To re-run data transformation and DuckDB setup, set overwrite=True.")
-        con = duckdb.connect()
-        con.execute(f"CREATE OR REPLACE VIEW fitbit_data AS SELECT * FROM read_parquet('{output_dir_fit}/**/combined_fitbit.parquet', union_by_name => TRUE)")
-        con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/**/combined_mri.parquet', union_by_name => TRUE)")
+        try:
+            con = duckdb.connect()
+            con.execute(f"CREATE OR REPLACE VIEW fitbit_data AS SELECT * FROM read_parquet('{output_dir_fit}/**/combined_fitbit.parquet', union_by_name => TRUE)")
+            con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/**/combined_mri.parquet', union_by_name => TRUE)")
+        except Exception as e:
+            print(f"Error setting up DuckDB views: {e}")
+            print("Please check that the combined parquet files exist in the output directories and are correctly formatted.")
+            raise e
 
         return con
     
@@ -437,7 +472,7 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
 
 # ---- DATA ANALYSIS ----
 
-def normative_selection(con, mri_meta_df, output_path):
+def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), overwrite=True):
     '''
     This function performs normative modeling and selects subjects based on their composite absolute z-score. 
     It selects the top 10% (based on prevalence) of subjects with the highest cumulative z-score.
@@ -446,24 +481,39 @@ def normative_selection(con, mri_meta_df, output_path):
     Parameters:
         con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
         mri_meta_df (DataFrame): DataFrame containing MRI metadata
-        output_path (str): Path to the output directory where the normative model results will be saved
+        output_path (pathlib.Path): Path to the output directory where the normative model results will be saved
     Returns:
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
         normative_modelling (Folder): Folder containing the normative model, results, and plots created in the output directory
     '''
+
+    if overwrite == False:
+        print("Normative modeling and subject selection skipped (overwrite=False). To re-run normative modeling and subject selection, set overwrite=True.")
+        try:
+            selected_subjects = pd.read_csv(Path(output_path) / "normative_modelling" / "results" / "selected_subjects.csv")
+            return selected_subjects
+        except Exception as e:
+            print(f"Error loading selected subjects: {e}")
+            print("Please check that the selected_subjects.csv file exists in the normative_modelling results directory and is correctly formatted.")
+            raise e
+
     # Get MRI ROIs to include in the normative model
     _, mri_rois_dict = mri_rois()
     mri_roi_cols = list(mri_rois_dict.keys())
+
+    # Get subjects to include from mri_meta_df
+    included_subjects = mri_meta_df["subject"].unique()
     
-    # Query MRI data for the first timepoint for each subject
+    # Query MRI data for the first timepoint for each included subject
     query = f"""
-    SELECT *
-    FROM mri_data
-    WHERE {"timepoint"} = (
-        SELECT MIN(m2.{"timepoint"})
-        FROM mri_data m2
-        WHERE m2.{"subject"} = mri_data.{"subject"}
-    )
+        SELECT *
+        FROM mri_data
+        WHERE subject IN ({', '.join(f"'{sub}'" for sub in included_subjects)})
+        AND timepoint IN (
+            SELECT MIN(timepoint)
+            FROM mri_data AS sub_mri
+            WHERE sub_mri.subject = mri_data.subject
+        )
     """
     mri_df = con.execute(query).df()
     print(f"MRI data loaded: {len(mri_df)} subjects")
@@ -494,6 +544,7 @@ def normative_selection(con, mri_meta_df, output_path):
     df['sex'] = pd.to_numeric(df['sex'], errors='raise').astype(float)
     df['age_at_mri'] = pd.to_numeric(df['age_at_mri'], errors='raise').astype(float)
     df['scan_site'] = pd.to_numeric(df['scan_site'], errors='raise').astype(float)
+    df['subject'] = df['subject'].astype(str)
 
     # Prepare data for normative modeling
     data = NormData.from_dataframe(
@@ -520,7 +571,7 @@ def normative_selection(con, mri_meta_df, output_path):
         # Whether to save the results after evaluation.
         saveresults=True,
         # Whether to save the plots after fitting.
-        saveplots=True,
+        saveplots=False,
         # The directory to save the model, results, and plots.
         save_dir=normative_output_dir_str,
         # The scaler to use for the input data. Can be either one of "standardize", "minmax", "robminmax", "none"
@@ -541,14 +592,42 @@ def normative_selection(con, mri_meta_df, output_path):
     centiles_df = pd.read_csv(normative_output_dir / "results" / "Z_mri_norm.csv")
     # Calculate composite absolute z-score across all MRI ROIs for each subject
     centiles_df["composite_z"] = centiles_df[mri_roi_cols].abs().sum(axis=1)
-    # Select top 10% of subjects with the highest composite z-score
-    threshold = centiles_df["composite_z"].quantile(0.9)
-    selected_subjects = centiles_df[centiles_df["composite_z"] >= threshold].copy()
-    print(f"Selected {len(selected_subjects)} subjects with composite z-score >= {threshold:.2f} (top 10%)")
+    subject_scores = (
+        centiles_df[["subject_ids", "composite_z"]]
+        .dropna()
+        .drop_duplicates(subset=["subject_ids"])
+        .sort_values("composite_z")
+        .reset_index(drop=True)
+    )
+    subject_scores["subject_ids"].nunique()
+    subject_scores["rank"] = np.arange(len(subject_scores))
+    # Select top 10% of subjects with the highest composite z-score based on ranked prevalence
+    n_select = int(np.ceil(0.10 * len(subject_scores)))
+    selected_subject_ids = subject_scores.nlargest(n_select, "composite_z")["subject_ids"]
+    selected_subjects = subject_scores[subject_scores["subject_ids"].isin(selected_subject_ids)]
+    
+    print(f"Selected {len(selected_subject_ids)} subjects with the highest composite z-scores based on a prevalence threshold of 10%.")
+    selected_subjects.to_csv(normative_output_dir / "results" / "selected_subjects.csv", index=False)
+    
+    # create scatter plot of composite z-scores for all subjects, highlighting selected subjects in a different color
+    plot_df = centiles_df[["subject_ids", "composite_z"]].dropna().sort_values("composite_z").reset_index(drop=True)
+    plot_df["rank"] = np.arange(len(plot_df))
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(subject_scores["rank"], subject_scores["composite_z"], label="All subjects", alpha=0.5, s=12)
+    selected_plot = subject_scores[subject_scores["subject_ids"].isin(selected_subject_ids)]
+    plt.scatter(selected_plot["rank"], selected_plot["composite_z"], label="Selected subjects", color="red", s=18)
+    plt.xlabel("Subject rank by composite z-score")
+    plt.ylabel("Composite Absolute Z-Score")
+    plt.title("Composite Absolute Z-Scores for MRI ROIs")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(normative_output_dir / "results" / "composite_z_scores.png")
+    plt.close()
 
     # Create summary table with mean, std, min, and max per mri_roi for the selected subjects
     stats_selected = (
-        selected_subjects[mri_roi_cols]
+        centiles_df[mri_roi_cols]
         .agg(['mean', 'std', 'min', 'max'])
         .transpose()
         .reset_index()
@@ -591,7 +670,7 @@ def create_mri_composites(con, selected_subjects):
         "mri_roi": vif_data.columns,
         "vif": [variance_inflation_factor(vif_data.values, i) for i in range(vif_data.shape[1])]
     }).sort_values("vif", ascending=False)
-    vif_df.head
+    vif_df.head()
 
     # Replace variables with a vif above 10 with their average until all variables have a vif below 10
     composite_dict = {}
@@ -615,140 +694,197 @@ def create_mri_composites(con, selected_subjects):
 
     return selected_subjects, composite_dict
 
-def mri_subtyping(con, selected_subjects):
+def mri_subtyping(dem_df, selected_subjects):
     '''
-    This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data and composite scores.
+    This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data.
+    It uses several different clustering algorithms (HBDSCAN and Bayesian Gaussian Mixture Models).
+    Clustering stability is assessed using bootstrapping and assessing stability using the Jaccard index.
+    Algorithms are compared based on their Silhouette coefficient, Density-Based Clustering Validation (DBCV) score, and Davies-Bouldin Index (DBI).
 
     Parameters:
-        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
-        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
+        dem_df (DataFrame): DataFrame containing demographic information for the selected subjects
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI z-scores
     Returns:
-        selected_subjects (DataFrame): DataFrame containing the selected subjects and their assigned cluster labels based on their MRI ROI data and composite scores
-    '''
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their assigned cluster labels based on their MRI ROI data
 
-def missingness_analysis(con, selected_subjects):
+    NOTE: This function is currently broken. Neither clustering algorithms compute properly. This is most likely due to the subjects and ROIs already being
+    pre-selected and therefore not showing enough differentiating patterns.
+    '''
+    output_path = Path(output_path)
+    # selected subjects read csv
+    selected_subjects = pd.read_csv(os.path.join(output_path, "selected_subjects.csv"))
+    selected_subjects.shape
+    selected_subjects.drop(columns=["observations", "composite_z"], inplace=True)
+
+    def _align_labels(reference, target):
+        '''Aligns cluster labels of the target clustering to the reference clustering using the Hungarian algorithm.'''
+        # Compute confusion matrix between reference and target labels
+        conf_matrix = confusion_matrix(reference, target)
+        # Use Hungarian algorithm to find optimal label alignment
+        row_ind, col_ind = linear_sum_assignment(-conf_matrix)
+        # Create a mapping from target labels to reference labels
+        label_mapping = {target_label: reference_label for target_label, reference_label in zip(col_ind, row_ind)}
+        # Apply the mapping to the target labels
+        aligned_target = target.map(label_mapping)
+        return aligned_target 
+    
+    # Create reference clustering on the original data
+    hdbscan_clusterer = hdbscan.HDBSCAN(min_cluster_size=5)
+    reference_labels_hdbscan = hdbscan_clusterer.fit_predict(selected_subjects.drop(columns=["subject_ids"]))
+    gmm_clusterer = BayesianGaussianMixture(n_components=3, random_state=42)
+    reference_labels_gmm = gmm_clusterer.fit_predict(selected_subjects.drop(columns=["subject_ids"]))
+
+    # Create mask for non-noise points in HDBSCAN and GMM to use for alignment and scoring (only consider points that are not labeled as noise in either clustering)
+    mask = (reference_labels_hdbscan[bootstrap_sample.index] >= 0) & (boot_labels >= 0)
+
+    ref_clean  = reference_labels_hdbscan[bootstrap_sample.index][mask]
+    
+    jaccard_indices = {
+        "hdbscan": [],
+        "gmm": []
+    }
+    
+    for i in tqdm(range(100), desc="Bootstrapping for clustering stability"):
+        # Resample subjects with replacement
+        bootstrap_sample = selected_subjects.sample(frac=1, replace=True, random_state=i)
+
+        # HDBSCAN clustering
+        hdbscan_clusterer = hdbscan.HDBSCAN(min_cluster_size=5)
+        boot_labels = hdbscan_clusterer.fit_predict(bootstrap_sample.drop(columns=["subject_ids"]))
+        boot_clean = boot_labels[mask]
+        aligned_boot_labels = _align_labels(ref_clean[bootstrap_sample.index], boot_clean)
+        jaccard_hdbscan = jaccard_score(reference_labels_hdbscan[bootstrap_sample.index], aligned_boot_labels, average="macro")
+        jaccard_indices["hdbscan"].append(jaccard_hdbscan)
+
+        # Gaussian Mixture Models clustering
+        gmm_clusterer = BayesianGaussianMixture(n_components=3, random_state=i)
+        boot_labels = gmm_clusterer.fit_predict(bootstrap_sample.drop(columns=["subject_ids"]))
+        boot_clean = boot_labels[mask]
+        aligned_boot_labels = _align_labels(reference_labels_gmm[bootstrap_sample.index], boot_clean)
+        jaccard_gmm = jaccard_score(reference_labels_gmm[bootstrap_sample.index], aligned_boot_labels, average="macro")
+        jaccard_indices["gmm"].append(jaccard_gmm)
+    print(f"HDBSCAN clustering stability (Jaccard index): mean={np.mean(jaccard_indices['hdbscan']):.4f}, std={np.std(jaccard_indices['hdbscan']):.4f}")
+    print(f"GMM clustering stability (Jaccard index): mean={np.mean(jaccard_indices['gmm']):.4f}, std={np.std(jaccard_indices['gmm']):.4f}")
+
+def missingness_analysis(con, fit_meta_df):
     '''
     This function analyzes the missingness patterns in the fitbit data for the selected subjects for MCAR, MAR, or MNAR missingness
     using Littles test from pyampute.
+        1. Queries different fitbit domain data separately (i.e. actigraphy-based: Stps1m, METs1m, Int1m, heart-rate: HR1m, Sleep: Slp1m)
+        2. For each, creates datetime index (days) with proper missing days based on min and max of the Wear_Time column for each subject and timepoint, 
+        and merges with the original data to get missingness patterns
+        3. Conducts Little's test for each fitbit domain to assess whether the missingness is MCAR, MAR, or MNAR
 
     Parameters:
         con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
-        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
+        fit_meta_df (DataFrame): DataFrame containing the fitbit metadata for the selected subjects
     Returns:
         missingness_df (DataFrame): DataFrame containing the missingness patterns in the fitbit data for the selected subjects.
+
+    NOTE: This function is currently broken. Little's test is not computing properly and I have no fucking clue why. WIP
     '''
-    # Do missingness analysis per sensor domain (actigraphy: Int1m, METs1m, Stps1m;
-    # heart rate: HR1m; sleep: Slp1m). The function will:
-    #  - run Little's MCAR test on the full dataset
-    #  - run Little's MCAR test per sensor domain
-    #  - create temporal missingness heatmaps per domain (hour x day_of_week)
 
-    # Get list of selected subjects
-    selected_subjects_list = selected_subjects["subject_ids"].tolist()
-    # Query fitbit data for the selected subjects
-    query = f"""
-    SELECT *
-    FROM fitbit_data WHERE subject IN ({', '.join(f"'{s}'" for s in selected_subjects_list)})
-    """
-    fitbit_df = con.execute(query).df()
-    print(f"Fitbit data loaded for selected subjects: {len(fitbit_df)} rows")
+    # For each subject and timepoint, create datetime index with proper missing days based on min and max of the Wear_Time column, and merge with original data to get missingness patterns
+    def create_missingness_df(df, domain_name):
+        missingness_list = []
+        grouped = df.groupby(["subject", "timepoint"])
+        for (subject, timepoint), group in tqdm(grouped, total=grouped.ngroups, desc=f"Creating missingness patterns for {domain_name}"):
+            min_date = group["Wear_Time"].min().floor("D")
+            max_date = group["Wear_Time"].max().ceil("D")
+            value_cols = [c for c in group.columns if c not in ["subject", "timepoint", "Wear_Time"]]
+            daily_means = group.set_index("Wear_Time")[value_cols].resample("D").mean().reset_index()
+            date_range = pd.date_range(start=min_date, end=max_date, freq="D")
+            date_df = pd.DataFrame({"Wear_Time": date_range})
+            merged_df = date_df.merge(daily_means, on="Wear_Time", how="left")
+            merged_df["subject"] = subject
+            merged_df["timepoint"] = timepoint
+            missingness_list.append(merged_df)
+        return pd.concat(missingness_list, ignore_index=True)
+    
+    # Conduct Little's test for each fitbit domain to assess if the missingness is MCAR
+    mcar_test = MCARTest(method="little")
 
-    # Ensure Wear_Time is datetime
-    if "Wear_Time" in fitbit_df.columns:
-        fitbit_df["Wear_Time"] = pd.to_datetime(fitbit_df["Wear_Time"], errors="coerce")
-
-    # Conduct Little's test for MCAR on the full set of metric columns (drop non-metric cols)
-    metric_cols = [c for c in fitbit_df.columns if c not in ("subject", "timepoint", "Wear_Time")]
-    full_df_for_mcar = fitbit_df[metric_cols].dropna(axis=1, how="all")
-    if full_df_for_mcar.shape[1] == 0:
-        raise ValueError("No metric columns found in fitbit data for MCAR testing")
-
-    mcar_test = MCARTest()
-    try:
-        overall_missingness = mcar_test.fit_transform(full_df_for_mcar)
-        overall_p = overall_missingness["p_value"].iloc[0]
-        print(f"Overall Little's MCAR test p-value: {overall_p:.4f}")
-    except Exception as e:
-        print(f"Overall MCAR test failed: {e}")
-        overall_missingness = None
-
-    # Define sensor domains and patterns to detect columns
-    domains = {
-        "actigraphy": ["int1m", "mets1m", "stps1m", "steps", "intensity", "mets", "stps"],
-        "heart_rate": ["hr1m", "hr", "heartrate", "heart"],
-        "sleep": ["slp1m", "slp", "sleep"],
-    }
-
-    output_path = pathlib.Path("output")
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    domain_results = []
-
-    for domain, patterns in domains.items():
-        domain_cols = [c for c in metric_cols if any(p in c.lower() for p in patterns)]
-        domain_cols = [c for c in domain_cols if c in fitbit_df.columns]
-
-        if not domain_cols:
-            print(f"No columns found for domain '{domain}', skipping.")
-            continue
-
-        # Dataframe for MCAR test: drop columns that are entirely missing
-        domain_df_for_mcar = fitbit_df[domain_cols].dropna(axis=1, how="all")
-        if domain_df_for_mcar.shape[1] == 0:
-            print(f"All columns for domain '{domain}' are empty, skipping MCAR test.")
-            continue
-
-        # Run Little's MCAR test for this domain
+    def safe_little_test(df, min_obs_per_col=5, min_cols=2):
+        df = df.copy()
+        # coerce numeric and drop empty cols/rows
+        df = df.apply(pd.to_numeric, errors='coerce')
+        df = df.loc[:, df.notna().sum() >= min_obs_per_col]
+        df = df.dropna(how='all')
+        if df.shape[1] < min_cols or df.shape[0] < 2:
+            return np.nan, "insufficient data after filtering"
+        # compute pj/df quickly (same logic as pyampute)
+        vars_ = df.dtypes.index.values
+        n_var = df.shape[1]
+        r = 1 * df.isnull()
+        mdp = np.dot(r, [2**i for i in range(n_var)])
+        pj = 0
+        for i in np.unique(mdp):
+            dataset_temp = df.loc[mdp == i, vars_]
+            select_vars = ~dataset_temp.isnull().any()
+            pj += np.sum(select_vars)
+        df_val = pj - n_var
+        if df_val <= 0:
+            return np.nan, f"df <= 0 (pj={pj}, n_var={n_var})"
+        # try running the test and catch numerical errors
         try:
-            domain_mcar = MCARTest().fit_transform(domain_df_for_mcar)
-            domain_p = domain_mcar["p_value"].iloc[0]
-            print(f"Domain '{domain}' Little's MCAR p-value: {domain_p:.4f}")
+            pval = MCARTest(method="little").little_mcar_test(df)
         except Exception as e:
-            print(f"MCAR test failed for domain '{domain}': {e}")
-            domain_p = None
+            return np.nan, f"test error: {e}"
+        return pval, None
 
-        # Temporal pattern analysis: mark a timestamp as missing for this domain when ALL domain metrics are NA
-        mask_missing_domain = fitbit_df[domain_cols].isna().all(axis=1).astype(int)
-        if "Wear_Time" in fitbit_df.columns:
-            fitbit_df["hour"] = fitbit_df["Wear_Time"].dt.hour
-            fitbit_df["day_of_week"] = fitbit_df["Wear_Time"].dt.dayofweek
-            temporal = (
-                pd.DataFrame({"missing": mask_missing_domain, "hour": fitbit_df["hour"], "day_of_week": fitbit_df["day_of_week"]})
-                .groupby(["hour", "day_of_week"])["missing"]
-                .mean()
-                .unstack()
-            )
-            plt.figure(figsize=(10, 6))
-            sns.heatmap(temporal, annot=False, fmt=".2f", cmap="viridis")
-            plt.title(f"Missingness Heatmap for {domain} by Hour and Day")
-            plt.xlabel("Day of Week (0=Monday, 6=Sunday)")
-            plt.ylabel("Hour of Day")
-            plt.tight_layout()
-            plt.savefig(Path(output_path) / f"missingness_heatmap_{domain}.png")
-            plt.close()
+    p, err = safe_little_test(actigraphy_missingness_df.drop(columns=["subject","timepoint","Wear_Time"]))
+    print("p:", p, "err:", err)
 
-            # spearman correlation between missingness and hour/day
-            try:
-                spearman_hour = spearmanr(fitbit_df["hour"].fillna(-1), mask_missing_domain)
-                spearman_day = spearmanr(fitbit_df["day_of_week"].fillna(-1), mask_missing_domain)
-                print(f"{domain}: Spearman missing vs hour rho={spearman_hour.correlation:.4f}, p={spearman_hour.pvalue:.4f}")
-                print(f"{domain}: Spearman missing vs day rho={spearman_day.correlation:.4f}, p={spearman_day.pvalue:.4f}")
-            except Exception as e:
-                print(f"Spearman correlation failed for domain '{domain}': {e}")
+    # Query all fitbit data
+    fitbit_df = con.execute(f"SELECT subject, timepoint, Wear_Time, * FROM fitbit_data").df()
+    print(f"Creating missingness pattern...")
+    fitbit_missingness_df = create_missingness_df(fitbit_df, "fitbit")
+    fitbit_df = None  # free memory
+    fitbit_mcar = mcar_test.little_mcar_test(fitbit_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
+    fitbit_missingness_df = None  # free memory
 
-        else:
-            print("Wear_Time column missing; skipping temporal analysis.")
+    # Query actigraphy columns
+    actigraphy_cols = ["Calories_Cal1m", "Steps_Stps1m", "METs_METs1m"]
+    actigraphy_df = con.execute(f"SELECT subject, timepoint, Wear_Time, {', '.join(actigraphy_cols)} FROM fitbit_data").df()
+    # Create missingness patterns for actigraphy data
+    actigraphy_missingness_df = create_missingness_df(actigraphy_df, "actigraphy")
+    actigraphy_df = None  # free memory
+    # Conduct Little's test for actigraphy data
+    actigraphy_mcar = mcar_test.little_mcar_test(actigraphy_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
+    actigraphy_missingness_df = None  # free memory
 
-        domain_results.append({"domain": domain, "p_value": domain_p, "n_columns": len(domain_cols)})
+    actigraphy_df.head()
+    actigraphy_df.shape
+    actigraphy_missingness_df.head()
+    actigraphy_missingness_df.shape
+    actigraphy_missingness_df["Wear_Time"].min(), actigraphy_missingness_df["Wear_Time"].max()
 
-    domain_results_df = pd.DataFrame(domain_results)
-    domain_results_df.to_csv(output_path / "missingness_domain_results.csv", index=False)
+    daily_means = actigraphy_df.set_index("Wear_Time")[actigraphy_cols].resample("D").mean().reset_index()
+    daily_means.head(10)
 
-    # Return overall MCAR test result along with per-domain results
-    return {
-        "overall": overall_missingness,
-        "domains": domain_results_df,
-    }
+    # Query heart rate columns
+    heart_rate_df = con.execute(f"SELECT subject, timepoint, Wear_Time, Value_HR1m FROM fitbit_data").df()
+    # Create missingness patterns for heart rate data
+    heart_rate_missingness_df = create_missingness_df(heart_rate_df, "heart_rate")
+    heart_rate_df = None  # free memory
+    # Conduct Little's test for heart rate data
+    heart_rate_mcar = mcar_test.little_mcar_test(heart_rate_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
+    heart_rate_missingness_df = None  # free memory
+
+    # Query sleep columns
+    sleep_df = con.execute(f"SELECT subject, timepoint, Wear_Time, value_Slp1m FROM fitbit_data").df()
+    # Create missingness patterns for sleep data
+    sleep_missingness_df = create_missingness_df(sleep_df, "sleep")
+    sleep_df = None  # free memory
+    # Conduct Little's test for sleep data
+    sleep_mcar = mcar_test.little_mcar_test(sleep_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
+    sleep_missingness_df = None  # free memory
+
+    print(f"Actigraphy missingness MCAR test: p-value={actigraphy_mcar:.4f}")
+    print(f"Heart rate missingness MCAR test: p-value={heart_rate_mcar:.4f}")
+    print(f"Sleep missingness MCAR test: p-value={sleep_mcar:.4f}")
+
+# ---- FEATURE EXTRACTION ----
 
 def extr_fitbit_features(con, selected_subjects):
     '''
@@ -759,23 +895,33 @@ def extr_fitbit_features(con, selected_subjects):
         4. Creates mean, stdm, min, and max for the trend, seasonal, and residual components of the STL decomposition for each fitbit metric
     Parameters:
         con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
-        selected_subjects (DataFrame): DataFrame containing the selected subjects
+        selected_subjects (DataFrame): DataFrame containing the subjects to extract fitbit features from 
     Returns:
         fitbit_features_df (DataFrame): DataFrame containing the extracted fitbit features for each subject
     '''
     # Get list of selected subjects
-    selected_subjects_list = selected_subjects["subject_ids"].tolist()
-    # Query fitbit data for the selected subjects
+    selected_subjects_list = selected_subjects["subject"].unique().tolist()
+
+    # Query FIRST timepoint for the selected subjects
     query = f"""
     SELECT *
     FROM fitbit_data
-    WHERE subject IN ({', '.join(f"'{s}'" for s in selected_subjects_list)})
+    WHERE timepoint = (
+        SELECT MIN(timepoint)
+        FROM fitbit_data f2
+        WHERE f2.subject = fitbit_data.subject
+    )
+    AND subject IN ({', '.join(map(str, selected_subjects_list))})
     """
+    print("Querying fitbit data for feature extraction...")
     fitbit_df = con.execute(query).df()
-    print(f"Fitbit data loaded for selected subjects: {len(fitbit_df)} rows")
 
     # Get fitbit metric columns (exclude subject, timepoint, and Wear_Time)
     fitbit_metric_cols = [col for col in fitbit_df.columns if col not in ["subject", "timepoint", "Wear_Time"]]
+
+    # Coerce to numeric
+    for col in fitbit_metric_cols:
+        fitbit_df[col] = pd.to_numeric(fitbit_df[col], errors="coerce")
 
     # Create a dataframe to hold the extracted features
     features_list = []
@@ -785,16 +931,36 @@ def extr_fitbit_features(con, selected_subjects):
     for (subject, timepoint), group in tqdm(grouped, total=grouped.ngroups, desc="Extracting Fitbit features"):
         feature_dict = {"subject": subject, "timepoint": timepoint}
         for metric in fitbit_metric_cols:
-            if metric in group.columns:
-                daily_data = group[["Wear_Time", metric]].dropna()
+            # Check if the metric column exists in the group
+            #if metric in group.columns:
+                daily_data = group[["Wear_Time", metric]]#.dropna()
                 if not daily_data.empty:
+                    # Create daily features (mean, std, min, max)
                     daily_data.set_index("Wear_Time", inplace=True)
                     daily_stats = daily_data.resample("D").agg(['mean', 'std', 'min', 'max'])
                     daily_stats.columns = ['_'.join(col) for col in daily_stats.columns]
+                    # Create datetime index with proper missing days based on the daily resampling range
+                    min_date = daily_stats.index.min().floor("D")
+                    max_date = daily_stats.index.max().ceil("D")
+                    date_range = pd.date_range(start=min_date, end=max_date, freq="D")
+                    # Reindex to include missing days and impute missing values with multiple imputation
+                    daily_stats = daily_stats.reindex(date_range)
+                    #if daily_stats.shape[0] > 1 and daily_stats.notna().sum().sum() > daily_stats.shape[1]:
+                    try:
+                        imputer = IterativeImputer(random_state=0, max_iter=20)
+                        daily_stats = pd.DataFrame(
+                            imputer.fit_transform(daily_stats),
+                            index=daily_stats.index,
+                            columns=daily_stats.columns,
+                        )
+                    except Exception as e:
+                        print(f"Iterative imputation failed for subject {subject}, timepoint {timepoint}, metric {metric}: {e}")
+                        daily_stats = daily_stats.ffill().bfill()
+                    #else:
+                        #daily_stats = daily_stats.ffill().bfill()
                     feature_dict.update(daily_stats.mean().to_dict())
                     # STL decomposition
                     try:
-                        from statsmodels.tsa.seasonal import STL
                         stl = STL(daily_data[metric], period=7, robust=True)
                         result = stl.fit()
                         stl_features = {
@@ -816,5 +982,5 @@ def extr_fitbit_features(con, selected_subjects):
                         print(f"STL decomposition failed for subject {subject}, timepoint {timepoint}, metric {metric}: {e}")
         features_list.append(feature_dict)
     fitbit_features_df = pd.DataFrame(features_list)
-    
+
     return fitbit_features_df
