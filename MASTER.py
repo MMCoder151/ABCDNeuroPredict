@@ -19,8 +19,6 @@ dem_df, mri_meta_df, fit_meta_df = select_subjects(dta_path, test=False, overwri
 # Transform data to make it easier to query with DuckDB
 con = setup_duckdb(dta_path, fit_meta_df, overwrite=True)
 
-unique_fit_cols = con.execute("SELECT DISTINCT column_name FROM (DESCRIBE fitbit_data)").fetchall()
-
 # ---- DATA ANALYSIS ----
 
 # Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
@@ -48,6 +46,17 @@ train_df, test_df = train_test_split(dem_df["subject"], test_size=0.2, stratify=
 
 # Extract features from selected subjects fitbit data for train set
 train_features = extr_fitbit_features(con, train_df)
+train_y = dem_df[dem_df["subject"].isin(train_df)]["group"]
 
 # Extract features from selected subjects fitbit data for test set
 test_features = extr_fitbit_features(con, test_df)
+test_y = dem_df[dem_df["subject"].isin(test_df)]["group"]
+
+# Save features to CSV
+train_features.to_csv(os.path.join(output_path, "train_features.csv"), index=False)
+test_features.to_csv(os.path.join(output_path, "test_features.csv"), index=False)
+train_y.to_csv(os.path.join(output_path, "train_labels.csv"), index=False)
+test_y.to_csv(os.path.join(output_path, "test_labels.csv"), index=False)
+
+# ---- MODELING ----
+

@@ -100,7 +100,7 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
         - Drops Slp30s files, due to unusable data according to ABCD Data Release 6.0 documentation
         - Only subjects/sessions with complete "fit" data (i.e., all 6 "fit" files present) are included (=> complete Fitbit data for included subjects/sessions)
         - Only "scans" files with non-empty "acq_time" column are included (=> valid MRI acquisition date for included sessions)
-        - Only subjects/timepoints with more than 7 days of actually recorded Fitbit data and/or <60% missing data are included (=> sufficient Fitbit data for included sessions)
+        - Only subjects/timepoints with more than 14 days of actually recorded Fitbit data are included (=> sufficient Fitbit data for included sessions)
     Parameters:
         dta_path (Path): Path to the raw data directory
         test (bool): Whether to run in test mode (only uses first 100 subjects for faster testing)
@@ -198,9 +198,12 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
         recording_duration_days = len(actual_days)
         fit_meta_df.loc[fit_meta_df["filepath"] == file, "present_recording_days"] = recording_duration_days
 
-    fit_meta_df["missing_days_percentage"] = 100 * (1 - (fit_meta_df["present_recording_days"] / fit_meta_df["recording_duration_days"]))
+    # TODO : Recheck missing_days_percentage calculation (old one returned negative percentages, WTF???) 
+    # and rerun with "< 60" instead of <0.6 (It's already * 100, duh)
+
+    fit_meta_df["missing_days_percentage"] = ((fit_meta_df["present_recording_days"] / fit_meta_df["recording_duration_days"]) * 100)
     short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 14)][["subject", "timepoint"]].drop_duplicates()
-    # short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 7) | (fit_meta_df["missing_days_percentage"] < 0.6)][["subject", "timepoint"]].drop_duplicates()
+    # short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 7) | (fit_meta_df["missing_days_percentage"] < 60)][["subject", "timepoint"]].drop_duplicates()
     fit_meta_df = fit_meta_df.merge(short_recordings, on=["subject", "timepoint"], how="left", indicator=True)
     fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
     print(f"Dropped {len(short_recordings)} timepoints with less than 14 days of fitbit data.")
@@ -370,7 +373,7 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
 
         return con
     
-    # Combine fitbit files for each subject and timepoint into a single parquet file based on datetime index
+    # Combine fitbit files for each INCLUDED subject and timepoint into a single parquet file based on datetime index
     for _, row in tqdm(fit_meta_df.iterrows(), total=len(fit_meta_df), desc="Combining Fitbit files"):
         subject = row["subject"]
         timepoint = row["timepoint"]
