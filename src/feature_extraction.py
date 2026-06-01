@@ -22,6 +22,21 @@ from sklearn.impute import IterativeImputer
 import statsmodels.api as sm
 from scipy.stats import wilcoxon
 
+
+def _one_hot_encode_scan_site(df, site_col="scan_site", prefix="scan_site", categories=None):
+    """One-hot encode a scan-site column while keeping a stable category order."""
+    encoded = df.copy()
+    site_values = encoded[site_col].astype("string")
+    if categories is None:
+        categories = sorted(site_values.dropna().unique().tolist())
+    else:
+        categories = [str(category) for category in categories]
+    site_cat = pd.Categorical(site_values, categories=categories)
+    dummies = pd.get_dummies(site_cat, prefix=prefix, drop_first=True, dtype=float)
+    encoded = encoded.drop(columns=[site_col])
+    encoded = pd.concat([encoded, dummies], axis=1)
+    return encoded, list(dummies.columns), categories
+
 def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output")):
     '''
     This function runs linear regression and extracts the total and unique variance explained (R squared and adjusted R squared) 
@@ -43,11 +58,12 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
     z_scores_df = pd.read_csv(output_path / "normative_modelling" / "results" / "Z_mri_norm.csv")
     z_scores_df.drop(columns=["observations"], inplace=True, errors ="ignore")
 
-    # Import raw MRI data for the first timepoint for each subject
+    # Import raw MRI data for the FIRST timepoint for each INCLUDED subject in dem_df
     query = f"""
         SELECT *
         FROM mri_data
-        WHERE timepoint IN (
+        WHERE subject IN ({', '.join(f"'{sub}'" for sub in dem_df['subject'].unique())})
+        AND timepoint = (
             SELECT MIN(timepoint)
             FROM mri_data AS sub_mri
             WHERE sub_mri.subject = mri_data.subject
@@ -96,6 +112,24 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
         how="inner"
     )
 
+    site_categories = sorted(
+        pd.concat([mri_df["scan_site"], z_scores_df["scan_site"]], ignore_index=True)
+        .astype("string")
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    mri_df, site_dummy_cols, site_categories = _one_hot_encode_scan_site(
+        mri_df,
+        categories=site_categories,
+    )
+    z_scores_df, z_site_dummy_cols, _ = _one_hot_encode_scan_site(
+        z_scores_df,
+        categories=site_categories,
+    )
+    if site_dummy_cols != z_site_dummy_cols:
+        raise ValueError("Site dummy columns do not align between raw and post-normative data.")
+
     # Fit hierarchical linear regression models for each MRI ROI with age, sex, and site as predictors before and after noromative modeling
     # and extract both total and unique variance explained (R squared and adjusted R squared) for each confound
     confound_effects = []
@@ -104,20 +138,20 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
     # Order reflects theoretical priority: site first (nuisance),
     # then age (primary biological), then sex
     model_hierarchy = {
-        'site only':          ['scan_site'],
-        'site + age':         ['scan_site', 'age_at_mri'],
-        'site + age + sex':   ['scan_site', 'age_at_mri', 'sex']
+        'site only':          site_dummy_cols,
+        'site + age':         site_dummy_cols + ['age_at_mri'],
+        'site + age + sex':   site_dummy_cols + ['age_at_mri', 'sex']
     }
 
     for roi in tqdm(mri_roi_cols, desc="Analyzing confound effects"):
         # Prepare data for regression
-        pre_df = mri_df[["subject", "age_at_mri", "sex", "scan_site", roi]].dropna(subset=[roi])
-        pre_df = pre_df.apply(pd.to_numeric, errors='coerce').astype('float64').dropna(subset=[roi])
+        pre_df = mri_df[["subject", "age_at_mri", "sex", roi] + site_dummy_cols].dropna(subset=[roi])
+        pre_df = pre_df.apply(pd.to_numeric, errors='coerce').astype('float64')
         #pre_df.dtypes
-        post_df = z_scores_df[["subject", "age_at_mri", "sex", "scan_site", roi]].dropna(subset=[roi])
-        post_df = post_df.apply(pd.to_numeric, errors='coerce').astype('float64').dropna(subset=[roi])
-        X_pre = pre_df[["age_at_mri", "sex", "scan_site"]]
-        X_post = post_df[["age_at_mri", "sex", "scan_site"]]
+        post_df = z_scores_df[["subject", "age_at_mri", "sex", roi] + site_dummy_cols].dropna(subset=[roi])
+        post_df = post_df.apply(pd.to_numeric, errors='coerce').astype('float64')
+        X_pre = pre_df[site_dummy_cols + ["age_at_mri", "sex"]]
+        X_post = post_df[site_dummy_cols + ["age_at_mri", "sex"]]
         y_pre = pre_df[roi]
         y_post = post_df[roi]
         X_pre_const = sm.add_constant(X_pre)
@@ -162,54 +196,43 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
 
     pivot = df.pivot(index='mri_roi', columns='model')
 
-    missing = [r for r in mri_roi_cols if r not in mri_df.columns]
-    print('missing in mri_df:', missing)
-
-    pre_counts  = mri_df[mri_roi_cols].notna().sum().sort_values()
-    post_counts = z_scores_df[mri_roi_cols].notna().sum().sort_values()
-    print(pre_counts.head(20))
-    print(post_counts.head(20))
-
-    nan_rois = site_R2_pre[site_R2_pre.isna()].index.tolist()
-    print('pre non-nulls for NaN ROIs:\n', pre_counts.loc[nan_rois])
-    print('post non-nulls for NaN ROIs:\n', post_counts.loc[nan_rois])
-
-    roi = nan_rois[0]
-    clean_pre = mri_df[['subject','scan_site', 'age_at_mri','sex', roi]].apply(pd.to_numeric, errors='coerce').dropna(subset=['scan_site', roi])
-    print('pre rows:', len(clean_pre))
-    print('y unique:', clean_pre[roi].nunique())
-    print('scan_site unique:', clean_pre['scan_site'].nunique())
-    import numpy as np, statsmodels.api as sm
-    X = sm.add_constant(clean_pre[['scan_site']].astype(float))
-    print('X shape, rank:', X.shape, np.linalg.matrix_rank(X.values))
-
-    # find the confound_effects entry for this ROI (if still in memory)
-    entry = next((e for e in confound_effects if e['mri_roi']==roi), None)
-    print(entry)
-
     # Age effect = (site+age) - (site only)
     age_R2_pre  = pivot['R2_pre']['site + age'] - pivot['R2_pre']['site only']
     age_R2_post = pivot['R2_post']['site + age'] - pivot['R2_post']['site only']
     age_reduction = (age_R2_pre - age_R2_post)
-    age_pct_reduction = 100 * age_reduction / age_R2_pre.replace(0, np.nan)
-    print(f"Age effect: mean R2 reduction={age_reduction.mean():.4f}, mean % reduction={age_pct_reduction.mean():.2f}%")
+    print(f"Age effect: mean R2 reduction={age_reduction.mean():.4f}")
 
     # Sex effect = (site+age+sex) - (site+age)
     sex_R2_pre  = pivot['R2_pre']['site + age + sex'] - pivot['R2_pre']['site + age']
     sex_R2_post = pivot['R2_post']['site + age + sex'] - pivot['R2_post']['site + age']
     sex_reduction = (sex_R2_pre - sex_R2_post)
-    sex_pct_reduction = 100 * sex_reduction / sex_R2_pre.replace(0, np.nan)
-    print(f"Sex effect: mean R2 reduction={sex_reduction.mean():.4f}, mean % reduction={sex_pct_reduction.mean():.2f}%")
-
-    nan_rois = site_R2_pre[site_R2_pre.isna()].index.tolist()
-    print(len(nan_rois), 'ROIs with NaN R2:', nan_rois[:20])
+    print(f"Sex effect: mean R2 reduction={sex_reduction.mean():.4f}")
 
     # Site effect is just the R2 of 'site only'
     site_R2_pre  = pivot['R2_pre']['site only']
     site_R2_post = pivot['R2_post']['site only']
     site_reduction = site_R2_pre - site_R2_post
-    site_pct_reduction = 100 * site_reduction / site_R2_pre.replace(0, np.nan)
-    print(f"Site effect: mean R2 reduction={site_reduction.mean():.4f}, mean % reduction={site_pct_reduction.mean():.2f}%")
+    print(f"Site effect: mean R2 reduction={site_reduction.mean():.4f}")
+
+    residual_association_df = df[df["model"].isin(model_hierarchy)].copy()
+    residual_association_df = residual_association_df[[
+        "mri_roi",
+        "model",
+        "R2_post",
+        "AdjR2_post",
+        "pvals_post",
+        "coef_post",
+    ]]
+    residual_association_df.to_csv(
+        output_path / "post_normative_residual_association.csv",
+        index=False,
+    )
+    print(
+        "Post-normative residual association (mean R2): "
+        f"site-only={residual_association_df.loc[residual_association_df['model'] == 'site only', 'R2_post'].mean():.4f}, "
+        f"site+age={residual_association_df.loc[residual_association_df['model'] == 'site + age', 'R2_post'].mean():.4f}, "
+        f"site+age+sex={residual_association_df.loc[residual_association_df['model'] == 'site + age + sex', 'R2_post'].mean():.4f}"
+    )
 
     # Wilcoxon signed-rank test to compare the R2 values for each confound pre and post normative modeling across all MRI ROIs
     valid = (~age_R2_pre.isna()) & (~age_R2_post.isna())
@@ -234,7 +257,7 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
     plt.axvline(0, color='k', linestyle='--')
     plt.title('Age: reduction in R2 (pre - post)')
     plt.xlabel('Δ R2')
-    plt.show()
+    plt.savefig(output_path / "confound_effects_analysis_age_R2_reduction.png")
 
     plt.figure(figsize=(6,6))
     plt.scatter(age_R2_pre, age_R2_post, alpha=0.7)
@@ -242,7 +265,7 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
     plt.xlabel('R2 pre')
     plt.ylabel('R2 post')
     plt.title('R2 pre vs post (age effect)')
-    plt.show()
+    plt.savefig(output_path / "confound_effects_analysis_age_R2_pre_vs_post.png")
 
     confound_effects_df = pd.DataFrame(confound_effects)
     confound_effects_df.to_csv(output_path / "confound_effects_analysis.csv", index=False)
@@ -321,14 +344,15 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
 
     df['sex'] = pd.to_numeric(df['sex'], errors='raise').astype(float)
     df['age_at_mri'] = pd.to_numeric(df['age_at_mri'], errors='raise').astype(float)
-    df['scan_site'] = pd.to_numeric(df['scan_site'], errors='raise').astype(float)
     df['subject'] = df['subject'].astype(str)
+
+    df, site_dummy_cols, _ = _one_hot_encode_scan_site(df)
 
     # Prepare data for normative modeling
     data = NormData.from_dataframe(
         name="mri_norm",
         dataframe=df,
-        covariates=["sex", "age_at_mri", "scan_site"],
+        covariates=["sex", "age_at_mri"] + site_dummy_cols,
         response_vars=mri_roi_cols,
         subject_ids="subject",
         remove_Nan=True,
