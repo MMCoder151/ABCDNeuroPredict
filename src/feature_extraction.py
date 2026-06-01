@@ -1,0 +1,764 @@
+import os
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from src.mri_rois import mri_rois
+from pcntoolkit import NormativeModel, BLR, Runner
+from pcntoolkit.dataio.norm_data import NormData
+from tqdm import tqdm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.tsa.seasonal import STL
+import pathlib
+from pyampute.exploration.mcar_statistical_tests import MCARTest
+import matplotlib.pyplot as plt
+from sklearn.mixture import BayesianGaussianMixture
+import hdbscan
+from sklearn.metrics import confusion_matrix
+from scipy.optimize import linear_sum_assignment
+from sklearn.metrics import jaccard_score
+from pyampute.exploration.mcar_statistical_tests import MCARTest
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.impute import IterativeImputer
+import statsmodels.api as sm
+from scipy.stats import wilcoxon
+
+def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output")):
+    '''
+    This function runs linear regression and extracts the total and unique variance explained (R squared and adjusted R squared) 
+    for each confound before and after normative modeling
+    Parameters:
+        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
+        dem_df (DataFrame): DataFrame containing demographic information for the subjects
+        mri_meta_df (DataFrame): DataFrame containing MRI metadata for the subjects
+        output_path (pathlib.Path): Path to the output directory where the results will be saved
+    Returns:
+        confound_effects_analysis.csv (file): CSV file containing the results of the confound effect analyses for each MRI ROI
+        confound_effects_analysis.json (file): JSON file containing the results of the confound effect analyses for each MRI ROI
+        confound_effects_df (DataFrame): DataFrame containing the results of the confound effect analyses for each MRI ROI
+    '''
+    # Import z-score file from normative modeling
+    if not (output_path / "normative_modelling" / "results" / "Z_mri_norm.csv").exists():
+        print("Z-score file from normative modeling not found. Please run normative modeling before running confound effect analysis.")
+        return None
+    z_scores_df = pd.read_csv(output_path / "normative_modelling" / "results" / "Z_mri_norm.csv")
+    z_scores_df.drop(columns=["observations"], inplace=True, errors ="ignore")
+
+    # Import raw MRI data for the first timepoint for each subject
+    query = f"""
+        SELECT *
+        FROM mri_data
+        WHERE timepoint IN (
+            SELECT MIN(timepoint)
+            FROM mri_data AS sub_mri
+            WHERE sub_mri.subject = mri_data.subject
+        )
+    """
+    mri_df = con.execute(query).df()
+
+    # Get MRI ROIs to include in the analysis
+    _, mri_rois_dict = mri_rois()
+    mri_roi_cols = list(mri_rois_dict.keys())
+
+    # Encode sex explicitly so F/M map to 1/2 before passing data to NormData.
+    sex_map = {'F': 1, 'M': 2}
+    if not pd.api.types.is_numeric_dtype(dem_df['sex']):
+        sex_values = dem_df['sex'].astype('string').str.strip().str.upper()
+        mapped_sex = sex_values.map(sex_map)
+        if mapped_sex.isna().any():
+            unexpected_values = sorted(sex_values[mapped_sex.isna()].dropna().unique().tolist())
+            raise ValueError(
+                f"Unmapped sex values found: {unexpected_values}. Expected F/M or numeric input."
+            )
+        dem_df['sex'] = mapped_sex.astype('Int64')
+
+    # Add age_at_mri from mri_meta_df for the first timepoint to dem_df
+    first_age = mri_meta_df.sort_values("timepoint").drop_duplicates(subset="subject", keep="first")[["subject","age_at_mri"]]
+    dem_df = dem_df.merge(
+        first_age,
+        on="subject",
+        how="left"
+    )
+
+    # Merge z_scores_df with demographic data to get age for each subject
+    z_scores_df = z_scores_df.merge(
+        dem_df[["subject", "age_at_mri", "sex", "scan_site"]].drop_duplicates(),
+        left_on="subject_ids",
+        right_on="subject",
+        how="inner"
+    )
+    z_scores_df.drop(columns=["subject_ids"], inplace=True)
+
+    # Merge raw MRI data with demographic data to get age for each subject
+    mri_df = mri_df.merge(
+        dem_df[["subject", "age_at_mri", "sex", "scan_site"]].drop_duplicates(),
+        left_on="subject",
+        right_on="subject",
+        how="inner"
+    )
+
+    # Fit hierarchical linear regression models for each MRI ROI with age, sex, and site as predictors before and after noromative modeling
+    # and extract both total and unique variance explained (R squared and adjusted R squared) for each confound
+    confound_effects = []
+
+    # Define model hierarchy
+    # Order reflects theoretical priority: site first (nuisance),
+    # then age (primary biological), then sex
+    model_hierarchy = {
+        'site only':          ['scan_site'],
+        'site + age':         ['scan_site', 'age_at_mri'],
+        'site + age + sex':   ['scan_site', 'age_at_mri', 'sex']
+    }
+
+    for roi in tqdm(mri_roi_cols, desc="Analyzing confound effects"):
+        # Prepare data for regression
+        pre_df = mri_df[["subject", "age_at_mri", "sex", "scan_site", roi]].dropna(subset=[roi])
+        pre_df = pre_df.apply(pd.to_numeric, errors='coerce').astype('float64').dropna(subset=[roi])
+        #pre_df.dtypes
+        post_df = z_scores_df[["subject", "age_at_mri", "sex", "scan_site", roi]].dropna(subset=[roi])
+        post_df = post_df.apply(pd.to_numeric, errors='coerce').astype('float64').dropna(subset=[roi])
+        X_pre = pre_df[["age_at_mri", "sex", "scan_site"]]
+        X_post = post_df[["age_at_mri", "sex", "scan_site"]]
+        y_pre = pre_df[roi]
+        y_post = post_df[roi]
+        X_pre_const = sm.add_constant(X_pre)
+        X_post_const = sm.add_constant(X_post)
+        # Fit models according to hierarchy and extract R squared and adjusted R squared 
+        model_results = {}
+        for model_name, predictors in model_hierarchy.items():
+            model_pre = sm.OLS(y_pre, X_pre_const[["const"] + predictors]).fit()
+            model_post = sm.OLS(y_post, X_post_const[["const"] + predictors]).fit()
+            model_results[model_name] = {
+                "R_squared_pre": model_pre.rsquared,
+                "Adj_R_squared_pre": model_pre.rsquared_adj,
+                "p_values_pre": model_pre.pvalues.to_dict(),
+                "coefficients_pre": model_pre.params.to_dict(),
+                "R_squared_post": model_post.rsquared,
+                "Adj_R_squared_post": model_post.rsquared_adj,
+                "p_values_post": model_post.pvalues.to_dict(),
+                "coefficients_post": model_post.params.to_dict()
+            }
+        confound_effects.append({
+            "mri_roi": roi,
+            "model_results": model_results
+        })
+
+    rows = []
+    for item in confound_effects:
+        roi = item['mri_roi']
+        for mname, res in item['model_results'].items():
+            rows.append({
+                'mri_roi': roi,
+                'model': mname,
+                'R2_pre': res['R_squared_pre'],
+                'R2_post': res['R_squared_post'],
+                'AdjR2_pre': res['Adj_R_squared_pre'],
+                'AdjR2_post': res['Adj_R_squared_post'],
+                'pvals_pre': res['p_values_pre'],
+                'pvals_post': res['p_values_post'],
+                'coef_pre': res['coefficients_pre'],
+                'coef_post': res['coefficients_post']
+            })
+    df = pd.DataFrame(rows)
+
+    pivot = df.pivot(index='mri_roi', columns='model')
+
+    missing = [r for r in mri_roi_cols if r not in mri_df.columns]
+    print('missing in mri_df:', missing)
+
+    pre_counts  = mri_df[mri_roi_cols].notna().sum().sort_values()
+    post_counts = z_scores_df[mri_roi_cols].notna().sum().sort_values()
+    print(pre_counts.head(20))
+    print(post_counts.head(20))
+
+    nan_rois = site_R2_pre[site_R2_pre.isna()].index.tolist()
+    print('pre non-nulls for NaN ROIs:\n', pre_counts.loc[nan_rois])
+    print('post non-nulls for NaN ROIs:\n', post_counts.loc[nan_rois])
+
+    roi = nan_rois[0]
+    clean_pre = mri_df[['subject','scan_site', 'age_at_mri','sex', roi]].apply(pd.to_numeric, errors='coerce').dropna(subset=['scan_site', roi])
+    print('pre rows:', len(clean_pre))
+    print('y unique:', clean_pre[roi].nunique())
+    print('scan_site unique:', clean_pre['scan_site'].nunique())
+    import numpy as np, statsmodels.api as sm
+    X = sm.add_constant(clean_pre[['scan_site']].astype(float))
+    print('X shape, rank:', X.shape, np.linalg.matrix_rank(X.values))
+
+    # find the confound_effects entry for this ROI (if still in memory)
+    entry = next((e for e in confound_effects if e['mri_roi']==roi), None)
+    print(entry)
+
+    # Age effect = (site+age) - (site only)
+    age_R2_pre  = pivot['R2_pre']['site + age'] - pivot['R2_pre']['site only']
+    age_R2_post = pivot['R2_post']['site + age'] - pivot['R2_post']['site only']
+    age_reduction = (age_R2_pre - age_R2_post)
+    age_pct_reduction = 100 * age_reduction / age_R2_pre.replace(0, np.nan)
+    print(f"Age effect: mean R2 reduction={age_reduction.mean():.4f}, mean % reduction={age_pct_reduction.mean():.2f}%")
+
+    # Sex effect = (site+age+sex) - (site+age)
+    sex_R2_pre  = pivot['R2_pre']['site + age + sex'] - pivot['R2_pre']['site + age']
+    sex_R2_post = pivot['R2_post']['site + age + sex'] - pivot['R2_post']['site + age']
+    sex_reduction = (sex_R2_pre - sex_R2_post)
+    sex_pct_reduction = 100 * sex_reduction / sex_R2_pre.replace(0, np.nan)
+    print(f"Sex effect: mean R2 reduction={sex_reduction.mean():.4f}, mean % reduction={sex_pct_reduction.mean():.2f}%")
+
+    nan_rois = site_R2_pre[site_R2_pre.isna()].index.tolist()
+    print(len(nan_rois), 'ROIs with NaN R2:', nan_rois[:20])
+
+    # Site effect is just the R2 of 'site only'
+    site_R2_pre  = pivot['R2_pre']['site only']
+    site_R2_post = pivot['R2_post']['site only']
+    site_reduction = site_R2_pre - site_R2_post
+    site_pct_reduction = 100 * site_reduction / site_R2_pre.replace(0, np.nan)
+    print(f"Site effect: mean R2 reduction={site_reduction.mean():.4f}, mean % reduction={site_pct_reduction.mean():.2f}%")
+
+    # Wilcoxon signed-rank test to compare the R2 values for each confound pre and post normative modeling across all MRI ROIs
+    valid = (~age_R2_pre.isna()) & (~age_R2_post.isna())
+    stat, p_age = wilcoxon(age_R2_pre[valid], age_R2_post[valid])
+    print('Age R2 Wilcoxon p=', p_age)
+    valid = (~sex_R2_pre.isna()) & (~sex_R2_post.isna())
+    stat, p_sex = wilcoxon(sex_R2_pre[valid], sex_R2_post[valid])
+    print('Sex R2 Wilcoxon p=', p_sex)
+    valid = (~site_R2_pre.isna()) & (~site_R2_post.isna())
+    stat, p_site = wilcoxon(site_R2_pre[valid], site_R2_post[valid])
+    print('Site R2 Wilcoxon p=', p_site)
+
+    def extract_coef(series, key):
+        return series.map(lambda d: d.get(key, np.nan) if isinstance(d, dict) else np.nan)
+
+    pivot_coefs = df.copy()
+    pivot_coefs['age_coef_pre']  = extract_coef(pivot_coefs['coef_pre'], 'age_at_mri')
+    pivot_coefs['age_coef_post'] = extract_coef(pivot_coefs['coef_post'], 'age_at_mri')
+
+    plt.figure(figsize=(6,4))
+    plt.hist(age_R2_pre - age_R2_post, bins=40)
+    plt.axvline(0, color='k', linestyle='--')
+    plt.title('Age: reduction in R2 (pre - post)')
+    plt.xlabel('Δ R2')
+    plt.show()
+
+    plt.figure(figsize=(6,6))
+    plt.scatter(age_R2_pre, age_R2_post, alpha=0.7)
+    plt.plot([0, max(age_R2_pre.max(), age_R2_post.max())],[0, max(age_R2_pre.max(), age_R2_post.max())], 'k--')
+    plt.xlabel('R2 pre')
+    plt.ylabel('R2 post')
+    plt.title('R2 pre vs post (age effect)')
+    plt.show()
+
+    confound_effects_df = pd.DataFrame(confound_effects)
+    confound_effects_df.to_csv(output_path / "confound_effects_analysis.csv", index=False)
+    confound_effects_df.to_json(output_path / "confound_effects_analysis.json", orient="records", lines=False, indent=2)
+    return confound_effects_df
+
+
+def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), overwrite=True):
+    '''
+    This function performs normative modeling and selects subjects based on their composite absolute z-score. 
+    It selects the top 10% (based on prevalence) of subjects with the highest cumulative z-score.
+    These subjects are considered to have abnormal development in the selected MRI ROIs associated with depression.
+
+    Parameters:
+        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
+        mri_meta_df (DataFrame): DataFrame containing MRI metadata
+        output_path (pathlib.Path): Path to the output directory where the normative model results will be saved
+    Returns:
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
+        normative_modelling (Folder): Folder containing the normative model, results, and plots created in the output directory
+    '''
+
+    if overwrite == False:
+        print("Normative modeling and subject selection skipped (overwrite=False). To re-run normative modeling and subject selection, set overwrite=True.")
+        try:
+            selected_subjects = pd.read_csv(Path(output_path) / "normative_modelling" / "results" / "selected_subjects.csv")
+            return selected_subjects
+        except Exception as e:
+            print(f"Error loading selected subjects: {e}")
+            print("Please check that the selected_subjects.csv file exists in the normative_modelling results directory and is correctly formatted.")
+            raise e
+
+    # Get MRI ROIs to include in the normative model
+    _, mri_rois_dict = mri_rois()
+    mri_roi_cols = list(mri_rois_dict.keys())
+
+    # Get subjects to include from mri_meta_df
+    included_subjects = mri_meta_df["subject"].unique()
+    
+    # Query MRI data for the first timepoint for each included subject
+    query = f"""
+        SELECT *
+        FROM mri_data
+        WHERE subject IN ({', '.join(f"'{sub}'" for sub in included_subjects)})
+        AND timepoint IN (
+            SELECT MIN(timepoint)
+            FROM mri_data AS sub_mri
+            WHERE sub_mri.subject = mri_data.subject
+        )
+    """
+    mri_df = con.execute(query).df()
+    print(f"MRI data loaded: {len(mri_df)} subjects")
+
+    # Merge MRI data with demographic data
+    df = mri_df.merge(
+    mri_meta_df[["subject", "sex", "age_at_mri", "scan_site"]].drop_duplicates(),
+    on="subject",
+    how="inner"    
+    )
+
+    missing_cols = set(mri_roi_cols) - set(df.columns)
+    if missing_cols:
+        print(f"Warning: The following MRI ROI columns are missing from the dataframe: {missing_cols}")
+
+    # Encode sex explicitly so F/M map to 1/2 before passing data to NormData.
+    sex_map = {'F': 1, 'M': 2}
+    if not pd.api.types.is_numeric_dtype(df['sex']):
+        sex_values = df['sex'].astype('string').str.strip().str.upper()
+        mapped_sex = sex_values.map(sex_map)
+        if mapped_sex.isna().any():
+            unexpected_values = sorted(sex_values[mapped_sex.isna()].dropna().unique().tolist())
+            raise ValueError(
+                f"Unmapped sex values found: {unexpected_values}. Expected F/M or numeric input."
+            )
+        df['sex'] = mapped_sex.astype('Int64')
+
+    df['sex'] = pd.to_numeric(df['sex'], errors='raise').astype(float)
+    df['age_at_mri'] = pd.to_numeric(df['age_at_mri'], errors='raise').astype(float)
+    df['scan_site'] = pd.to_numeric(df['scan_site'], errors='raise').astype(float)
+    df['subject'] = df['subject'].astype(str)
+
+    # Prepare data for normative modeling
+    data = NormData.from_dataframe(
+        name="mri_norm",
+        dataframe=df,
+        covariates=["sex", "age_at_mri", "scan_site"],
+        response_vars=mri_roi_cols,
+        subject_ids="subject",
+        remove_Nan=True,
+    )
+
+    normative_output_dir = Path(output_path) / "normative_modelling"
+    if not normative_output_dir.exists():
+        normative_output_dir.mkdir(parents=True)
+    normative_output_dir_str = str(normative_output_dir)
+
+    # setup normative model
+    model = NormativeModel(
+        BLR(),
+        # Whether to save the model after fitting.
+        savemodel=True,
+        # Whether to evaluate the model after fitting.
+        evaluate_model=True,
+        # Whether to save the results after evaluation.
+        saveresults=True,
+        # Whether to save the plots after fitting.
+        saveplots=False,
+        # The directory to save the model, results, and plots.
+        save_dir=normative_output_dir_str,
+        # The scaler to use for the input data. Can be either one of "standardize", "minmax", "robminmax", "none"
+        inscaler="standardize",
+        # The scaler to use for the output data. Can be either one of "standardize", "minmax", "robminmax", "none"
+        outscaler="standardize",
+        )
+
+    model.fit(data)
+
+    # create a runner
+    #runner = Runner(cross_validate = True)
+
+    # fit the model 
+    #runner.fit(model, data)
+
+    # Read in z-score file from normative modeling 
+    centiles_df = pd.read_csv(normative_output_dir / "results" / "Z_mri_norm.csv")
+    # Calculate composite absolute z-score across all MRI ROIs for each subject
+    centiles_df["composite_z"] = centiles_df[mri_roi_cols].abs().sum(axis=1)
+    subject_scores = (
+        centiles_df[["subject_ids", "composite_z"]]
+        .dropna()
+        .drop_duplicates(subset=["subject_ids"])
+        .sort_values("composite_z")
+        .reset_index(drop=True)
+    )
+    subject_scores["subject_ids"].nunique()
+    subject_scores["rank"] = np.arange(len(subject_scores))
+    # Select top 10% of subjects with the highest composite z-score based on ranked prevalence
+    n_select = int(np.ceil(0.10 * len(subject_scores)))
+    selected_subject_ids = subject_scores.nlargest(n_select, "composite_z")["subject_ids"]
+    selected_subjects = subject_scores[subject_scores["subject_ids"].isin(selected_subject_ids)]
+    
+    print(f"Selected {len(selected_subject_ids)} subjects with the highest composite z-scores based on a prevalence threshold of 10%.")
+    selected_subjects.to_csv(normative_output_dir / "results" / "selected_subjects.csv", index=False)
+    
+    # create scatter plot of composite z-scores for all subjects, highlighting selected subjects in a different color
+    plot_df = centiles_df[["subject_ids", "composite_z"]].dropna().sort_values("composite_z").reset_index(drop=True)
+    plot_df["rank"] = np.arange(len(plot_df))
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(subject_scores["rank"], subject_scores["composite_z"], label="All subjects", alpha=0.5, s=12)
+    selected_plot = subject_scores[subject_scores["subject_ids"].isin(selected_subject_ids)]
+    plt.scatter(selected_plot["rank"], selected_plot["composite_z"], label="Selected subjects", color="red", s=18)
+    plt.xlabel("Subject rank by composite z-score")
+    plt.ylabel("Composite Absolute Z-Score")
+    plt.title("Composite Absolute Z-Scores for MRI ROIs")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(normative_output_dir / "results" / "composite_z_scores.png")
+    plt.close()
+
+    # Create summary table with mean, std, min, and max per mri_roi for the selected subjects
+    stats_selected = (
+        centiles_df[mri_roi_cols]
+        .agg(['mean', 'std', 'min', 'max'])
+        .transpose()
+        .reset_index()
+        .rename(columns={"index": "mri_roi"})
+    )
+    stats_selected.to_csv(normative_output_dir / "results" / "mri_roi_statistics.csv", index=False)
+
+    # Create results summary table with mean, std, min, and max per metric
+    stats_df = pd.read_csv(normative_output_dir / "results" / "statistics_mri_norm.csv")
+    summary = stats_df.assign(
+        mean = stats_df[mri_roi_cols].mean(axis=1),
+        std  = stats_df[mri_roi_cols].std(axis=1),
+        min  = stats_df[mri_roi_cols].min(axis=1),
+        max  = stats_df[mri_roi_cols].max(axis=1),
+    )[["statistic", "mean", "std", "min", "max"]]
+    summary.to_csv(normative_output_dir / "results" / "statistics_summary.csv", index=False)
+
+    return selected_subjects
+
+def create_mri_composites(selected_subjects):
+    '''
+    This function creates composite scores out of selected subject's z-scores based on 
+    variance inflation factors (VIF) to account for multicollinearity between MRI ROIs.
+
+    Parameters:
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
+    Returns:
+        composite_scores_df (DataFrame): DataFrame containing the selected subjects and their composite scores based on the selected MRI ROIs
+        composite_dict (dict): Dictionary mapping composite score names to the MRI ROIs included in each composite
+    '''
+
+    # Get MRI ROIs to include in the normative model
+    _, mri_rois_dict = mri_rois()
+    mri_roi_cols = list(mri_rois_dict.keys())
+
+    # Calculate variance inflation factors (VIF) for the selected MRI ROIs
+    vif_data = selected_subjects[mri_roi_cols].dropna()
+    vif_df = pd.DataFrame({
+        "mri_roi": vif_data.columns,
+        "vif": [variance_inflation_factor(vif_data.values, i) for i in range(vif_data.shape[1])]
+    }).sort_values("vif", ascending=False)
+    vif_df.head()
+
+    # Replace variables with a vif above 10 with their average until all variables have a vif below 10
+    composite_dict = {}
+    while vif_df["vif"].max() > 10:
+        # Get the variable with the highest VIF
+        high_vif_roi = vif_df.iloc[0]["mri_roi"]
+        # Create a composite score by averaging this variable with the variable it is most correlated with
+        correlations = vif_data.corr()[high_vif_roi].drop(high_vif_roi).abs()
+        most_correlated_roi = correlations.idxmax()
+        composite_name = f"composite_{high_vif_roi}_{most_correlated_roi}"
+        selected_subjects[composite_name] = selected_subjects[[high_vif_roi, most_correlated_roi]].mean(axis=1)
+        composite_dict[composite_name] = [high_vif_roi, most_correlated_roi]
+        # Drop the original variable with high VIF from the data used to calculate VIFs in the next iteration
+        vif_data = vif_data.drop(columns=[high_vif_roi])
+        # Recalculate VIFs
+        vif_df = pd.DataFrame({
+            "mri_roi": vif_data.columns,
+            "vif": [variance_inflation_factor(vif_data.values, i) for i in range(vif_data.shape[1])]
+        }).sort_values("vif", ascending=False)
+    print(f"Composites created: {composite_dict}")
+
+    return selected_subjects, composite_dict
+
+def mri_subtyping(dem_df, selected_subjects):
+    '''
+    This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data.
+    It uses several different clustering algorithms (HBDSCAN and Bayesian Gaussian Mixture Models).
+    Clustering stability is assessed using bootstrapping and assessing stability using the Jaccard index.
+    Algorithms are compared based on their Silhouette coefficient, Density-Based Clustering Validation (DBCV) score, and Davies-Bouldin Index (DBI).
+
+    Parameters:
+        dem_df (DataFrame): DataFrame containing demographic information for the selected subjects
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI z-scores
+    Returns:
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their assigned cluster labels based on their MRI ROI data
+
+    NOTE: This function is currently broken. Neither clustering algorithms compute properly. This is most likely due to the subjects and ROIs already being
+    pre-selected and therefore not showing enough differentiating patterns.
+    TODO: Dimensionality reduction (PacMac)
+    TODO: Look into Site correction!!! (Maxim Paper)
+    TODO: nach site plotten (sex, )
+    '''
+    output_path = Path(output_path)
+    # selected subjects read csv
+    selected_subjects = pd.read_csv(os.path.join(output_path, "selected_subjects.csv"))
+    selected_subjects.shape
+    selected_subjects.drop(columns=["observations", "composite_z"], inplace=True)
+
+    def _align_labels(reference, target):
+        '''Aligns cluster labels of the target clustering to the reference clustering using the Hungarian algorithm.'''
+        # Compute confusion matrix between reference and target labels
+        conf_matrix = confusion_matrix(reference, target)
+        # Use Hungarian algorithm to find optimal label alignment
+        row_ind, col_ind = linear_sum_assignment(-conf_matrix)
+        # Create a mapping from target labels to reference labels
+        label_mapping = {target_label: reference_label for target_label, reference_label in zip(col_ind, row_ind)}
+        # Apply the mapping to the target labels
+        aligned_target = target.map(label_mapping)
+        return aligned_target 
+    
+    # Create reference clustering on the original data
+    hdbscan_clusterer = hdbscan.HDBSCAN(min_cluster_size=5)
+    reference_labels_hdbscan = hdbscan_clusterer.fit_predict(selected_subjects.drop(columns=["subject_ids"]))
+    gmm_clusterer = BayesianGaussianMixture(n_components=3, random_state=42)
+    reference_labels_gmm = gmm_clusterer.fit_predict(selected_subjects.drop(columns=["subject_ids"]))
+
+    # Create mask for non-noise points in HDBSCAN and GMM to use for alignment and scoring (only consider points that are not labeled as noise in either clustering)
+    mask = (reference_labels_hdbscan[bootstrap_sample.index] >= 0) & (boot_labels >= 0)
+
+    ref_clean  = reference_labels_hdbscan[bootstrap_sample.index][mask]
+    
+    jaccard_indices = {
+        "hdbscan": [],
+        "gmm": []
+    }
+    
+    for i in tqdm(range(100), desc="Bootstrapping for clustering stability"):
+        # Resample subjects with replacement
+        bootstrap_sample = selected_subjects.sample(frac=1, replace=True, random_state=i)
+
+        # HDBSCAN clustering
+        hdbscan_clusterer = hdbscan.HDBSCAN(min_cluster_size=5)
+        boot_labels = hdbscan_clusterer.fit_predict(bootstrap_sample.drop(columns=["subject_ids"]))
+        boot_clean = boot_labels[mask]
+        aligned_boot_labels = _align_labels(ref_clean[bootstrap_sample.index], boot_clean)
+        jaccard_hdbscan = jaccard_score(reference_labels_hdbscan[bootstrap_sample.index], aligned_boot_labels, average="macro")
+        jaccard_indices["hdbscan"].append(jaccard_hdbscan)
+
+        # Gaussian Mixture Models clustering
+        gmm_clusterer = BayesianGaussianMixture(n_components=3, random_state=i)
+        boot_labels = gmm_clusterer.fit_predict(bootstrap_sample.drop(columns=["subject_ids"]))
+        boot_clean = boot_labels[mask]
+        aligned_boot_labels = _align_labels(reference_labels_gmm[bootstrap_sample.index], boot_clean)
+        jaccard_gmm = jaccard_score(reference_labels_gmm[bootstrap_sample.index], aligned_boot_labels, average="macro")
+        jaccard_indices["gmm"].append(jaccard_gmm)
+    print(f"HDBSCAN clustering stability (Jaccard index): mean={np.mean(jaccard_indices['hdbscan']):.4f}, std={np.std(jaccard_indices['hdbscan']):.4f}")
+    print(f"GMM clustering stability (Jaccard index): mean={np.mean(jaccard_indices['gmm']):.4f}, std={np.std(jaccard_indices['gmm']):.4f}")
+
+def missingness_analysis(con, fit_meta_df):
+    '''
+    This function analyzes the missingness patterns in the fitbit data for the selected subjects for MCAR, MAR, or MNAR missingness
+    using Littles test from pyampute.
+        1. Queries different fitbit domain data separately (i.e. actigraphy-based: Stps1m, METs1m, Int1m, heart-rate: HR1m, Sleep: Slp1m)
+        2. For each, creates datetime index (days) with proper missing days based on min and max of the Wear_Time column for each subject and timepoint, 
+        and merges with the original data to get missingness patterns
+        3. Conducts Little's test for each fitbit domain to assess whether the missingness is MCAR, MAR, or MNAR
+
+    Parameters:
+        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
+        fit_meta_df (DataFrame): DataFrame containing the fitbit metadata for the selected subjects
+    Returns:
+        missingness_df (DataFrame): DataFrame containing the missingness patterns in the fitbit data for the selected subjects.
+
+    NOTE: This function is currently broken. Little's test is not computing properly and I have no fucking clue why. WIP
+    '''
+
+    # For each subject and timepoint, create datetime index with proper missing days based on min and max of the Wear_Time column, and merge with original data to get missingness patterns
+    def create_missingness_df(df, domain_name):
+        missingness_list = []
+        grouped = df.groupby(["subject", "timepoint"])
+        for (subject, timepoint), group in tqdm(grouped, total=grouped.ngroups, desc=f"Creating missingness patterns for {domain_name}"):
+            min_date = group["Wear_Time"].min().floor("D")
+            max_date = group["Wear_Time"].max().ceil("D")
+            value_cols = [c for c in group.columns if c not in ["subject", "timepoint", "Wear_Time"]]
+            daily_means = group.set_index("Wear_Time")[value_cols].resample("D").mean().reset_index()
+            date_range = pd.date_range(start=min_date, end=max_date, freq="D")
+            date_df = pd.DataFrame({"Wear_Time": date_range})
+            merged_df = date_df.merge(daily_means, on="Wear_Time", how="left")
+            merged_df["subject"] = subject
+            merged_df["timepoint"] = timepoint
+            missingness_list.append(merged_df)
+        return pd.concat(missingness_list, ignore_index=True)
+    
+    # Conduct Little's test for each fitbit domain to assess if the missingness is MCAR
+    mcar_test = MCARTest(method="little")
+
+    def safe_little_test(df, min_obs_per_col=5, min_cols=2):
+        df = df.copy()
+        # coerce numeric and drop empty cols/rows
+        df = df.apply(pd.to_numeric, errors='coerce')
+        df = df.loc[:, df.notna().sum() >= min_obs_per_col]
+        df = df.dropna(how='all')
+        if df.shape[1] < min_cols or df.shape[0] < 2:
+            return np.nan, "insufficient data after filtering"
+        # compute pj/df quickly (same logic as pyampute)
+        vars_ = df.dtypes.index.values
+        n_var = df.shape[1]
+        r = 1 * df.isnull()
+        mdp = np.dot(r, [2**i for i in range(n_var)])
+        pj = 0
+        for i in np.unique(mdp):
+            dataset_temp = df.loc[mdp == i, vars_]
+            select_vars = ~dataset_temp.isnull().any()
+            pj += np.sum(select_vars)
+        df_val = pj - n_var
+        if df_val <= 0:
+            return np.nan, f"df <= 0 (pj={pj}, n_var={n_var})"
+        # try running the test and catch numerical errors
+        try:
+            pval = MCARTest(method="little").little_mcar_test(df)
+        except Exception as e:
+            return np.nan, f"test error: {e}"
+        return pval, None
+
+    p, err = safe_little_test(actigraphy_missingness_df.drop(columns=["subject","timepoint","Wear_Time"]))
+    print("p:", p, "err:", err)
+
+    # Query all fitbit data
+    fitbit_df = con.execute(f"SELECT subject, timepoint, Wear_Time, * FROM fitbit_data").df()
+    print(f"Creating missingness pattern...")
+    fitbit_missingness_df = create_missingness_df(fitbit_df, "fitbit")
+    fitbit_df = None  # free memory
+    fitbit_mcar = mcar_test.little_mcar_test(fitbit_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
+    fitbit_missingness_df = None  # free memory
+
+    # Query actigraphy columns
+    actigraphy_cols = ["Calories_Cal1m", "Steps_Stps1m", "METs_METs1m"]
+    actigraphy_df = con.execute(f"SELECT subject, timepoint, Wear_Time, {', '.join(actigraphy_cols)} FROM fitbit_data").df()
+    # Create missingness patterns for actigraphy data
+    actigraphy_missingness_df = create_missingness_df(actigraphy_df, "actigraphy")
+    actigraphy_df = None  # free memory
+    # Conduct Little's test for actigraphy data
+    actigraphy_mcar = mcar_test.little_mcar_test(actigraphy_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
+    actigraphy_missingness_df = None  # free memory
+
+    actigraphy_df.head()
+    actigraphy_df.shape
+    actigraphy_missingness_df.head()
+    actigraphy_missingness_df.shape
+    actigraphy_missingness_df["Wear_Time"].min(), actigraphy_missingness_df["Wear_Time"].max()
+
+    daily_means = actigraphy_df.set_index("Wear_Time")[actigraphy_cols].resample("D").mean().reset_index()
+    daily_means.head(10)
+
+    # Query heart rate columns
+    heart_rate_df = con.execute(f"SELECT subject, timepoint, Wear_Time, Value_HR1m FROM fitbit_data").df()
+    # Create missingness patterns for heart rate data
+    heart_rate_missingness_df = create_missingness_df(heart_rate_df, "heart_rate")
+    heart_rate_df = None  # free memory
+    # Conduct Little's test for heart rate data
+    heart_rate_mcar = mcar_test.little_mcar_test(heart_rate_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
+    heart_rate_missingness_df = None  # free memory
+
+    # Query sleep columns
+    sleep_df = con.execute(f"SELECT subject, timepoint, Wear_Time, value_Slp1m FROM fitbit_data").df()
+    # Create missingness patterns for sleep data
+    sleep_missingness_df = create_missingness_df(sleep_df, "sleep")
+    sleep_df = None  # free memory
+    # Conduct Little's test for sleep data
+    sleep_mcar = mcar_test.little_mcar_test(sleep_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
+    sleep_missingness_df = None  # free memory
+
+    print(f"Actigraphy missingness MCAR test: p-value={actigraphy_mcar:.4f}")
+    print(f"Heart rate missingness MCAR test: p-value={heart_rate_mcar:.4f}")
+    print(f"Sleep missingness MCAR test: p-value={sleep_mcar:.4f}")
+
+def extr_fitbit_features(con, selected_subjects):
+    '''
+    This function extracts features from the fitbit data for the selected subjects.
+        1. Creates daily mean, std, min, and max for each fitbit metric
+        2. Imputes missing days 
+        3. Conducts weekly Seasonal Trend Decomposition using Loess (STL) for each daily fitbit metric
+        4. Creates mean, stdm, min, and max for the trend, seasonal, and residual components of the STL decomposition for each fitbit metric
+    Parameters:
+        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
+        selected_subjects (DataFrame): DataFrame containing the subjects to extract fitbit features from 
+    Returns:
+        fitbit_features_df (DataFrame): DataFrame containing the extracted fitbit features for each subject
+    '''
+    # Get list of selected subjects
+    selected_subjects_list = selected_subjects["subject"].unique().tolist()
+
+    # Query FIRST timepoint for the selected subjects
+    query = f"""
+    SELECT *
+    FROM fitbit_data
+    WHERE timepoint = (
+        SELECT MIN(timepoint)
+        FROM fitbit_data f2
+        WHERE f2.subject = fitbit_data.subject
+    )
+    AND subject IN ({', '.join(map(str, selected_subjects_list))})
+    """
+    print("Querying fitbit data for feature extraction...")
+    fitbit_df = con.execute(query).df()
+
+    # Get fitbit metric columns (exclude subject, timepoint, and Wear_Time)
+    fitbit_metric_cols = [col for col in fitbit_df.columns if col not in ["subject", "timepoint", "Wear_Time"]]
+
+    # Coerce to numeric
+    for col in fitbit_metric_cols:
+        fitbit_df[col] = pd.to_numeric(fitbit_df[col], errors="coerce")
+
+    # Create a dataframe to hold the extracted features
+    features_list = []
+
+    # Loop through each subject and timepoint to extract features
+    grouped = fitbit_df.groupby(["subject", "timepoint"])
+    for (subject, timepoint), group in tqdm(grouped, total=grouped.ngroups, desc="Extracting Fitbit features"):
+        feature_dict = {"subject": subject, "timepoint": timepoint}
+        for metric in fitbit_metric_cols:
+            # Check if the metric column exists in the group
+            #if metric in group.columns:
+                daily_data = group[["Wear_Time", metric]]#.dropna()
+                if not daily_data.empty:
+                    # Create daily features (mean, std, min, max)
+                    daily_data.set_index("Wear_Time", inplace=True)
+                    daily_stats = daily_data.resample("D").agg(['mean', 'std', 'min', 'max'])
+                    daily_stats.columns = ['_'.join(col) for col in daily_stats.columns]
+                    # Create datetime index with proper missing days based on the daily resampling range
+                    min_date = daily_stats.index.min().floor("D")
+                    max_date = daily_stats.index.max().ceil("D")
+                    date_range = pd.date_range(start=min_date, end=max_date, freq="D")
+                    # Reindex to include missing days and impute missing values with multiple imputation
+                    daily_stats = daily_stats.reindex(date_range)
+                    #if daily_stats.shape[0] > 1 and daily_stats.notna().sum().sum() > daily_stats.shape[1]:
+                    try:
+                        imputer = IterativeImputer(random_state=0, max_iter=20)
+                        daily_stats = pd.DataFrame(
+                            imputer.fit_transform(daily_stats),
+                            index=daily_stats.index,
+                            columns=daily_stats.columns,
+                        )
+                    except Exception as e:
+                        print(f"Iterative imputation failed for subject {subject}, timepoint {timepoint}, metric {metric}: {e}")
+                        daily_stats = daily_stats.ffill().bfill()
+                    #else:
+                        #daily_stats = daily_stats.ffill().bfill()
+                    feature_dict.update(daily_stats.mean().to_dict())
+                    # STL decomposition
+                    try:
+                        stl = STL(daily_data[metric], period=7, robust=True)
+                        result = stl.fit()
+                        stl_features = {
+                            f"{metric}_trend_mean": result.trend.mean(),
+                            f"{metric}_trend_std": result.trend.std(),
+                            f"{metric}_trend_min": result.trend.min(),
+                            f"{metric}_trend_max": result.trend.max(),
+                            f"{metric}_seasonal_mean": result.seasonal.mean(),
+                            f"{metric}_seasonal_std": result.seasonal.std(),
+                            f"{metric}_seasonal_min": result.seasonal.min(),
+                            f"{metric}_seasonal_max": result.seasonal.max(),
+                            f"{metric}_resid_mean": result.resid.mean(),
+                            f"{metric}_resid_std": result.resid.std(),
+                            f"{metric}_resid_min": result.resid.min(),
+                            f"{metric}_resid_max": result.resid.max(),
+                        }
+                        feature_dict.update(stl_features)
+                    except Exception as e:
+                        print(f"STL decomposition failed for subject {subject}, timepoint {timepoint}, metric {metric}: {e}")
+        features_list.append(feature_dict)
+    fitbit_features_df = pd.DataFrame(features_list)
+
+    return fitbit_features_df
