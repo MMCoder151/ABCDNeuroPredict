@@ -109,10 +109,8 @@ test_y.to_csv(os.path.join(output_path, "test_labels.csv"), index=False)
 
 # ---- DATA ANALYSIS ----
 
-# Get demographics (age, sex) of selected and all subjects
-
 # Conduct unsupervised clustering of selected subjects' z-scores for subtype discovery
-#subject_subtypes = mri_subtyping(dem_df, selected_subjects)
+#subject_subtypes = mri_clustering(dem_df, selected_subjects)
 
 # Conduct missingness analysis of fitbit data
 #missingness_df = missingness_analysis(con, fit_meta_df)

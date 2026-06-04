@@ -21,6 +21,10 @@ from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer
 import statsmodels.api as sm
 from scipy.stats import wilcoxon
+import pacmap
+from sklearn.metrics import silhouette_score
+from sklearn.manifold import trustworthiness
+from sklearn.neighbors import NearestNeighbors
 
 
 def _one_hot_encode_scan_site(df, site_col="scan_site", prefix="scan_site", categories=None):
@@ -40,7 +44,7 @@ def _one_hot_encode_scan_site(df, site_col="scan_site", prefix="scan_site", cate
 def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output")):
     '''
     This function runs linear regression and extracts the total and unique variance explained (R squared and adjusted R squared) 
-    for each confound before and after normative modeling
+    for each confound before and after normative modeling of MRI data
     Parameters:
         con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
         dem_df (DataFrame): DataFrame containing demographic information for the subjects
@@ -112,6 +116,7 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
         how="inner"
     )
 
+    # One-hot encode scan site in both dataframes and ensure the same categories and column names
     site_categories = sorted(
         pd.concat([mri_df["scan_site"], z_scores_df["scan_site"]], ignore_index=True)
         .astype("string")
@@ -147,7 +152,6 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
         # Prepare data for regression
         pre_df = mri_df[["subject", "age_at_mri", "sex", roi] + site_dummy_cols].dropna(subset=[roi])
         pre_df = pre_df.apply(pd.to_numeric, errors='coerce').astype('float64')
-        #pre_df.dtypes
         post_df = z_scores_df[["subject", "age_at_mri", "sex", roi] + site_dummy_cols].dropna(subset=[roi])
         post_df = post_df.apply(pd.to_numeric, errors='coerce').astype('float64')
         X_pre = pre_df[site_dummy_cols + ["age_at_mri", "sex"]]
@@ -271,7 +275,6 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
     confound_effects_df.to_csv(output_path / "confound_effects_analysis.csv", index=False)
     confound_effects_df.to_json(output_path / "confound_effects_analysis.json", orient="records", lines=False, indent=2)
     return confound_effects_df
-
 
 def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), overwrite=True):
     '''
@@ -495,7 +498,7 @@ def create_mri_composites(selected_subjects):
 
     return selected_subjects, composite_dict
 
-def mri_subtyping(dem_df, selected_subjects):
+def mri_clustering(dem_df, selected_subjects):
     '''
     This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data.
     It uses several different clustering algorithms (HBDSCAN and Bayesian Gaussian Mixture Models).
@@ -532,14 +535,33 @@ def mri_subtyping(dem_df, selected_subjects):
         aligned_target = target.map(label_mapping)
         return aligned_target 
     
-    # Create reference clustering on the original data
-    hdbscan_clusterer = hdbscan.HDBSCAN(min_cluster_size=5)
-    reference_labels_hdbscan = hdbscan_clusterer.fit_predict(selected_subjects.drop(columns=["subject_ids"]))
-    gmm_clusterer = BayesianGaussianMixture(n_components=3, random_state=42)
-    reference_labels_gmm = gmm_clusterer.fit_predict(selected_subjects.drop(columns=["subject_ids"]))
+    # Dimensionality reduction using PaCMAP
+    reducer = pacmap.PaCMAP(n_components=2, random_state=42)
+    embedding = reducer.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
+    selected_subjects["embedding_1"] = embedding[:, 0]
+    selected_subjects["embedding_2"] = embedding[:, 1]
 
-    # Create mask for non-noise points in HDBSCAN and GMM to use for alignment and scoring (only consider points that are not labeled as noise in either clustering)
-    mask = (reference_labels_hdbscan[bootstrap_sample.index] >= 0) & (boot_labels >= 0)
+    # Evaluate dimensionality reduction validity using knn overlap and trustworthiness
+    def knn_overlap(X_orig, X_emb, k=10):
+        nn_orig = NearestNeighbors(n_neighbors=k+1).fit(X_orig)
+        nn_emb  = NearestNeighbors(n_neighbors=k+1).fit(X_emb)
+        idx_orig = nn_orig.kneighbors(return_distance=False)[:,1:]  # exclude self
+        idx_emb  = nn_emb.kneighbors(return_distance=False)[:,1:]
+        overlaps = [(len(set(a).intersection(b))/k) for a,b in zip(idx_orig, idx_emb)]
+        return np.mean(overlaps)
+    
+    knn_overlap_score = knn_overlap(selected_subjects.drop(columns=["subject_ids", "embedding_1", "embedding_2"]), embedding)
+    trustworthiness_score = trustworthiness(selected_subjects.drop(columns=["subject_ids", "embedding_1", "embedding_2"]), embedding, n_neighbors=10)
+    print(f"PaCMAP dimensionality reduction validity: KNN overlap={knn_overlap_score:.4f}, Trustworthiness={trustworthiness_score:.4f}")
+
+    # Create reference clustering on the lower dimensional data
+    hdbscan_clusterer = hdbscan.HDBSCAN(min_cluster_size=5)
+    reference_labels_hdbscan = hdbscan_clusterer.fit_predict(selected_subjects[["embedding_1", "embedding_2"]])
+    gmm_clusterer = BayesianGaussianMixture(n_components=3, random_state=42)
+    reference_labels_gmm = gmm_clusterer.fit_predict(selected_subjects[["embedding_1", "embedding_2"]])
+
+    # Create mask for non-noise points in HDBSCAN and GMM to use for alignment and scoring with label alignment
+    mask = (reference_labels_hdbscan != -1) & (reference_labels_gmm != -1)
 
     ref_clean  = reference_labels_hdbscan[bootstrap_sample.index][mask]
     
@@ -550,11 +572,11 @@ def mri_subtyping(dem_df, selected_subjects):
     
     for i in tqdm(range(100), desc="Bootstrapping for clustering stability"):
         # Resample subjects with replacement
-        bootstrap_sample = selected_subjects.sample(frac=1, replace=True, random_state=i)
+        bootstrap_sample = selected_subjects[["embedding_1", "embedding_2"]].sample(frac=1, replace=True, random_state=i)
 
         # HDBSCAN clustering
         hdbscan_clusterer = hdbscan.HDBSCAN(min_cluster_size=5)
-        boot_labels = hdbscan_clusterer.fit_predict(bootstrap_sample.drop(columns=["subject_ids"]))
+        boot_labels = hdbscan_clusterer.fit_predict(bootstrap_sample)
         boot_clean = boot_labels[mask]
         aligned_boot_labels = _align_labels(ref_clean[bootstrap_sample.index], boot_clean)
         jaccard_hdbscan = jaccard_score(reference_labels_hdbscan[bootstrap_sample.index], aligned_boot_labels, average="macro")
@@ -562,7 +584,7 @@ def mri_subtyping(dem_df, selected_subjects):
 
         # Gaussian Mixture Models clustering
         gmm_clusterer = BayesianGaussianMixture(n_components=3, random_state=i)
-        boot_labels = gmm_clusterer.fit_predict(bootstrap_sample.drop(columns=["subject_ids"]))
+        boot_labels = gmm_clusterer.fit_predict(bootstrap_sample)
         boot_clean = boot_labels[mask]
         aligned_boot_labels = _align_labels(reference_labels_gmm[bootstrap_sample.index], boot_clean)
         jaccard_gmm = jaccard_score(reference_labels_gmm[bootstrap_sample.index], aligned_boot_labels, average="macro")
