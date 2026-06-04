@@ -15,7 +15,42 @@ if not os.path.exists(output_path):
 # ---- DATA WRANGLING ----
 
 # Select subjects based on inclusion criteria and extract metadata
-dem_df, mri_meta_df, fit_meta_df = select_subjects(dta_path, test=False, overwrite=False)
+dem_df, mri_meta_df, fit_meta_df = filter_subjects(dta_path, test=False, overwrite=True)
+
+# Print demographics of selected subjects with both fitbit and mri data
+print("Demographics of filtered subjects with both fitbit and mri files:")
+print(f"N: {mri_meta_df['subject'].nunique()}")
+print("\nMRI Age Statistics:")
+print(f"Mean: {mri_meta_df['age_at_mri'].mean()}, Std: {mri_meta_df['age_at_mri'].std()}, Min: {mri_meta_df['age_at_mri'].min()}, Max: {mri_meta_df['age_at_mri'].max()}")
+print("\nSex Distribution:")
+print(dem_df["sex"].value_counts())
+
+# Print demographics of subjects without short recordings ("short" == 0)
+non_short_pairs = fit_meta_df[fit_meta_df["short"] == 0][["subject", "timepoint"]]
+non_short_subjects = non_short_pairs["subject"].unique()
+common_mri_non_short_df = mri_meta_df[
+    mri_meta_df[["subject", "timepoint"]].apply(tuple, axis=1).isin(non_short_pairs.apply(tuple, axis=1))
+]
+
+print("\nDemographics of subjects without short recordings:")
+print(f"N: {common_mri_non_short_df['subject'].nunique()}")
+print("\nMRI Age Statistics:")
+print(f"Mean: {common_mri_non_short_df['age_at_mri'].mean()}, Std: {common_mri_non_short_df['age_at_mri'].std()}, Min: {common_mri_non_short_df['age_at_mri'].min()}, Max: {common_mri_non_short_df['age_at_mri'].max()}")
+print("\nSex Distribution:")
+print(dem_df[dem_df["subject"].isin(non_short_subjects)]["sex"].value_counts())
+
+# Print demographics of subjects with short recordings ("short" == 1)
+short_pairs = fit_meta_df[fit_meta_df["short"] == 1][["subject", "timepoint"]]
+short_subjects = short_pairs["subject"].unique()
+common_mri_short_df = mri_meta_df[
+    mri_meta_df[["subject", "timepoint"]].apply(tuple, axis=1).isin(short_pairs.apply(tuple, axis=1))
+] 
+print("\nDemographics of subjects with short recordings:")
+print(f"N: {common_mri_short_df['subject'].nunique()}")
+print("\nMRI Age Statistics:")
+print(f"Mean: {common_mri_short_df['age_at_mri'].mean()}, Std: {common_mri_short_df['age_at_mri'].std()}, Min: {common_mri_short_df['age_at_mri'].min()}, Max: {common_mri_short_df['age_at_mri'].max()}")
+print("\nSex Distribution:")
+print(dem_df[dem_df["subject"].isin(short_subjects)]["sex"].value_counts())
 
 # Transform data to make it easier to query with DuckDB
 con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
@@ -23,7 +58,25 @@ con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
 # ---- FEATURE EXTRACTION ----
 
 # Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
-selected_subjects = normative_selection(con, mri_meta_df, overwrite=True)
+selected_subjects = normative_selection(con, mri_meta_df, overwrite=False)
+
+# Print demographics of normative selected subjects
+print("Selected Subjects MRI Age Statistics:")
+print(f"Mean: {mri_meta_df[mri_meta_df['subject'].isin(selected_subjects['subject_ids'])]['age_at_mri'].mean()}, Std: {mri_meta_df[mri_meta_df['subject'].isin(selected_subjects['subject_ids'])]['age_at_mri'].std()}, Min: {mri_meta_df[mri_meta_df['subject'].isin(selected_subjects['subject_ids'])]['age_at_mri'].min()}, Max: {mri_meta_df[mri_meta_df['subject'].isin(selected_subjects['subject_ids'])]['age_at_mri'].max()}")
+print("\nSelected Subjects Sex Distribution:")
+print(dem_df[dem_df["subject"].isin(selected_subjects["subject_ids"])]["sex"].value_counts())
+
+# Print missing statistics of fitbit data for selected subjects
+selected_fit_meta_df = fit_meta_df[fit_meta_df["subject"].isin(selected_subjects["subject_ids"])]
+print("\nFitbit Data Missingness Statistics for Normative Selected Subjects:")
+print(f"Mean missingness: {selected_fit_meta_df['missingness'].mean()}, Std: {selected_fit_meta_df['missingness'].std()}, Min: {selected_fit_meta_df['missingness'].min()}, Max: {selected_fit_meta_df['missingness'].max()}")
+print(f"Number of subjects with short recordings (short == 1): {selected_fit_meta_df[selected_fit_meta_df['short'] == 1]['subject'].nunique()} ({selected_fit_meta_df[selected_fit_meta_df['short'] == 1]['subject'].nunique() / len(selected_fit_meta_df) * 100:.2f}% )")
+
+# Print missingness statistics of fitbit data for non-selected subjects
+non_selected_fit_meta_df = fit_meta_df[~fit_meta_df["subject"].isin(selected_subjects["subject_ids"])]
+print("\nFitbit Data Missingness Statistics for Normative Non-Selected Subjects:")
+print(f"Mean missingness: {non_selected_fit_meta_df['missingness'].mean()}, Std: {non_selected_fit_meta_df['missingness'].std()}, Min: {non_selected_fit_meta_df['missingness'].min()}, Max: {non_selected_fit_meta_df['missingness'].max()}")
+print(f"Number of subjects with short recordings (short == 1): {non_selected_fit_meta_df[non_selected_fit_meta_df['short'] == 1]['subject'].nunique()} ({non_selected_fit_meta_df[non_selected_fit_meta_df['short'] == 1]['subject'].nunique() / len(non_selected_fit_meta_df) * 100:.2f}% )")
 
 # Conduct confound analysis pre and post normative modeling
 confound_effects_df = analyse_confounds(con, dem_df, mri_meta_df)

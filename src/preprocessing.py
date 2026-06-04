@@ -73,7 +73,7 @@ def _recode_fitbit_data(fit_df):
 
     return fit_df
 
-def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Path("output")):
+def filter_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Path("output")):
     '''
     This function selects subjects and time points based on selection criteria (below) and extracts demographic and meta information for fitbit and mri data
         - Only subjects with both "fit" and "scans" files are included (=> subjects with both Fitbit and MRI data)
@@ -81,7 +81,7 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
         - Drops Slp30s files, due to unusable data according to ABCD Data Release 6.0 documentation
         - Only subjects/sessions with complete "fit" data (i.e., all 6 "fit" files present) are included (=> complete Fitbit data for included subjects/sessions)
         - Only "scans" files with non-empty "acq_time" column are included (=> valid MRI acquisition date for included sessions)
-        - Only subjects/timepoints with more than 14 days of actually recorded Fitbit data are included (=> sufficient Fitbit data for included sessions)
+    Subjects/timepoints with less than 7 days of actually recorded Fitbit data and less than 60% missings are marked for later filtering
     Parameters:
         dta_path (Path): Path to the raw data directory
         test (bool): Whether to run in test mode (only uses first 100 subjects for faster testing)
@@ -183,14 +183,16 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
     # and rerun with "< 60" instead of <0.6 (It's already * 100, duh)
 
     fit_meta_df["missing_days_percentage"] = ((fit_meta_df["present_recording_days"] / fit_meta_df["recording_duration_days"]) * 100)
-    short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 14)][["subject", "timepoint"]].drop_duplicates()
-    # short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 7) | (fit_meta_df["missing_days_percentage"] < 60)][["subject", "timepoint"]].drop_duplicates()
-    fit_meta_df = fit_meta_df.merge(short_recordings, on=["subject", "timepoint"], how="left", indicator=True)
-    fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
-    print(f"Dropped {len(short_recordings)} timepoints with less than 14 days of fitbit data.")
+    #short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 14)][["subject", "timepoint"]].drop_duplicates()
+    short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 7) | (fit_meta_df["missing_days_percentage"] > 60)][["subject", "timepoint"]].drop_duplicates()
+    # Mark short recordings in binary column in fit_meta_df
+    fit_meta_df["short"] = fit_meta_df.apply(lambda row: 1 if (row["recording_duration_days"] < 7) | (row["missing_days_percentage"] > 60) else 0, axis=1)
+    #fit_meta_df = fit_meta_df.merge(short_recordings, on=["subject", "timepoint"], how="left", indicator=True)
+    #fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
+    #print(f"Dropped {len(short_recordings)} timepoints with less than 14 days of fitbit data.")
     #print(f"Dropped {len(short_recordings)} timepoints with less than 7 days and/or >60% missings of fitbit data.")
-    print(f"Number of subjects remaining after dropping short recordings: {fit_meta_df['subject'].nunique()}")
-    print(f"Average number of timepoints per subject after dropping short recordings: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
+    #print(f"Number of subjects remaining after dropping short recordings: {fit_meta_df['subject'].nunique()}")
+    #print(f"Average number of timepoints per subject after dropping short recordings: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
     # GET MRI METADATA
 
@@ -240,7 +242,7 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
     # Filter both metadata tables to the intersection of pairs
     fit_meta_df = fit_meta_df.merge(common_pairs, on=["subject", "timepoint"], how="inner")
     mri_meta_df = mri_meta_df.merge(common_pairs, on=["subject", "timepoint"], how="inner")
-    print(f"Number of subjects with both fitbit and mri files: {fit_meta_df['subject'].nunique()}")
+    print(f"Number of subjects with both fitbit and mri files: {common_pairs['subject'].nunique()}")
 
     # Get subjects with multiple timepoints/sessions with both "fit" and "scans" files
     timepoint_counts = fit_meta_df.groupby("subject")["timepoint"].nunique().reset_index(name="timepoint_count")
@@ -307,7 +309,7 @@ def select_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
     mri_meta_df.drop_duplicates(subset=["subject", "timepoint"], inplace=True)
     demo_df.drop_duplicates(subset=["subject"], inplace=True)
 
-    print(f"Final number of subjects included after selection: {demo_df['subject'].nunique()}")
+    print(f"Final number of subjects included after filtering: {demo_df['subject'].nunique()}")
 
     # save metadata to csv
     output_path.mkdir(parents=True, exist_ok=True)
