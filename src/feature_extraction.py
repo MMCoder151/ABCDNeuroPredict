@@ -191,18 +191,21 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
     age_R2_pre  = pivot['R2_pre']['site + age'] - pivot['R2_pre']['site only']
     age_R2_post = pivot['R2_post']['site + age'] - pivot['R2_post']['site only']
     age_reduction = (age_R2_pre - age_R2_post)
+    print(f"Age effect: mean R2 pre={age_R2_pre.mean():.4f}, mean R2 post={age_R2_post.mean():.4f}")
     print(f"Age effect: mean R2 reduction={age_reduction.mean():.4f}")
 
     # Sex effect = (site+age+sex) - (site+age)
     sex_R2_pre  = pivot['R2_pre']['site + age + sex'] - pivot['R2_pre']['site + age']
     sex_R2_post = pivot['R2_post']['site + age + sex'] - pivot['R2_post']['site + age']
     sex_reduction = (sex_R2_pre - sex_R2_post)
+    print(f"Sex effect: mean R2 pre={sex_R2_pre.mean():.4f}, mean R2 post={sex_R2_post.mean():.4f}")
     print(f"Sex effect: mean R2 reduction={sex_reduction.mean():.4f}")
 
     # Site effect is just the R2 of 'site only'
     site_R2_pre  = pivot['R2_pre']['site only']
     site_R2_post = pivot['R2_post']['site only']
     site_reduction = site_R2_pre - site_R2_post
+    print(f"Site effect: mean R2 pre={site_R2_pre.mean():.4f}, mean R2 post={site_R2_post.mean():.4f}")
     print(f"Site effect: mean R2 reduction={site_reduction.mean():.4f}")
 
     residual_association_df = df[df["model"].isin(model_hierarchy)].copy()
