@@ -263,7 +263,7 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
     confound_effects_df.to_json(output_path / "confound_effects_analysis.json", orient="records", lines=False, indent=2)
     return confound_effects_df
 
-def normative_selection(con, mri_meta_df, dem_df, output_path=pathlib.Path("output"), overwrite=True):
+def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), overwrite=True):
     '''
     This function performs normative modeling and selects subjects based on their composite absolute z-score. 
     It selects the top 10% (based on prevalence) of subjects with the highest cumulative z-score.
@@ -310,9 +310,9 @@ def normative_selection(con, mri_meta_df, dem_df, output_path=pathlib.Path("outp
     mri_df = con.execute(query).df()
     print(f"MRI data loaded: {len(mri_df)} subjects")
 
-    # Merge MRI data with demographic data from dem_df to get sex for each subject
+    # Merge MRI data 
     df = mri_df.merge(
-        dem_df[["subject", "sex"]].drop_duplicates(),
+        mri_meta_df[["subject", "sex", "age_at_mri", "scan_site"]].drop_duplicates(),
         on="subject",
         how="inner"
     )

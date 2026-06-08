@@ -179,20 +179,17 @@ def filter_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
         recording_duration_days = len(actual_days)
         fit_meta_df.loc[fit_meta_df["filepath"] == file, "present_recording_days"] = recording_duration_days
 
-    # TODO : Recheck missing_days_percentage calculation (old one returned negative percentages, WTF???) 
-    # and rerun with "< 60" instead of <0.6 (It's already * 100, duh)
+    present_days = pd.to_numeric(fit_meta_df["present_recording_days"], errors="coerce")
+    recording_days = pd.to_numeric(fit_meta_df["recording_duration_days"], errors="coerce")
+    fit_meta_df["missing_days_percentage"] = 100.0
+    valid_duration = recording_days > 0
+    fit_meta_df.loc[valid_duration, "missing_days_percentage"] = (
+        1 - (present_days.loc[valid_duration] / recording_days.loc[valid_duration])
+    ) * 100
+    fit_meta_df["missing_days_percentage"] = fit_meta_df["missing_days_percentage"].clip(lower=0, upper=100)
 
-    fit_meta_df["missing_days_percentage"] = ((fit_meta_df["present_recording_days"] / fit_meta_df["recording_duration_days"]) * 100)
-    #short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 14)][["subject", "timepoint"]].drop_duplicates()
-    short_recordings = fit_meta_df[(fit_meta_df["recording_duration_days"] < 7) | (fit_meta_df["missing_days_percentage"] > 60)][["subject", "timepoint"]].drop_duplicates()
     # Mark short recordings in binary column in fit_meta_df
     fit_meta_df["short"] = fit_meta_df.apply(lambda row: 1 if (row["recording_duration_days"] < 7) | (row["missing_days_percentage"] > 60) else 0, axis=1)
-    #fit_meta_df = fit_meta_df.merge(short_recordings, on=["subject", "timepoint"], how="left", indicator=True)
-    #fit_meta_df = fit_meta_df[fit_meta_df["_merge"] == "left_only"].drop(columns=["_merge"])
-    #print(f"Dropped {len(short_recordings)} timepoints with less than 14 days of fitbit data.")
-    #print(f"Dropped {len(short_recordings)} timepoints with less than 7 days and/or >60% missings of fitbit data.")
-    #print(f"Number of subjects remaining after dropping short recordings: {fit_meta_df['subject'].nunique()}")
-    #print(f"Average number of timepoints per subject after dropping short recordings: {fit_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
 
     # GET MRI METADATA
 
@@ -455,3 +452,119 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
     print(f"✓ DuckDB ready — {n_fitbit} Fitbit subjects, {n_mri} MRI subjects")
 
     return con
+
+def describe_subjects(fit_meta_df, mri_meta_df):
+    '''
+    This function prints descriptive statistics about the fitbit data for included subjects at the first timepoint in general and split by file domain (e.g., "fitbInt1m", "fitbCal1m", etc.) to the console.
+    Parameters:
+        fit_meta_df (DataFrame): DataFrame containing metadata for the selected fitbit files (subjects, timepoints, filepaths, recording durations, missingness percentages, etc.)
+        mri_meta_df (DataFrame): DataFrame containing MRI metadata for the subjects
+    Returns:
+        None (prints descriptive statistics to console)
+    '''
+
+    if "missing_days_percentage" in fit_meta_df.columns:
+        missingness_series = pd.to_numeric(fit_meta_df["missing_days_percentage"], errors="coerce")
+        needs_recompute = missingness_series.isna().any() or (~missingness_series.between(0, 100)).any()
+    else:
+        needs_recompute = True
+
+    if needs_recompute:
+        if {"present_recording_days", "recording_duration_days"}.issubset(fit_meta_df.columns):
+            fit_meta_df = fit_meta_df.copy()
+            present_days = pd.to_numeric(fit_meta_df["present_recording_days"], errors="coerce")
+            recording_days = pd.to_numeric(fit_meta_df["recording_duration_days"], errors="coerce")
+            fit_meta_df["missing_days_percentage"] = 100.0
+            valid_duration = recording_days > 0
+            fit_meta_df.loc[valid_duration, "missing_days_percentage"] = (
+                1 - (present_days.loc[valid_duration] / recording_days.loc[valid_duration])
+            ) * 100
+            fit_meta_df["missing_days_percentage"] = fit_meta_df["missing_days_percentage"].clip(lower=0, upper=100)
+        else:
+            raise KeyError(
+                "fit_meta_df must contain 'missing_days_percentage' or the columns required to derive it: "
+                "'present_recording_days' and 'recording_duration_days'."
+            )
+
+    # Print demographics of selected subjects with both fitbit and mri data
+    print("General demographics:")
+    print(f"N: {mri_meta_df['subject'].nunique()}")
+    print("\nMRI Age Statistics:")
+    print(f"Mean: {mri_meta_df['age_at_mri'].mean()}, Std: {mri_meta_df['age_at_mri'].std()}, Min: {mri_meta_df['age_at_mri'].min()}, Max: {mri_meta_df['age_at_mri'].max()}")
+    print("\nSex Distribution:")
+    print(mri_meta_df["sex"].value_counts())
+    print(f"\nAverage missingness percentage of fitbit data: {fit_meta_df['missing_days_percentage'].mean()}")
+
+    # Print Fitbit completeness at the first available timepoint, split by file domain
+    first_timepoint_fit_df = fit_meta_df[["subject", "timepoint", "filename", "short", "missing_days_percentage"]].copy()
+    first_timepoint_fit_df["domain"] = "other"
+    first_timepoint_fit_df.loc[
+        first_timepoint_fit_df["filename"].str.contains(r"fitbInt1m", case=False, regex=True),
+        "domain",
+    ] = "actigraphy"
+    first_timepoint_fit_df.loc[
+        first_timepoint_fit_df["filename"].str.contains(r"fitbHR1m", case=False, regex=True),
+        "domain",
+    ] = "heart_rate"
+    first_timepoint_fit_df.loc[
+        first_timepoint_fit_df["filename"].str.contains(r"fitbSlp1m", case=False, regex=True),
+        "domain",
+    ] = "sleep"
+    first_timepoint_fit_df = first_timepoint_fit_df[first_timepoint_fit_df["domain"] != "other"]
+    first_timepoint_fit_df["timepoint_order"] = first_timepoint_fit_df["timepoint"].str.extract(r"(\d+)")[0].astype(int)
+
+    first_timepoint_subject_df = (
+        first_timepoint_fit_df.sort_values(["subject", "timepoint_order", "timepoint"])
+        .drop_duplicates(subset=["subject"], keep="first")[["subject", "timepoint"]]
+    )
+
+    first_timepoint_fit_df = first_timepoint_fit_df.merge(first_timepoint_subject_df, on=["subject", "timepoint"], how="inner")
+
+    domain_subject_df = (
+        first_timepoint_fit_df.groupby(["domain", "subject"], as_index=False)
+        .agg(
+            n_files=("filename", "size"),
+            has_short=("short", lambda s: bool((s == 1).any())),
+            has_non_short=("short", lambda s: bool((s == 0).any())),
+            mean_missingness=("missing_days_percentage", "mean"),
+        )
+    )
+
+    print("\nSubject descriptive statistics at the first available timepoint, by domain:")
+
+    for domain in ["actigraphy", "heart_rate", "sleep"]:
+        domain_df = domain_subject_df[domain_subject_df["domain"] == domain]
+        if domain_df.empty:
+            continue
+
+        short_subjects = set(domain_df.loc[domain_df["has_short"], "subject"])
+        non_short_subjects = set(domain_df.loc[domain_df["has_non_short"], "subject"])
+
+        print(f"\n{domain.replace('_', ' ').title()}:")
+        print(f"Subjects at first timepoint: {domain_df['subject'].nunique()}")
+        print(f"Subjects with any short files: {len(short_subjects)}")
+        print(f"Subjects with any non-short files: {len(non_short_subjects)}")
+        print(f"Average missingness percentage: {domain_df['mean_missingness'].mean()}")
+
+        for label, subject_set in [("short", short_subjects), ("non-short", non_short_subjects)]:
+            subject_list = list(subject_set)
+            if not subject_list:
+                print(f"\n{domain.replace('_', ' ').title()} - {label.title()}:")
+                print("N: 0")
+                continue
+
+            subject_mri_df = mri_meta_df[mri_meta_df["subject"].isin(subject_list)]
+
+            print(f"\n{domain.replace('_', ' ').title()} - {label.title()}:")
+            print(f"N: {len(subject_set)}")
+            print("MRI Age Statistics:")
+            print(
+                f"Mean: {subject_mri_df['age_at_mri'].mean()}, "
+                f"Std: {subject_mri_df['age_at_mri'].std()}, "
+                f"Min: {subject_mri_df['age_at_mri'].min()}, "
+                f"Max: {subject_mri_df['age_at_mri'].max()}"
+            )
+            print("Sex Distribution:")
+            print(subject_mri_df["sex"].value_counts())
+            print("Average missingness percentage:")
+            print(domain_df[domain_df["subject"].isin(subject_set)]["mean_missingness"].mean())

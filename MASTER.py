@@ -14,96 +14,19 @@ if not os.path.exists(output_path):
 
 # ---- DATA WRANGLING ----
 
-# Select subjects based on inclusion criteria and extract metadata
+# Filter subjects based on inclusion criteria and extract metadata
 dem_df, mri_meta_df, fit_meta_df = filter_subjects(dta_path, test=False, overwrite=False)
 
-# Print demographics of selected subjects with both fitbit and mri data
-print("Demographics of filtered subjects with both fitbit and mri files:")
-print(f"N: {mri_meta_df['subject'].nunique()}")
-print("\nMRI Age Statistics:")
-print(f"Mean: {mri_meta_df['age_at_mri'].mean()}, Std: {mri_meta_df['age_at_mri'].std()}, Min: {mri_meta_df['age_at_mri'].min()}, Max: {mri_meta_df['age_at_mri'].max()}")
-print("\nSex Distribution:")
-print(dem_df["sex"].value_counts())
-
-# Print Fitbit completeness at the first available timepoint, split by file domain
-first_timepoint_fit_df = fit_meta_df[["subject", "timepoint", "filename", "short"]].copy()
-first_timepoint_fit_df["domain"] = "other"
-first_timepoint_fit_df.loc[
-    first_timepoint_fit_df["filename"].str.contains(r"fitbInt1m", case=False, regex=True),
-    "domain",
-] = "actigraphy"
-first_timepoint_fit_df.loc[
-    first_timepoint_fit_df["filename"].str.contains(r"fitbHR1m", case=False, regex=True),
-    "domain",
-] = "heart_rate"
-first_timepoint_fit_df.loc[
-    first_timepoint_fit_df["filename"].str.contains(r"fitbSlp1m", case=False, regex=True),
-    "domain",
-] = "sleep"
-first_timepoint_fit_df = first_timepoint_fit_df[first_timepoint_fit_df["domain"] != "other"]
-first_timepoint_fit_df["timepoint_order"] = first_timepoint_fit_df["timepoint"].str.extract(r"(\d+)")[0].astype(int)
-
-first_timepoint_subject_df = (
-    first_timepoint_fit_df.sort_values(["subject", "timepoint_order", "timepoint"])
-    .drop_duplicates(subset=["subject"], keep="first")[["subject", "timepoint"]]
-)
-
-first_timepoint_fit_df = first_timepoint_fit_df.merge(first_timepoint_subject_df, on=["subject", "timepoint"], how="inner")
-
-domain_subject_df = (
-    first_timepoint_fit_df.groupby(["domain", "subject"], as_index=False)
-    .agg(
-        n_files=("filename", "size"),
-        has_short=("short", lambda s: bool((s == 1).any())),
-        has_non_short=("short", lambda s: bool((s == 0).any())),
-    )
-)
-
-print("\nFitbit completeness at the first available timepoint, by domain:")
-print("mixed = subjects with both short and non-short files within the same domain")
-
-for domain in ["actigraphy", "heart_rate", "sleep"]:
-    domain_df = domain_subject_df[domain_subject_df["domain"] == domain]
-    if domain_df.empty:
-        continue
-
-    short_subjects = set(domain_df.loc[domain_df["has_short"], "subject"])
-    non_short_subjects = set(domain_df.loc[domain_df["has_non_short"], "subject"])
-
-    print(f"\n{domain.replace('_', ' ').title()}:")
-    print(f"Subjects at first timepoint: {domain_df['subject'].nunique()}")
-    print(f"Subjects with any short files: {len(short_subjects)}")
-    print(f"Subjects with any non-short files: {len(non_short_subjects)}")
-
-    for label, subject_set in [("short", short_subjects), ("non-short", non_short_subjects)]:
-        subject_list = list(subject_set)
-        if not subject_list:
-            print(f"\n{domain.replace('_', ' ').title()} - {label.title()}:")
-            print("N: 0")
-            continue
-
-        subject_dem_df = dem_df[dem_df["subject"].isin(subject_list)]
-        subject_mri_df = mri_meta_df[mri_meta_df["subject"].isin(subject_list)]
-
-        print(f"\n{domain.replace('_', ' ').title()} - {label.title()}:")
-        print(f"N: {len(subject_set)}")
-        print("MRI Age Statistics:")
-        print(
-            f"Mean: {subject_mri_df['age_at_mri'].mean()}, "
-            f"Std: {subject_mri_df['age_at_mri'].std()}, "
-            f"Min: {subject_mri_df['age_at_mri'].min()}, "
-            f"Max: {subject_mri_df['age_at_mri'].max()}"
-        )
-        print("Sex Distribution:")
-        print(subject_dem_df["sex"].value_counts())
+# Print descriptive statistics of filtered subjects
+describe_subjects(fit_meta_df, mri_meta_df)
 
 # Transform data to make it easier to query with DuckDB
-con = setup_duckdb(dta_path, fit_meta_df, overwrite=True)
+con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
 
 # ---- FEATURE EXTRACTION ----
 
 # Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
-selected_subjects = normative_selection(con, mri_meta_df, dem_df, overwrite=False)
+selected_subjects = normative_selection(con, mri_meta_df, overwrite=True)
 
 # Print demographics of normative selected subjects
 print("Selected Subjects MRI Age Statistics:")
