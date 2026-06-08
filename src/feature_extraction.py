@@ -1,4 +1,3 @@
-import os
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -9,22 +8,10 @@ from tqdm import tqdm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.tsa.seasonal import STL
 import pathlib
-from pyampute.exploration.mcar_statistical_tests import MCARTest
 import matplotlib.pyplot as plt
-from sklearn.mixture import BayesianGaussianMixture
-import hdbscan
-from sklearn.metrics import confusion_matrix
-from scipy.optimize import linear_sum_assignment
-from sklearn.metrics import jaccard_score
-from pyampute.exploration.mcar_statistical_tests import MCARTest
-from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer
 import statsmodels.api as sm
 from scipy.stats import wilcoxon
-import pacmap
-from sklearn.metrics import silhouette_score
-from sklearn.manifold import trustworthiness
-from sklearn.neighbors import NearestNeighbors
 
 
 def _one_hot_encode_scan_site(df, site_col="scan_site", prefix="scan_site", categories=None):
@@ -276,7 +263,7 @@ def analyse_confounds(con, dem_df, mri_meta_df, output_path=pathlib.Path("output
     confound_effects_df.to_json(output_path / "confound_effects_analysis.json", orient="records", lines=False, indent=2)
     return confound_effects_df
 
-def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), overwrite=True):
+def normative_selection(con, mri_meta_df, dem_df, output_path=pathlib.Path("output"), overwrite=True):
     '''
     This function performs normative modeling and selects subjects based on their composite absolute z-score. 
     It selects the top 10% (based on prevalence) of subjects with the highest cumulative z-score.
@@ -285,6 +272,7 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
     Parameters:
         con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
         mri_meta_df (DataFrame): DataFrame containing MRI metadata
+        dem_df (DataFrame): DataFrame containing demographic data
         output_path (pathlib.Path): Path to the output directory where the normative model results will be saved
     Returns:
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
@@ -322,11 +310,11 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
     mri_df = con.execute(query).df()
     print(f"MRI data loaded: {len(mri_df)} subjects")
 
-    # Merge MRI data with demographic data
+    # Merge MRI data with demographic data from dem_df to get sex for each subject
     df = mri_df.merge(
-    mri_meta_df[["subject", "sex", "age_at_mri", "scan_site"]].drop_duplicates(),
-    on="subject",
-    how="inner"    
+        dem_df[["subject", "sex"]].drop_duplicates(),
+        on="subject",
+        how="inner"
     )
 
     missing_cols = set(mri_roi_cols) - set(df.columns)
@@ -497,218 +485,6 @@ def create_mri_composites(selected_subjects):
     print(f"Composites created: {composite_dict}")
 
     return selected_subjects, composite_dict
-
-def mri_clustering(dem_df, selected_subjects):
-    '''
-    This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data.
-    It uses several different clustering algorithms (HBDSCAN and Bayesian Gaussian Mixture Models).
-    Clustering stability is assessed using bootstrapping and assessing stability using the Jaccard index.
-    Algorithms are compared based on their Silhouette coefficient, Density-Based Clustering Validation (DBCV) score, and Davies-Bouldin Index (DBI).
-
-    Parameters:
-        dem_df (DataFrame): DataFrame containing demographic information for the selected subjects
-        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI z-scores
-    Returns:
-        selected_subjects (DataFrame): DataFrame containing the selected subjects and their assigned cluster labels based on their MRI ROI data
-
-    NOTE: This function is currently broken. Neither clustering algorithms compute properly. This is most likely due to the subjects and ROIs already being
-    pre-selected and therefore not showing enough differentiating patterns.
-    TODO: Dimensionality reduction (PacMac)
-    TODO: Look into Site correction!!! (Maxim Paper)
-    TODO: nach site plotten (sex, )
-    '''
-    output_path = Path(output_path)
-    # selected subjects read csv
-    selected_subjects = pd.read_csv(os.path.join(output_path, "selected_subjects.csv"))
-    selected_subjects.shape
-    selected_subjects.drop(columns=["observations", "composite_z"], inplace=True)
-
-    def _align_labels(reference, target):
-        '''Aligns cluster labels of the target clustering to the reference clustering using the Hungarian algorithm.'''
-        # Compute confusion matrix between reference and target labels
-        conf_matrix = confusion_matrix(reference, target)
-        # Use Hungarian algorithm to find optimal label alignment
-        row_ind, col_ind = linear_sum_assignment(-conf_matrix)
-        # Create a mapping from target labels to reference labels
-        label_mapping = {target_label: reference_label for target_label, reference_label in zip(col_ind, row_ind)}
-        # Apply the mapping to the target labels
-        aligned_target = target.map(label_mapping)
-        return aligned_target 
-    
-    # Dimensionality reduction using PaCMAP
-    reducer = pacmap.PaCMAP(n_components=2, random_state=42)
-    embedding = reducer.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
-    selected_subjects["embedding_1"] = embedding[:, 0]
-    selected_subjects["embedding_2"] = embedding[:, 1]
-
-    # Evaluate dimensionality reduction validity using knn overlap and trustworthiness
-    def knn_overlap(X_orig, X_emb, k=10):
-        nn_orig = NearestNeighbors(n_neighbors=k+1).fit(X_orig)
-        nn_emb  = NearestNeighbors(n_neighbors=k+1).fit(X_emb)
-        idx_orig = nn_orig.kneighbors(return_distance=False)[:,1:]  # exclude self
-        idx_emb  = nn_emb.kneighbors(return_distance=False)[:,1:]
-        overlaps = [(len(set(a).intersection(b))/k) for a,b in zip(idx_orig, idx_emb)]
-        return np.mean(overlaps)
-    
-    knn_overlap_score = knn_overlap(selected_subjects.drop(columns=["subject_ids", "embedding_1", "embedding_2"]), embedding)
-    trustworthiness_score = trustworthiness(selected_subjects.drop(columns=["subject_ids", "embedding_1", "embedding_2"]), embedding, n_neighbors=10)
-    print(f"PaCMAP dimensionality reduction validity: KNN overlap={knn_overlap_score:.4f}, Trustworthiness={trustworthiness_score:.4f}")
-
-    # Create reference clustering on the lower dimensional data
-    hdbscan_clusterer = hdbscan.HDBSCAN(min_cluster_size=5)
-    reference_labels_hdbscan = hdbscan_clusterer.fit_predict(selected_subjects[["embedding_1", "embedding_2"]])
-    gmm_clusterer = BayesianGaussianMixture(n_components=3, random_state=42)
-    reference_labels_gmm = gmm_clusterer.fit_predict(selected_subjects[["embedding_1", "embedding_2"]])
-
-    # Create mask for non-noise points in HDBSCAN and GMM to use for alignment and scoring with label alignment
-    mask = (reference_labels_hdbscan != -1) & (reference_labels_gmm != -1)
-
-    ref_clean  = reference_labels_hdbscan[bootstrap_sample.index][mask]
-    
-    jaccard_indices = {
-        "hdbscan": [],
-        "gmm": []
-    }
-    
-    for i in tqdm(range(100), desc="Bootstrapping for clustering stability"):
-        # Resample subjects with replacement
-        bootstrap_sample = selected_subjects[["embedding_1", "embedding_2"]].sample(frac=1, replace=True, random_state=i)
-
-        # HDBSCAN clustering
-        hdbscan_clusterer = hdbscan.HDBSCAN(min_cluster_size=5)
-        boot_labels = hdbscan_clusterer.fit_predict(bootstrap_sample)
-        boot_clean = boot_labels[mask]
-        aligned_boot_labels = _align_labels(ref_clean[bootstrap_sample.index], boot_clean)
-        jaccard_hdbscan = jaccard_score(reference_labels_hdbscan[bootstrap_sample.index], aligned_boot_labels, average="macro")
-        jaccard_indices["hdbscan"].append(jaccard_hdbscan)
-
-        # Gaussian Mixture Models clustering
-        gmm_clusterer = BayesianGaussianMixture(n_components=3, random_state=i)
-        boot_labels = gmm_clusterer.fit_predict(bootstrap_sample)
-        boot_clean = boot_labels[mask]
-        aligned_boot_labels = _align_labels(reference_labels_gmm[bootstrap_sample.index], boot_clean)
-        jaccard_gmm = jaccard_score(reference_labels_gmm[bootstrap_sample.index], aligned_boot_labels, average="macro")
-        jaccard_indices["gmm"].append(jaccard_gmm)
-    print(f"HDBSCAN clustering stability (Jaccard index): mean={np.mean(jaccard_indices['hdbscan']):.4f}, std={np.std(jaccard_indices['hdbscan']):.4f}")
-    print(f"GMM clustering stability (Jaccard index): mean={np.mean(jaccard_indices['gmm']):.4f}, std={np.std(jaccard_indices['gmm']):.4f}")
-
-def missingness_analysis(con, fit_meta_df):
-    '''
-    This function analyzes the missingness patterns in the fitbit data for the selected subjects for MCAR, MAR, or MNAR missingness
-    using Littles test from pyampute.
-        1. Queries different fitbit domain data separately (i.e. actigraphy-based: Stps1m, METs1m, Int1m, heart-rate: HR1m, Sleep: Slp1m)
-        2. For each, creates datetime index (days) with proper missing days based on min and max of the Wear_Time column for each subject and timepoint, 
-        and merges with the original data to get missingness patterns
-        3. Conducts Little's test for each fitbit domain to assess whether the missingness is MCAR, MAR, or MNAR
-
-    Parameters:
-        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
-        fit_meta_df (DataFrame): DataFrame containing the fitbit metadata for the selected subjects
-    Returns:
-        missingness_df (DataFrame): DataFrame containing the missingness patterns in the fitbit data for the selected subjects.
-
-    NOTE: This function is currently broken. Little's test is not computing properly and I have no fucking clue why. WIP
-    '''
-
-    # For each subject and timepoint, create datetime index with proper missing days based on min and max of the Wear_Time column, and merge with original data to get missingness patterns
-    def create_missingness_df(df, domain_name):
-        missingness_list = []
-        grouped = df.groupby(["subject", "timepoint"])
-        for (subject, timepoint), group in tqdm(grouped, total=grouped.ngroups, desc=f"Creating missingness patterns for {domain_name}"):
-            min_date = group["Wear_Time"].min().floor("D")
-            max_date = group["Wear_Time"].max().ceil("D")
-            value_cols = [c for c in group.columns if c not in ["subject", "timepoint", "Wear_Time"]]
-            daily_means = group.set_index("Wear_Time")[value_cols].resample("D").mean().reset_index()
-            date_range = pd.date_range(start=min_date, end=max_date, freq="D")
-            date_df = pd.DataFrame({"Wear_Time": date_range})
-            merged_df = date_df.merge(daily_means, on="Wear_Time", how="left")
-            merged_df["subject"] = subject
-            merged_df["timepoint"] = timepoint
-            missingness_list.append(merged_df)
-        return pd.concat(missingness_list, ignore_index=True)
-    
-    # Conduct Little's test for each fitbit domain to assess if the missingness is MCAR
-    mcar_test = MCARTest(method="little")
-
-    def safe_little_test(df, min_obs_per_col=5, min_cols=2):
-        df = df.copy()
-        # coerce numeric and drop empty cols/rows
-        df = df.apply(pd.to_numeric, errors='coerce')
-        df = df.loc[:, df.notna().sum() >= min_obs_per_col]
-        df = df.dropna(how='all')
-        if df.shape[1] < min_cols or df.shape[0] < 2:
-            return np.nan, "insufficient data after filtering"
-        # compute pj/df quickly (same logic as pyampute)
-        vars_ = df.dtypes.index.values
-        n_var = df.shape[1]
-        r = 1 * df.isnull()
-        mdp = np.dot(r, [2**i for i in range(n_var)])
-        pj = 0
-        for i in np.unique(mdp):
-            dataset_temp = df.loc[mdp == i, vars_]
-            select_vars = ~dataset_temp.isnull().any()
-            pj += np.sum(select_vars)
-        df_val = pj - n_var
-        if df_val <= 0:
-            return np.nan, f"df <= 0 (pj={pj}, n_var={n_var})"
-        # try running the test and catch numerical errors
-        try:
-            pval = MCARTest(method="little").little_mcar_test(df)
-        except Exception as e:
-            return np.nan, f"test error: {e}"
-        return pval, None
-
-    p, err = safe_little_test(actigraphy_missingness_df.drop(columns=["subject","timepoint","Wear_Time"]))
-    print("p:", p, "err:", err)
-
-    # Query all fitbit data
-    fitbit_df = con.execute(f"SELECT subject, timepoint, Wear_Time, * FROM fitbit_data").df()
-    print(f"Creating missingness pattern...")
-    fitbit_missingness_df = create_missingness_df(fitbit_df, "fitbit")
-    fitbit_df = None  # free memory
-    fitbit_mcar = mcar_test.little_mcar_test(fitbit_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
-    fitbit_missingness_df = None  # free memory
-
-    # Query actigraphy columns
-    actigraphy_cols = ["Calories_Cal1m", "Steps_Stps1m", "METs_METs1m"]
-    actigraphy_df = con.execute(f"SELECT subject, timepoint, Wear_Time, {', '.join(actigraphy_cols)} FROM fitbit_data").df()
-    # Create missingness patterns for actigraphy data
-    actigraphy_missingness_df = create_missingness_df(actigraphy_df, "actigraphy")
-    actigraphy_df = None  # free memory
-    # Conduct Little's test for actigraphy data
-    actigraphy_mcar = mcar_test.little_mcar_test(actigraphy_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
-    actigraphy_missingness_df = None  # free memory
-
-    actigraphy_df.head()
-    actigraphy_df.shape
-    actigraphy_missingness_df.head()
-    actigraphy_missingness_df.shape
-    actigraphy_missingness_df["Wear_Time"].min(), actigraphy_missingness_df["Wear_Time"].max()
-
-    daily_means = actigraphy_df.set_index("Wear_Time")[actigraphy_cols].resample("D").mean().reset_index()
-    daily_means.head(10)
-
-    # Query heart rate columns
-    heart_rate_df = con.execute(f"SELECT subject, timepoint, Wear_Time, Value_HR1m FROM fitbit_data").df()
-    # Create missingness patterns for heart rate data
-    heart_rate_missingness_df = create_missingness_df(heart_rate_df, "heart_rate")
-    heart_rate_df = None  # free memory
-    # Conduct Little's test for heart rate data
-    heart_rate_mcar = mcar_test.little_mcar_test(heart_rate_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
-    heart_rate_missingness_df = None  # free memory
-
-    # Query sleep columns
-    sleep_df = con.execute(f"SELECT subject, timepoint, Wear_Time, value_Slp1m FROM fitbit_data").df()
-    # Create missingness patterns for sleep data
-    sleep_missingness_df = create_missingness_df(sleep_df, "sleep")
-    sleep_df = None  # free memory
-    # Conduct Little's test for sleep data
-    sleep_mcar = mcar_test.little_mcar_test(sleep_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
-    sleep_missingness_df = None  # free memory
-
-    print(f"Actigraphy missingness MCAR test: p-value={actigraphy_mcar:.4f}")
-    print(f"Heart rate missingness MCAR test: p-value={heart_rate_mcar:.4f}")
-    print(f"Sleep missingness MCAR test: p-value={sleep_mcar:.4f}")
 
 def extr_fitbit_features(con, selected_subjects):
     '''

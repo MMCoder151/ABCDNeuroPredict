@@ -98,12 +98,12 @@ for domain in ["actigraphy", "heart_rate", "sleep"]:
         print(subject_dem_df["sex"].value_counts())
 
 # Transform data to make it easier to query with DuckDB
-con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
+con = setup_duckdb(dta_path, fit_meta_df, overwrite=True)
 
 # ---- FEATURE EXTRACTION ----
 
 # Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
-selected_subjects = normative_selection(con, mri_meta_df, overwrite=False)
+selected_subjects = normative_selection(con, mri_meta_df, dem_df, overwrite=False)
 
 # Print demographics of normative selected subjects
 print("Selected Subjects MRI Age Statistics:")
