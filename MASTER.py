@@ -26,7 +26,7 @@ con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
 # ---- FEATURE EXTRACTION ----
 
 # Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
-selected_subjects = normative_selection(con, mri_meta_df, overwrite=True)
+selected_subjects = normative_selection(con, mri_meta_df, overwrite=False)
 
 # Conduct confound analysis pre and post normative modeling
 confound_effects_df = analyse_confounds(con, dem_df, mri_meta_df)
@@ -42,10 +42,10 @@ non_selected_mri_meta_df = mri_meta_df[~mri_meta_df["subject"].isin(selected_sub
 describe_subjects(non_selected_fit_meta_df, non_selected_mri_meta_df)
 
 # Create composite mri z-scores based on VIF
-selected_subjects_composites, composite_dict = create_mri_composites(con, selected_subjects)
+#filtered_subjects_composites, composite_dict = create_mri_composites(selected_subjects)
 
 # Save selected subjects to CSV
-selected_subjects_composites.to_csv(os.path.join(output_path, "selected_subjects_composites.csv"), index=False)
+#filtered_subjects_composites.to_csv(os.path.join(output_path, "selected_subjects_composites.csv"), index=False)
 
 # Add group labels to dem_df based on selected_subjects
 dem_df["group"] = dem_df["subject"].apply(lambda x: 1 if x in selected_subjects["subject_ids"].values else 0)

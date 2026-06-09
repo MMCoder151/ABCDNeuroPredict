@@ -9,7 +9,9 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.tsa.seasonal import STL
 import pathlib
 import matplotlib.pyplot as plt
+from sklearn.impute import SimpleImputer
 from sklearn.impute import IterativeImputer
+from sklearn.experimental import enable_iterative_imputer  # noqa
 import statsmodels.api as sm
 from scipy.stats import wilcoxon
 
@@ -502,41 +504,61 @@ def extr_fitbit_features(con, selected_subjects):
     Returns:
         fitbit_features_df (DataFrame): DataFrame containing the extracted fitbit features for each subject
     '''
-    # Get list of selected subjects
-    selected_subjects_list = selected_subjects["subject"].unique().tolist()
+    # Get a de-duplicated list of selected subjects.
+    if hasattr(selected_subjects, "columns") and "subject" in selected_subjects.columns:
+        selected_subjects_list = selected_subjects["subject"].dropna().unique().tolist()
+    else:
+        selected_subjects_list = pd.Series(selected_subjects).dropna().unique().tolist()
+
+    #subject_filter = ", ".join("'" + str(subject).replace("'", "''") + "'" for subject in selected_subjects_list)
 
     # Query FIRST timepoint for the selected subjects
-    query = f"""
-    SELECT *
-    FROM fitbit_data
-    WHERE timepoint = (
-        SELECT MIN(timepoint)
-        FROM fitbit_data f2
-        WHERE f2.subject = fitbit_data.subject
-    )
-    AND subject IN ({', '.join(map(str, selected_subjects_list))})
-    """
-    print("Querying fitbit data for feature extraction...")
-    fitbit_df = con.execute(query).df()
+    #query = f"""
+    #SELECT *
+    #FROM fitbit_data
+    #WHERE timepoint = (
+    #    SELECT MIN(timepoint)
+    #    FROM fitbit_data f2
+    #    WHERE f2.subject = fitbit_data.subject
+    #)
+    #AND subject IN ({subject_filter})
+    #"""
+    #print("Querying fitbit data for feature extraction...")
+    #fitbit_df = con.execute(query).df()
 
     # Get fitbit metric columns (exclude subject, timepoint, and Wear_Time)
-    fitbit_metric_cols = [col for col in fitbit_df.columns if col not in ["subject", "timepoint", "Wear_Time"]]
+    #fitbit_metric_cols = [col for col in fitbit_df.columns if col not in ["subject", "timepoint", "Wear_Time"]]
 
     # Coerce to numeric
-    for col in fitbit_metric_cols:
-        fitbit_df[col] = pd.to_numeric(fitbit_df[col], errors="coerce")
+    #for col in fitbit_metric_cols:
+    #    fitbit_df[col] = pd.to_numeric(fitbit_df[col], errors="coerce")
 
     # Create a dataframe to hold the extracted features
     features_list = []
 
     # Loop through each subject and timepoint to extract features
-    grouped = fitbit_df.groupby(["subject", "timepoint"])
-    for (subject, timepoint), group in tqdm(grouped, total=grouped.ngroups, desc="Extracting Fitbit features"):
-        feature_dict = {"subject": subject, "timepoint": timepoint}
+    #grouped = fitbit_df.groupby(["subject"])
+    for subject in tqdm(selected_subjects_list, total=len(selected_subjects_list), desc="Extracting Fitbit features"):
+        # query first timepoint for the subject
+        query = f"""
+        SELECT *
+        FROM fitbit_data        
+        WHERE subject = '{subject}'
+        AND timepoint = (
+            SELECT MIN(timepoint)
+            FROM fitbit_data f2
+            WHERE f2.subject = fitbit_data.subject
+        )
+        """
+        subject_fitbit_df = con.execute(query).df()
+        fitbit_metric_cols = [col for col in subject_fitbit_df.columns if col not in ["subject", "timepoint", "Wear_Time"]]
+        for col in fitbit_metric_cols:
+            subject_fitbit_df[col] = pd.to_numeric(subject_fitbit_df[col], errors="coerce")
+        feature_dict = {"subject": subject}
         for metric in fitbit_metric_cols:
             # Check if the metric column exists in the group
-            #if metric in group.columns:
-                daily_data = group[["Wear_Time", metric]]#.dropna()
+            if metric in subject_fitbit_df.columns:
+                daily_data = subject_fitbit_df[["Wear_Time", metric]]#.dropna()
                 if not daily_data.empty:
                     # Create daily features (mean, std, min, max)
                     daily_data.set_index("Wear_Time", inplace=True)
@@ -548,19 +570,19 @@ def extr_fitbit_features(con, selected_subjects):
                     date_range = pd.date_range(start=min_date, end=max_date, freq="D")
                     # Reindex to include missing days and impute missing values with multiple imputation
                     daily_stats = daily_stats.reindex(date_range)
-                    #if daily_stats.shape[0] > 1 and daily_stats.notna().sum().sum() > daily_stats.shape[1]:
-                    try:
-                        imputer = IterativeImputer(random_state=0, max_iter=20)
-                        daily_stats = pd.DataFrame(
-                            imputer.fit_transform(daily_stats),
-                            index=daily_stats.index,
-                            columns=daily_stats.columns,
-                        )
-                    except Exception as e:
-                        print(f"Iterative imputation failed for subject {subject}, timepoint {timepoint}, metric {metric}: {e}")
+                    if daily_stats.shape[0] > 1 and daily_stats.notna().sum().sum() > daily_stats.shape[1]:
+                        try:
+                            imputer = IterativeImputer(random_state=0, max_iter=20)
+                            daily_stats = pd.DataFrame(
+                                imputer.fit_transform(daily_stats),
+                                index=daily_stats.index,
+                                columns=daily_stats.columns,
+                            )
+                        except Exception as e:
+                            print(f"Iterative imputation failed for subject {subject}, metric {metric}: {e}")
+                            daily_stats = daily_stats.ffill().bfill()
+                    else:
                         daily_stats = daily_stats.ffill().bfill()
-                    #else:
-                        #daily_stats = daily_stats.ffill().bfill()
                     feature_dict.update(daily_stats.mean().to_dict())
                     # STL decomposition
                     try:
@@ -582,7 +604,7 @@ def extr_fitbit_features(con, selected_subjects):
                         }
                         feature_dict.update(stl_features)
                     except Exception as e:
-                        print(f"STL decomposition failed for subject {subject}, timepoint {timepoint}, metric {metric}: {e}")
+                        print(f"STL decomposition failed for subject {subject}, metric {metric}: {e}")
         features_list.append(feature_dict)
     fitbit_features_df = pd.DataFrame(features_list)
 
