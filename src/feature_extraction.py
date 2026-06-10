@@ -515,29 +515,6 @@ def extr_fitbit_features(con, selected_subjects):
     else:
         selected_subjects_list = pd.Series(selected_subjects).dropna().unique().tolist()
 
-    #subject_filter = ", ".join("'" + str(subject).replace("'", "''") + "'" for subject in selected_subjects_list)
-
-    # Query FIRST timepoint for the selected subjects
-    #query = f"""
-    #SELECT *
-    #FROM fitbit_data
-    #WHERE timepoint = (
-    #    SELECT MIN(timepoint)
-    #    FROM fitbit_data f2
-    #    WHERE f2.subject = fitbit_data.subject
-    #)
-    #AND subject IN ({subject_filter})
-    #"""
-    #print("Querying fitbit data for feature extraction...")
-    #fitbit_df = con.execute(query).df()
-
-    # Get fitbit metric columns (exclude subject, timepoint, and Wear_Time)
-    #fitbit_metric_cols = [col for col in fitbit_df.columns if col not in ["subject", "timepoint", "Wear_Time"]]
-
-    # Coerce to numeric
-    #for col in fitbit_metric_cols:
-    #    fitbit_df[col] = pd.to_numeric(fitbit_df[col], errors="coerce")
-
     # Create a dataframe to hold the extracted features
     features_list = []
 
@@ -589,26 +566,29 @@ def extr_fitbit_features(con, selected_subjects):
                     else:
                         daily_stats = daily_stats.ffill().bfill()
                     feature_dict.update(daily_stats.mean().to_dict())
-                    # STL decomposition
+                    # STL decomposition on the imputed daily aggregate series.
                     try:
-                        # TODO: Change, so that STL is done on each of the daily aggreates (min, max, mean, std) instead of the raw daily data
-                        stl = STL(daily_data[metric], period=7, robust=True)
-                        result = stl.fit()
-                        stl_features = {
-                            f"{metric}_trend_mean": result.trend.mean(),
-                            f"{metric}_trend_std": result.trend.std(),
-                            f"{metric}_trend_min": result.trend.min(),
-                            f"{metric}_trend_max": result.trend.max(),
-                            f"{metric}_seasonal_mean": result.seasonal.mean(),
-                            f"{metric}_seasonal_std": result.seasonal.std(),
-                            f"{metric}_seasonal_min": result.seasonal.min(),
-                            f"{metric}_seasonal_max": result.seasonal.max(),
-                            f"{metric}_resid_mean": result.resid.mean(),
-                            f"{metric}_resid_std": result.resid.std(),
-                            f"{metric}_resid_min": result.resid.min(),
-                            f"{metric}_resid_max": result.resid.max(),
-                        }
-                        feature_dict.update(stl_features)
+                        for agg in ["mean", "std", "min", "max"]:
+                            stl_input = daily_stats[f"{metric}_{agg}"].copy()
+                            stl_input.index = pd.to_datetime(stl_input.index)
+                            stl_input = stl_input.sort_index().asfreq("D")
+                            stl = STL(stl_input, period=7, robust=True)
+                            result = stl.fit()
+                            stl_features = {
+                                f"{metric}_{agg}_trend_mean": result.trend.mean(),
+                                f"{metric}_{agg}_trend_std": result.trend.std(),
+                                f"{metric}_{agg}_trend_min": result.trend.min(),
+                                f"{metric}_{agg}_trend_max": result.trend.max(),
+                                f"{metric}_{agg}_seasonal_mean": result.seasonal.mean(),
+                                f"{metric}_{agg}_seasonal_std": result.seasonal.std(),
+                                f"{metric}_{agg}_seasonal_min": result.seasonal.min(),
+                                f"{metric}_{agg}_seasonal_max": result.seasonal.max(),
+                                f"{metric}_{agg}_resid_mean": result.resid.mean(),
+                                f"{metric}_{agg}_resid_std": result.resid.std(),
+                                f"{metric}_{agg}_resid_min": result.resid.min(),
+                                f"{metric}_{agg}_resid_max": result.resid.max(),
+                            }
+                            feature_dict.update(stl_features)
                     except Exception as e:
                         print(f"STL decomposition failed for subject {subject}, metric {metric}: {e}")
         features_list.append(feature_dict)
