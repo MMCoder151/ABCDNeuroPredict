@@ -10,8 +10,8 @@ from statsmodels.tsa.seasonal import STL
 import pathlib
 import matplotlib.pyplot as plt
 from sklearn.impute import SimpleImputer
-from sklearn.impute import IterativeImputer
 from sklearn.experimental import enable_iterative_imputer  # noqa
+from sklearn.impute import IterativeImputer
 import statsmodels.api as sm
 from scipy.stats import wilcoxon
 

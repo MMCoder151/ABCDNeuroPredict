@@ -13,11 +13,13 @@ from sklearn.metrics import jaccard_score
 from pyampute.exploration.mcar_statistical_tests import MCARTest
 import pacmap
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import umap
 from sklearn.metrics import silhouette_score
 from sklearn.manifold import trustworthiness
 from sklearn.neighbors import NearestNeighbors
 
-def mri_clustering(dem_df, selected_subjects, output_path = Path("output")):
+def mri_clustering(selected_subjects, output_path = Path("output")):
     '''
     This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data.
     It uses several different clustering algorithms (HBDSCAN and Bayesian Gaussian Mixture Models).
@@ -25,13 +27,11 @@ def mri_clustering(dem_df, selected_subjects, output_path = Path("output")):
     Algorithms are compared based on their Silhouette coefficient, Density-Based Clustering Validation (DBCV) score, and Davies-Bouldin Index (DBI).
 
     Parameters:
-        dem_df (DataFrame): DataFrame containing demographic information for the selected subjects
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI z-scores
     Returns:
-        selected_subjects (DataFrame): DataFrame containing the selected subjects and their assigned cluster labels based on their MRI ROI data
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their assigned cluster labels based on their MRI ROI z-scores 
 
-    NOTE: This function is a WIP
-    TODO: Finish implementing tuning of HDBSCAN parameters
+    TODO: Add descriptive analysis of clusters and graphs
 
     '''
 
@@ -43,9 +43,6 @@ def mri_clustering(dem_df, selected_subjects, output_path = Path("output")):
     selected_subjects = selected_subjects.merge(subject_scores, left_on="subject_ids", right_on="subject_ids", how="left")
 
     selected_subjects.drop(columns=["observations", "composite_z", "rank"], inplace=True)
-  
-    selected_subjects.head()
-    selected_subjects.shape
 
     def _align_labels(reference, target):
         '''Aligns cluster labels of the target clustering to the reference clustering using the Hungarian algorithm.'''
@@ -62,15 +59,23 @@ def mri_clustering(dem_df, selected_subjects, output_path = Path("output")):
     
     # Dimensionality reduction using PaCMAP
     reducer = pacmap.PaCMAP(n_components=2, random_state=42)
-    embedding = reducer.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
-    selected_subjects["embedding_1"] = embedding[:, 0]
-    selected_subjects["embedding_2"] = embedding[:, 1]
+    X_pacmap = reducer.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
 
     # Dimensionality reduction using PCA for comparison
-    pca = PCA(n_components=0.9, random_state=42)
-    X_pca = pca.fit_transform(selected_subjects.drop(columns=["subject_ids", "embedding_1", "embedding_2"]))
-    X_pca.shape
-    selected_subjects.shape
+    pca09 = PCA(n_components=0.9, random_state=42)
+    X_pca09 = pca09.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
+    X_pca09.shape
+    pca2 = PCA(n_components=2, random_state=42)
+    X_pca2 = pca2.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
+
+    # Dimensionality reduction using t-SNE for comparison
+    tsne = TSNE(n_components=2, random_state=42)
+    X_tsne = tsne.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
+
+    # Dimensionality reduction using UMAP for comparison
+    umap_reducer = umap.UMAP(n_components=2, random_state=42)
+    X_umap = umap_reducer.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
+
     # Evaluate local dimensionality reduction validity using knn overlap and trustworthiness
     def knn_overlap(X_orig, X_emb, k=10):
         nn_orig = NearestNeighbors(n_neighbors=k+1).fit(X_orig)
@@ -80,9 +85,21 @@ def mri_clustering(dem_df, selected_subjects, output_path = Path("output")):
         overlaps = [(len(set(a).intersection(b))/k) for a,b in zip(idx_orig, idx_emb)]
         return np.mean(overlaps)
     
-    knn_overlap_score = knn_overlap(selected_subjects.drop(columns=["subject_ids", "embedding_1", "embedding_2"]), embedding)
-    trustworthiness_score = trustworthiness(selected_subjects.drop(columns=["subject_ids", "embedding_1", "embedding_2"]), embedding, n_neighbors=10)
+    knn_overlap_score = knn_overlap(selected_subjects.drop(columns=["subject_ids"]), X_pacmap)
+    trustworthiness_score = trustworthiness(selected_subjects.drop(columns=["subject_ids"]), X_pacmap, n_neighbors=10)
     print(f"PaCMAP dimensionality reduction validity: KNN overlap={knn_overlap_score:.4f}, Trustworthiness={trustworthiness_score:.4f}")
+    knn_overlap_score_pca09 = knn_overlap(selected_subjects.drop(columns=["subject_ids"]), X_pca09)
+    trustworthiness_score_pca09 = trustworthiness(selected_subjects.drop(columns=["subject_ids"]), X_pca09, n_neighbors=10)
+    print(f"PCA (0.9 components) dimensionality reduction validity: KNN overlap={knn_overlap_score_pca09:.4f}, Trustworthiness={trustworthiness_score_pca09:.4f}")
+    knn_overlap_score_pca2 = knn_overlap(selected_subjects.drop(columns=["subject_ids"]), X_pca2)
+    trustworthiness_score_pca2 = trustworthiness(selected_subjects.drop(columns=["subject_ids"]), X_pca2, n_neighbors=10)
+    print(f"PCA (2 components) dimensionality reduction validity: KNN overlap={knn_overlap_score_pca2:.4f}, Trustworthiness={trustworthiness_score_pca2:.4f}")
+    knn_overlap_score_tsne = knn_overlap(selected_subjects.drop(columns=["subject_ids"]), X_tsne)
+    trustworthiness_score_tsne = trustworthiness(selected_subjects.drop(columns=["subject_ids"]), X_tsne, n_neighbors=10)
+    print(f"t-SNE dimensionality reduction validity: KNN overlap={knn_overlap_score_tsne:.4f}, Trustworthiness={trustworthiness_score_tsne:.4f}")
+    knn_overlap_score_umap = knn_overlap(selected_subjects.drop(columns=["subject_ids"]), X_umap)
+    trustworthiness_score_umap = trustworthiness(selected_subjects.drop(columns=["subject_ids"]), X_umap, n_neighbors=10)
+    print(f"UMAP dimensionality reduction validity: KNN overlap={knn_overlap_score_umap:.4f}, Trustworthiness={trustworthiness_score_umap:.4f}")
 
     # Evaluate global dimensionality reduction validity using pairwise distance correlation
     def pairwise_distance_correlation(X_orig, X_emb):
@@ -91,69 +108,95 @@ def mri_clustering(dem_df, selected_subjects, output_path = Path("output")):
         dist_emb = squareform(pdist(X_emb))
         corr = np.corrcoef(dist_orig.flatten(), dist_emb.flatten())[0, 1]
         return corr
-    distance_correlation = pairwise_distance_correlation(selected_subjects.drop(columns=["subject_ids", "embedding_1", "embedding_2"]), embedding)
-    print(f"PaCMAP global distance preservation: Pairwise distance correlation={distance_correlation:.4f}")
-    distance_correlation_pca = pairwise_distance_correlation(selected_subjects.drop(columns=["subject_ids", "embedding_1", "embedding_2"]), X_pca)
-    print(f"PCA global distance preservation: Pairwise distance correlation={distance_correlation_pca:.4f}")
+    
+    distance_correlation = pairwise_distance_correlation(selected_subjects.drop(columns=["subject_ids"]), X_pacmap)
+    print(f"\nPaCMAP global distance preservation: Pairwise distance correlation={distance_correlation:.4f}")
+    distance_correlation_pca09 = pairwise_distance_correlation(selected_subjects.drop(columns=["subject_ids"]), X_pca09)
+    print(f"PCA (0.9 components) global distance preservation: Pairwise distance correlation={distance_correlation_pca09:.4f}")
+    distance_correlation_pca2 = pairwise_distance_correlation(selected_subjects.drop(columns=["subject_ids"]), X_pca2)
+    print(f"PCA (2 components) global distance preservation: Pairwise distance correlation={distance_correlation_pca2:.4f}")
+    distance_correlation_tsne = pairwise_distance_correlation(selected_subjects.drop(columns=["subject_ids"]), X_tsne)
+    print(f"t-SNE global distance preservation: Pairwise distance correlation={distance_correlation_tsne:.4f}")
+    distance_correlation_umap = pairwise_distance_correlation(selected_subjects.drop(columns=["subject_ids"]), X_umap)
+    print(f"UMAP global distance preservation: Pairwise distance correlation={distance_correlation_umap:.4f}")
 
     # Create reference clustering on the lower dimensional data
-    hdbscan_clusterer_pacmap = hdbscan.HDBSCAN(min_cluster_size=10)
-    reference_labels_hdbscan = pd.Series(
-        hdbscan_clusterer_pacmap.fit_predict(selected_subjects[["embedding_1", "embedding_2"]]),
+    hdbscan_clusterer_umap = hdbscan.HDBSCAN()
+    reference_labels_hdbscan_umap = pd.Series(
+        hdbscan_clusterer_umap.fit_predict(X_umap),
         index=selected_subjects.index,
-        name="reference_labels_hdbscan",
+        name="reference_labels_hdbscan_umap",
     )
-    hdbscan_clusterer_pca = hdbscan.HDBSCAN(min_cluster_size=10)
-    reference_labels_hdbscan_pca = pd.Series(
-        hdbscan_clusterer_pca.fit_predict(X_pca),
+    hdbscan_clusterer_pca09 = hdbscan.HDBSCAN()
+    reference_labels_hdbscan_pca09 = pd.Series(
+        hdbscan_clusterer_pca09.fit_predict(X_pca09),
         index=selected_subjects.index,
-        name="reference_labels_hdbscan_pca",
+        name="reference_labels_hdbscan_pca09",
     )
-    print(f"HDBSCAN clustering on PaCMAP embedding: Number of unique subtypes discovered: {len(set(reference_labels_hdbscan)) - (1 if -1 in reference_labels_hdbscan else 0)}")  # Exclude -1 if it exists, which represents subjects not assigned to any subtype
-    print(f"HDBSCAN clustering on PCA embedding: Number of unique subtypes discovered: {len(set(reference_labels_hdbscan_pca)) - (1 if -1 in reference_labels_hdbscan_pca else 0)}")  # Exclude -1 if it exists, which represents subjects not assigned to any subtype
-    #gmm_clusterer = BayesianGaussianMixture(n_components=3, max_iter=100, random_state=42)
-    #reference_labels_gmm = gmm_clusterer.fit_predict(selected_subjects[["embedding_1", "embedding_2"]])
+    print(f"\nHDBSCAN clustering on UMAP: Number of unique subtypes discovered: {len(set(reference_labels_hdbscan_umap)) - (1 if -1 in reference_labels_hdbscan_umap else 0)}")  # Exclude -1 if it exists, which represents subjects not assigned to any subtype
+    print(f"HDBSCAN clustering on PCA (0.9 components): Number of unique subtypes discovered: {len(set(reference_labels_hdbscan_pca09)) - (1 if -1 in reference_labels_hdbscan_pca09 else 0)}")  # Exclude -1 if it exists, which represents subjects not assigned to any subtype
 
     # Create mask for non-noise points in HDBSCAN and GMM to use for alignment and scoring with label alignment
-    mask_hdbscan = (reference_labels_hdbscan != -1)
-    #mask_gmm = (reference_labels_gmm != -1)
+    mask_hdbscan_umap = (reference_labels_hdbscan_umap != -1)
+    mask_hdbscan_pca09 = (reference_labels_hdbscan_pca09 != -1)
 
-    jaccard_indices_hdbscan = []
-    #jaccard_indices_gmm = []
+    tuning_results_umap = []
+    tuning_results_pca09 = []
 
-    for mcs in [5, 10, 15, 20]:  # Varying min_cluster_size for HDBSCAN
+    for mcs in tqdm([5, 10, 15, 20], desc="Tuning HDBSCAN parameters"):
         for ms in [5, 10, 20]:  # Varying min_samples for HDBSCAN
-            for i in tqdm(range(100), desc="Bootstrapping for clustering stability"):
+            for i in range(100):  # Bootstrapping for clustering stability
                 # Resample subjects with replacement
-                bootstrap_sample = selected_subjects[["embedding_1", "embedding_2"]].sample(frac=1, replace=True, random_state=i)
+                bootstrap_sample = selected_subjects.sample(frac=1, replace=True, random_state=i) 
                 bootstrap_indices = bootstrap_sample.index
+                bootstrap_sample_umap = X_umap[bootstrap_indices]
+                bootstrap_sample_pca09 = X_pca09[bootstrap_indices]
 
                 # Get the reference labels for the bootstrap sample and align comparisons on the sampled rows
-                ref_clean_hdbscan = reference_labels_hdbscan.loc[bootstrap_indices].reset_index(drop=True)
-                #ref_clean_gmm = reference_labels_gmm[bootstrap_sample.index][mask_gmm]
+                ref_clean_hdbscan_umap = reference_labels_hdbscan_umap.loc[bootstrap_indices].reset_index(drop=True)
+                ref_clean_hdbscan_pca09 = reference_labels_hdbscan_pca09.loc[bootstrap_indices].reset_index(drop=True)
 
                 # HDBSCAN clustering
-                hdbscan_clusterer = hdbscan.HDBSCAN(min_cluster_size=mcs, min_samples=ms)
-                boot_labels = pd.Series(hdbscan_clusterer.fit_predict(bootstrap_sample), index=bootstrap_indices).reset_index(drop=True)
-                non_noise_mask = (ref_clean_hdbscan != -1) & (boot_labels != -1)
-                if non_noise_mask.sum() == 0:
-                    jaccard_indices_hdbscan.append(np.nan)
+                hdbscan_clusterer_umap = hdbscan.HDBSCAN(min_cluster_size=mcs, min_samples=ms)
+                boot_labels_umap = pd.Series(hdbscan_clusterer_umap.fit_predict(bootstrap_sample_umap), index=bootstrap_indices).reset_index(drop=True)
+                non_noise_mask_umap = (ref_clean_hdbscan_umap != -1) & (boot_labels_umap != -1)
+                if non_noise_mask_umap.sum() == 0:
+                    tuning_results_umap.append({"mcs": np.nan, "ms": np.nan, "jaccard": np.nan, "silhouette": np.nan})
                     continue
-                aligned_boot_labels = _align_labels(ref_clean_hdbscan[non_noise_mask], boot_labels[non_noise_mask])
-                jaccard_hdbscan = jaccard_score(ref_clean_hdbscan[non_noise_mask], aligned_boot_labels, average="macro")
-                jaccard_indices_hdbscan.append(jaccard_hdbscan)
+                aligned_boot_labels = _align_labels(ref_clean_hdbscan_umap[non_noise_mask_umap], boot_labels_umap[non_noise_mask_umap])
+                jaccard_hdbscan = jaccard_score(ref_clean_hdbscan_umap[non_noise_mask_umap], aligned_boot_labels, average="macro")
+                tuning_results_umap.append({"mcs": mcs, "ms": ms, "jaccard": jaccard_hdbscan, "silhouette": silhouette_score(bootstrap_sample_umap, boot_labels_umap)})
+    
+                hdbscan_clusterer_pca09 = hdbscan.HDBSCAN(min_cluster_size=mcs, min_samples=ms)
+                boot_labels_pca09 = pd.Series(hdbscan_clusterer_pca09.fit_predict(bootstrap_sample_pca09), index=bootstrap_indices).reset_index(drop=True)
+                non_noise_mask_pca09 = (ref_clean_hdbscan_pca09 != -1) & (boot_labels_pca09 != -1)
+                if non_noise_mask_pca09.sum() == 0:
+                    tuning_results_pca09.append({"mcs": np.nan, "ms": np.nan, "jaccard": np.nan, "silhouette": np.nan})
+                    continue
+                aligned_boot_labels = _align_labels(ref_clean_hdbscan_pca09[non_noise_mask_pca09], boot_labels_pca09[non_noise_mask_pca09])
+                jaccard_hdbscan = jaccard_score(ref_clean_hdbscan_pca09[non_noise_mask_pca09], aligned_boot_labels, average="macro")
+                tuning_results_pca09.append({"mcs": mcs, "ms": ms, "jaccard": jaccard_hdbscan, "silhouette": silhouette_score(bootstrap_sample_pca09, boot_labels_pca09)})
 
-                # Gaussian Mixture Models clustering
-                #gmm_clusterer = BayesianGaussianMixture(n_components=3, max_iter=100, random_state=i)
-                #boot_labels = gmm_clusterer.fit_predict(bootstrap_sample)
-                #boot_clean = boot_labels[mask_gmm]
-                #aligned_boot_labels = _align_labels(ref_clean_gmm[bootstrap_sample.index], boot_clean)
-                #jaccard_gmm = jaccard_score(reference_labels_gmm[bootstrap_sample.index], aligned_boot_labels, average="macro")
-                #jaccard_indices["gmm"].append(jaccard_gmm)
-            print(f"HDBSCAN clustering stability (Jaccard index): mean={np.mean(jaccard_indices_hdbscan):.4f}, std={np.std(jaccard_indices_hdbscan):.4f}")
-            print(f"Number of unique subtypes discovered by HDBSCAN: {len(set(reference_labels_hdbscan)) - (1 if -1 in reference_labels_hdbscan else 0)}")  # Exclude -1 if it exists, which represents subjects not assigned to any subtype
-            print(f"Average cluster size for HDBSCAN: {pd.Series(reference_labels_hdbscan).value_counts().mean():.2f}")
-            #print(f"GMM clustering stability (Jaccard index): mean={np.mean(jaccard_indices['gmm']):.4f}, std={np.std(jaccard_indices['gmm']):.4f}")
+                # Get best performing parameters based on mean Jaccard index across bootstraps
+                best_params_umap = max(tuning_results_umap, key=lambda x: x["silhouette"])
+                best_params_pca09 = max(tuning_results_pca09, key=lambda x: x["silhouette"])   
+
+    print(f"\nBest HDBSCAN parameters for UMAP: min_cluster_size={best_params_umap['mcs']}, min_samples={best_params_umap['ms']}, silhouette={best_params_umap['silhouette']:.4f}")
+    print(f"Cluster stability across bootstraps for UMAP: mean Jaccard index={pd.Series([r['jaccard'] for r in tuning_results_umap if not np.isnan(r['jaccard'])]).mean():.4f} with std={pd.Series([r['jaccard'] for r in tuning_results_umap if not np.isnan(r['jaccard'])]).std():.4f}")
+    print(f"Variance in Silhouette score across bootstraps for UMAP: mean={pd.Series([r['silhouette'] for r in tuning_results_umap if not np.isnan(r['silhouette'])]).mean():.4f}, std={pd.Series([r['silhouette'] for r in tuning_results_umap if not np.isnan(r['silhouette'])]).std():.4f}, min={pd.Series([r['silhouette'] for r in tuning_results_umap if not np.isnan(r['silhouette'])]).min():.4f}, max={pd.Series([r['silhouette'] for r in tuning_results_umap if not np.isnan(r['silhouette'])]).max():.4f}")
+    print(f"Number of unique subtypes discovered with best HDBSCAN parameters on UMAP: {len(set(reference_labels_hdbscan_umap)) - (1 if -1 in reference_labels_hdbscan_umap else 0)} with an average of {pd.Series(reference_labels_hdbscan_umap).value_counts().mean():.2f} subjects per subtype")  # Exclude -1 if it exists, which represents subjects not assigned to any subtype
+    print(f"\nBest HDBSCAN parameters for PCA (0.9 components): min_cluster_size={best_params_pca09['mcs']}, min_samples={best_params_pca09['ms']}, silhouette={best_params_pca09['silhouette']:.4f}")
+    print(f"Cluster stability across bootstraps for PCA (0.9 components): mean Jaccard index={pd.Series([r['jaccard'] for r in tuning_results_pca09 if not np.isnan(r['jaccard'])]).mean():.4f} with std={pd.Series([r['jaccard'] for r in tuning_results_pca09 if not np.isnan(r['jaccard'])]).std():.4f}")
+    print(f"Variance in Silhouette score across bootstraps for PCA (0.9 components): mean={pd.Series([r['silhouette'] for r in tuning_results_pca09 if not np.isnan(r['silhouette'])]).mean():.4f}, std={pd.Series([r['silhouette'] for r in tuning_results_pca09 if not np.isnan(r['silhouette'])]).std():.4f}, min={pd.Series([r['silhouette'] for r in tuning_results_pca09 if not np.isnan(r['silhouette'])]).min():.4f}, max={pd.Series([r['silhouette'] for r in tuning_results_pca09 if not np.isnan(r['silhouette'])]).max():.4f}")
+    print(f"Number of unique subtypes discovered with best HDBSCAN parameters on PCA (0.9 components): {len(set(reference_labels_hdbscan_pca09)) - (1 if -1 in reference_labels_hdbscan_pca09 else 0)} with an average of {pd.Series(reference_labels_hdbscan_pca09).value_counts().mean():.2f} subjects per subtype")  # Exclude -1 if it exists, which represents subjects not assigned to any subtype
+    
+    # Rerun with best parameters and assign cluster labels to subjects
+    hdbscan_clusterer_umap = hdbscan.HDBSCAN(min_cluster_size=best_params_umap["mcs"], min_samples=best_params_umap["ms"])
+    selected_subjects["hdbscan_umap_labels"] = hdbscan_clusterer_umap.fit_predict(X_umap)
+    hdbscan_clusterer_pca09 = hdbscan.HDBSCAN(min_cluster_size=best_params_pca09["mcs"], min_samples=best_params_pca09["ms"])
+    selected_subjects["hdbscan_pca09_labels"] = hdbscan_clusterer_pca09.fit_predict(X_pca09) 
+
+    return selected_subjects
 
 def missingness_analysis(con, fit_meta_df):
     '''

@@ -2,6 +2,7 @@ from pathlib import Path
 import os
 from src.preprocessing import *
 from src.feature_extraction import *
+from src.data_analysis import *
 from sklearn.model_selection import train_test_split
 
 # Set data directory paths
@@ -26,7 +27,7 @@ con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
 # ---- FEATURE EXTRACTION ----
 
 # Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
-selected_subjects = normative_selection(con, mri_meta_df, overwrite=True)
+selected_subjects = normative_selection(con, mri_meta_df, overwrite=False)
 
 # Conduct confound analysis pre and post normative modeling
 confound_effects_df = analyse_confounds(con, dem_df, mri_meta_df)
@@ -64,7 +65,7 @@ test_y.to_csv(os.path.join(output_path, "test_labels.csv"), index=False)
 # ---- DATA ANALYSIS ----
 
 # Conduct unsupervised clustering of selected subjects' z-scores for subtype discovery
-#subject_subtypes = mri_clustering(dem_df, selected_subjects)
+subject_subtypes = mri_clustering(selected_subjects)
 
 # Print number of unique subtypes discovered
 #print(f"Number of unique subtypes discovered: {len(set(subject_subtypes.values())) - (1 if -1 in subject_subtypes.values() else 0))}")  # Exclude -1 if it exists, which represents subjects not assigned to any subtype
