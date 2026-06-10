@@ -300,6 +300,11 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
 
     # Get subjects to include from mri_meta_df
     included_subjects = mri_meta_df["subject"].unique()
+    first_mri_meta_df = (
+        mri_meta_df.sort_values(["subject", "timepoint"])
+        .drop_duplicates(subset=["subject"], keep="first")
+        [["subject", "sex", "age_at_mri", "scan_site"]]
+    )
     
     # Query MRI data for the first timepoint for each included subject
     query = f"""
@@ -317,7 +322,7 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
 
     # Merge MRI data 
     df = mri_df.merge(
-        mri_meta_df[["subject", "sex", "age_at_mri", "scan_site"]].drop_duplicates(),
+        first_mri_meta_df,
         on="subject",
         how="inner"
     )
@@ -586,6 +591,7 @@ def extr_fitbit_features(con, selected_subjects):
                     feature_dict.update(daily_stats.mean().to_dict())
                     # STL decomposition
                     try:
+                        # TODO: Change, so that STL is done on each of the daily aggreates (min, max, mean, std) instead of the raw daily data
                         stl = STL(daily_data[metric], period=7, robust=True)
                         result = stl.fit()
                         stl_features = {
