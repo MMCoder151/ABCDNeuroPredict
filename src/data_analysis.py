@@ -10,7 +10,7 @@ import hdbscan
 from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.metrics import confusion_matrix, silhouette_score
 from scipy.optimize import linear_sum_assignment
-from sklearn.metrics import jaccard_score, davies_bouldin_score, calinski_harabasz_score
+from sklearn.metrics import jaccard_score, davies_bouldin_score, calinski_harabasz_score, adjusted_rand_score
 from pyampute.exploration.mcar_statistical_tests import MCARTest
 import pacmap
 from sklearn.decomposition import PCA
@@ -92,8 +92,9 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
     umap_grid = list(ParameterGrid({
         "n_components": [2], 
         "random_state": [42],
-        "n_neighbors": [5, 10, 15, 20, 30, 40, 50],
-        "min_dist": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
+        "n_jobs": [1],
+        "n_neighbors": [5, 10, 15, 20],
+        "min_dist": [0.0, 0.05, 0.1, 0.2],
         "metric": ["euclidean", "manhattan", "cosine"]
         }))
 
@@ -120,7 +121,7 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
 
     agglomerative_params = list(ParameterGrid({
         "n_clusters": [5, 10, 15, 20],
-        "linkage": ["ward", "complete", "average", "single"]
+        "linkage": ["ward", "complete", "average"]
     }))
 
     cl_models = (
@@ -132,7 +133,7 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
     
     results = []
 
-    for (dr_name, DR, dr_params), (cl_name, CL, cl_params) in tqdm(product(dr_models, cl_models), desc="Tuning parameters"):
+    for (dr_name, DR, dr_params), (cl_name, CL, cl_params) in tqdm(product(dr_models, cl_models), total=len(dr_models)*len(cl_models), desc="Tuning parameters"):
         dr_model = DR(**dr_params)
         cl_model = CL(**cl_params)
 
@@ -158,15 +159,23 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
 
         # Evaluate bootstrap stability with Jaccard index
         jaccard_scores = []
+        ari_scores = []
         for i in range(100):  # Bootstrapping for clustering stability
             bootstrap_sample = selected_subjects.sample(frac=1, replace=True, random_state=i)
             X_bootstrap = dr_model.fit_transform(bootstrap_sample.drop(columns=["subject_ids"]))
             labels_bootstrap = cl_model.fit_predict(X_bootstrap)
+            # skip degenerate solutions in bootstrap samples
+            if len(np.unique(labels_bootstrap[labels_bootstrap != -1])) < 2 or (labels_bootstrap == -1).sum() / len(labels_bootstrap) > 0.20:
+                continue
             aligned_labels = _align_labels(labels[bootstrap_sample.index], labels_bootstrap)
             jaccard = jaccard_score(labels[bootstrap_sample.index], aligned_labels, average="macro")
             jaccard_scores.append(jaccard)
+            ari = adjusted_rand_score(labels[bootstrap_sample.index], aligned_labels)
+            ari_scores.append(ari)
         m_jaccard = np.mean(jaccard_scores)
         sd_jaccard = np.std(jaccard_scores)
+        m_ari = np.mean(ari_scores)
+        sd_ari = np.std(ari_scores)
 
         results.append({
             "dr_model": dr_name, "dr_params": dr_params,
@@ -179,7 +188,9 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
             "trustworthiness": trustworthiness_score,
             "pairwise_distance_correlation": pairwise_distance,
             "mean_jaccard": m_jaccard,
-            "std_jaccard": sd_jaccard
+            "std_jaccard": sd_jaccard,
+            "mean_ari": m_ari,
+            "std_ari": sd_ari
         })
 
     # Create clustering output path
@@ -189,13 +200,20 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
     results_df = pd.DataFrame(results).sort_values(by="silhouette", ascending=False)
     results_df.to_csv(os.path.join(clustering_output_path, "clustering_results.csv"), index=False)
 
-    print(f"\nBest clustering result: {results_df.iloc[0].to_dict()}")
+    results_df_filtered = results_df[results_df["silhouette"] > 0.25 & results_df["davies_bouldin"] < 1.0 & results_df["trustworthiness"] > 0.8 & results_df["pairwise_distance_correlation"] > 0.75 & results_df["knn_overlap"] > 0.5 & results_df["mean_jaccard"] > 0.5].sort_values(by="silhouette", ascending=False)
+    results_df_filtered.to_csv(os.path.join(clustering_output_path, "filtered_clustering_results.csv"), index=False)
+
+    if results_df_filtered.empty:
+        print("No clustering solutions met the filtering criteria.")
+        return selected_subjects
+    
+    print(f"Best filtered clustering result: {results_df_filtered.iloc[0].to_dict()}")
 
     # Rerun with best parameters to get cluster labels for each subject
-    best_dr = results_df.iloc[0]['dr_model']
-    best_cl = results_df.iloc[0]['cl_model']
-    best_dr_params = results_df.iloc[0]['dr_params']
-    best_cl_params = results_df.iloc[0]['cl_params']
+    best_dr = results_df_filtered.iloc[0]['dr_model']
+    best_cl = results_df_filtered.iloc[0]['cl_model']
+    best_dr_params = results_df_filtered.iloc[0]['dr_params']
+    best_cl_params = results_df_filtered.iloc[0]['cl_params']
     dr_model = next(DR(**params) for name, DR, params in dr_models if name == best_dr)
     cl_model = next(CL(**params) for name, CL, params in cl_models if name == best_cl)
     X_dr = dr_model.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
@@ -203,6 +221,54 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
 
     # Save cluster labels to CSV
     selected_subjects[["subject_ids", "subtype"]].to_csv(os.path.join(clustering_output_path, "subject_subtypes.csv"), index=False)
+
+    # Reduce dimensionality for visualization if not already 2D
+    if X_dr.shape[1] > 2:
+        dr_vis = umap.UMAP(n_components=2, random_state=42)
+        X_dr_vis = dr_vis.fit_transform(X_dr)
+    else:        X_dr_vis = X_dr
+
+    # Create colored scatter plot of clusters in dimensionality reduction space
+    plt.figure(figsize=(10, 6))
+    for subtype in np.unique(selected_subjects["subtype"]):
+        subtype_data = X_dr_vis[selected_subjects["subtype"] == subtype]
+        plt.scatter(subtype_data[:, 0], subtype_data[:, 1], label=f"Subtype {subtype}", alpha=0.6)
+    plt.title("Clusters in Dimensionality Reduction Space")
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(clustering_output_path, f"clusters_in_dr_space.png"))
+    plt.close()
+
+    # Create cluster profile plots for top 5 clusters
+    top_clusters = selected_subjects["subtype"].value_counts().index[:5]
+    for cluster in top_clusters:
+        cluster_profile = selected_subjects[selected_subjects["subtype"] == cluster].drop(columns=["subject_ids", "subtype"]).mean()
+        plt.figure(figsize=(10, 6))
+        cluster_profile.plot(kind="bar")
+        plt.title(f"Cluster {cluster} Profile")
+        plt.ylabel("Mean Z-score")
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
+        plt.savefig(os.path.join(clustering_output_path, f"cluster_{cluster}_profile.png"))
+        plt.close()
+
+    # Create cluster centoroid plots in dimensionality reduction space
+    plt.figure(figsize=(10, 6))
+    centroids = (
+        pd.DataFrame(X_dr_vis)
+        .groupby(selected_subjects["subtype"])
+        .mean()
+    )   
+    plt.scatter(centroids[0], centroids[1], s=200, marker="X")
+    plt.title("Cluster Centroids in Dimensionality Reduction Space")
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(clustering_output_path, f"cluster_centroids_in_dr_space.png"))
+    plt.close()
 
     return selected_subjects
 
