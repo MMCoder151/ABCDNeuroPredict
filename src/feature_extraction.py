@@ -518,7 +518,7 @@ def extr_fitbit_features(con, selected_subjects):
     # Create a dataframe to hold the extracted features
     features_list = []
 
-    # Loop through each subject and timepoint to extract features
+    # Loop through each subject to extract features
     #grouped = fitbit_df.groupby(["subject"])
     for subject in tqdm(selected_subjects_list, total=len(selected_subjects_list), desc="Extracting Fitbit features"):
         # query first timepoint for the subject

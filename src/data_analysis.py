@@ -272,11 +272,11 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
 
     return selected_subjects
 
-def missingness_analysis(con, fit_meta_df):
+def missingness_analysis(con, fit_meta_df, output_path = Path("output")):
     '''
     This function analyzes the missingness patterns in the fitbit data for the selected subjects for MCAR, MAR, or MNAR missingness
     using Littles test from pyampute.
-        1. Queries different fitbit domain data separately (i.e. actigraphy-based: Stps1m, METs1m, Int1m, heart-rate: HR1m, Sleep: Slp1m)
+        1. Queries each fitbit file for the first timepoint of the filtered subjects
         2. For each, creates datetime index (days) with proper missing days based on min and max of the Wear_Time column for each subject and timepoint, 
         and merges with the original data to get missingness patterns
         3. Conducts Little's test for each fitbit domain to assess whether the missingness is MCAR, MAR, or MNAR
@@ -285,16 +285,16 @@ def missingness_analysis(con, fit_meta_df):
         con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
         fit_meta_df (DataFrame): DataFrame containing the fitbit metadata for the selected subjects
     Returns:
-        missingness_df (DataFrame): DataFrame containing the missingness patterns in the fitbit data for the selected subjects.
+        mcar_results_df (DataFrame): DataFrame containing the results of Little's test for each fitbit domain, including the p-value and any errors encountered during testing
 
     NOTE: This function is currently broken. Little's test is not computing properly and I have no fucking clue why. WIP
     '''
 
-    # For each subject and timepoint, create datetime index with proper missing days based on min and max of the Wear_Time column, and merge with original data to get missingness patterns
+    # For each subject create datetime index with proper missing days based on min and max of the Wear_Time column, and merge with original data to get missingness patterns
     def create_missingness_df(df, domain_name):
         missingness_list = []
-        grouped = df.groupby(["subject", "timepoint"])
-        for (subject, timepoint), group in tqdm(grouped, total=grouped.ngroups, desc=f"Creating missingness patterns for {domain_name}"):
+        grouped = df.groupby(["subject"])
+        for subject, group in tqdm(grouped, total=grouped.ngroups, desc=f"Creating missingness patterns for {domain_name}"):
             min_date = group["Wear_Time"].min().floor("D")
             max_date = group["Wear_Time"].max().ceil("D")
             value_cols = [c for c in group.columns if c not in ["subject", "timepoint", "Wear_Time"]]
@@ -303,13 +303,10 @@ def missingness_analysis(con, fit_meta_df):
             date_df = pd.DataFrame({"Wear_Time": date_range})
             merged_df = date_df.merge(daily_means, on="Wear_Time", how="left")
             merged_df["subject"] = subject
-            merged_df["timepoint"] = timepoint
             missingness_list.append(merged_df)
         return pd.concat(missingness_list, ignore_index=True)
-    
-    # Conduct Little's test for each fitbit domain to assess if the missingness is MCAR
-    mcar_test = MCARTest(method="little")
 
+    # Define safe littles test for debugging
     def safe_little_test(df, min_obs_per_col=5, min_cols=2):
         df = df.copy()
         # coerce numeric and drop empty cols/rows
@@ -338,54 +335,25 @@ def missingness_analysis(con, fit_meta_df):
             return np.nan, f"test error: {e}"
         return pval, None
 
-    p, err = safe_little_test(actigraphy_missingness_df.drop(columns=["subject","timepoint","Wear_Time"]))
-    print("p:", p, "err:", err)
+    # Get unique names of data files from fit_meta_df
+    fitbit_files = fit_meta_df["data_file"].unique()
 
-    # Query all fitbit data
-    fitbit_df = con.execute(f"SELECT subject, timepoint, Wear_Time, * FROM fitbit_data").df()
-    print(f"Creating missingness pattern...")
-    fitbit_missingness_df = create_missingness_df(fitbit_df, "fitbit")
-    fitbit_df = None  # free memory
-    fitbit_mcar = mcar_test.little_mcar_test(fitbit_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
-    fitbit_missingness_df = None  # free memory
+    mcar_test = MCARTest(method="little")
 
-    # Query actigraphy columns
-    actigraphy_cols = ["Calories_Cal1m", "Steps_Stps1m", "METs_METs1m"]
-    actigraphy_df = con.execute(f"SELECT subject, timepoint, Wear_Time, {', '.join(actigraphy_cols)} FROM fitbit_data").df()
-    # Create missingness patterns for actigraphy data
-    actigraphy_missingness_df = create_missingness_df(actigraphy_df, "actigraphy")
-    actigraphy_df = None  # free memory
-    # Conduct Little's test for actigraphy data
-    actigraphy_mcar = mcar_test.little_mcar_test(actigraphy_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
-    actigraphy_missingness_df = None  # free memory
+    results = []
+    for file in fitbit_files:
+        query = f"SELECT * FROM fitbit_data WHERE data_file = '{file}' AND timepoint = (SELECT MIN(timepoint) FROM fitbit_data f2 WHERE f2.subject = fitbit_data.subject)"
+        df = con.execute(query).df()
+        missingness_df = create_missingness_df(df, file)
+        df = None  # free memory
+        mcar = mcar_test.little_mcar_test(missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
+        print(f"Little's test for {file}: p-value = {mcar}")
+        print("Safe test:")
+        pval, error = safe_little_test(missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
+        print(f"File: {file}, p-value: {pval}, error: {error}")
+        missingness_df = None  # free memory
+        results.append((file, mcar, pval, error))
+    mcar_results_df = pd.DataFrame(results, columns=["data_file", "little_mcar", "safe_little_pval", "safe_little_error"])
+    mcar_results_df.to_csv(os.path.join(output_path, "fitbit_missingness_mcar_results.csv"), index=False)
 
-    actigraphy_df.head()
-    actigraphy_df.shape
-    actigraphy_missingness_df.head()
-    actigraphy_missingness_df.shape
-    actigraphy_missingness_df["Wear_Time"].min(), actigraphy_missingness_df["Wear_Time"].max()
-
-    daily_means = actigraphy_df.set_index("Wear_Time")[actigraphy_cols].resample("D").mean().reset_index()
-    daily_means.head(10)
-
-    # Query heart rate columns
-    heart_rate_df = con.execute(f"SELECT subject, timepoint, Wear_Time, Value_HR1m FROM fitbit_data").df()
-    # Create missingness patterns for heart rate data
-    heart_rate_missingness_df = create_missingness_df(heart_rate_df, "heart_rate")
-    heart_rate_df = None  # free memory
-    # Conduct Little's test for heart rate data
-    heart_rate_mcar = mcar_test.little_mcar_test(heart_rate_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
-    heart_rate_missingness_df = None  # free memory
-
-    # Query sleep columns
-    sleep_df = con.execute(f"SELECT subject, timepoint, Wear_Time, value_Slp1m FROM fitbit_data").df()
-    # Create missingness patterns for sleep data
-    sleep_missingness_df = create_missingness_df(sleep_df, "sleep")
-    sleep_df = None  # free memory
-    # Conduct Little's test for sleep data
-    sleep_mcar = mcar_test.little_mcar_test(sleep_missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
-    sleep_missingness_df = None  # free memory
-
-    print(f"Actigraphy missingness MCAR test: p-value={actigraphy_mcar:.4f}")
-    print(f"Heart rate missingness MCAR test: p-value={heart_rate_mcar:.4f}")
-    print(f"Sleep missingness MCAR test: p-value={sleep_mcar:.4f}")
+    return mcar_results_df
