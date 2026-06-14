@@ -20,7 +20,7 @@ from sklearn.neighbors import NearestNeighbors
 from itertools import product
 from sklearn.model_selection import ParameterGrid
 
-def mri_clustering(selected_subjects, output_path = Path("output")):
+def mri_clustering(selected_subjects, output_path = Path("output"), bootstrapping = True):
     '''
     This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data.
     It uses several different clustering algorithms (HBDSCAN and Bayesian Gaussian Mixture Models).
@@ -139,6 +139,7 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
 
         X_dr   = dr_model.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
         labels = cl_model.fit_predict(X_dr)
+        n_dimensions = X_dr.shape[1]
 
         # Skip degenerate solutions
         n_clusters = len(np.unique(labels[labels != -1]))
@@ -157,28 +158,29 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
         db  = davies_bouldin_score(selected_subjects.drop(columns=["subject_ids"])[mask], labels[mask])
         ch  = calinski_harabasz_score(selected_subjects.drop(columns=["subject_ids"])[mask], labels[mask])
 
-        # Evaluate bootstrap stability with Jaccard index
-        jaccard_scores = []
-        ari_scores = []
-        for i in range(100):  # Bootstrapping for clustering stability
-            bootstrap_sample = selected_subjects.sample(frac=1, replace=True, random_state=i)
-            X_bootstrap = dr_model.fit_transform(bootstrap_sample.drop(columns=["subject_ids"]))
-            labels_bootstrap = cl_model.fit_predict(X_bootstrap)
-            # skip degenerate solutions in bootstrap samples
-            if len(np.unique(labels_bootstrap[labels_bootstrap != -1])) < 2 or (labels_bootstrap == -1).sum() / len(labels_bootstrap) > 0.20:
-                continue
-            aligned_labels = _align_labels(labels[bootstrap_sample.index], labels_bootstrap)
-            jaccard = jaccard_score(labels[bootstrap_sample.index], aligned_labels, average="macro")
-            jaccard_scores.append(jaccard)
-            ari = adjusted_rand_score(labels[bootstrap_sample.index], aligned_labels)
-            ari_scores.append(ari)
-        m_jaccard = np.mean(jaccard_scores)
-        sd_jaccard = np.std(jaccard_scores)
-        m_ari = np.mean(ari_scores)
-        sd_ari = np.std(ari_scores)
+        # Evaluate bootstrap stability with Jaccard index and ari score
+        if bootstrapping:
+            jaccard_scores = []
+            ari_scores = []
+            for i in range(10):  # Bootstrapping for clustering stability
+                bootstrap_sample = selected_subjects.sample(frac=1, replace=True, random_state=i)
+                X_bootstrap = dr_model.fit_transform(bootstrap_sample.drop(columns=["subject_ids"]))
+                labels_bootstrap = cl_model.fit_predict(X_bootstrap)
+                # skip degenerate solutions in bootstrap samples
+                if len(np.unique(labels_bootstrap[labels_bootstrap != -1])) < 2 or (labels_bootstrap == -1).sum() / len(labels_bootstrap) > 0.20:
+                    continue
+                aligned_labels = _align_labels(labels[bootstrap_sample.index], labels_bootstrap)
+                jaccard = jaccard_score(labels[bootstrap_sample.index], aligned_labels, average="macro")
+                jaccard_scores.append(jaccard)
+                ari = adjusted_rand_score(labels[bootstrap_sample.index], aligned_labels)
+                ari_scores.append(ari)
+            m_jaccard = np.mean(jaccard_scores)
+            sd_jaccard = np.std(jaccard_scores)
+            m_ari = np.mean(ari_scores)
+            sd_ari = np.std(ari_scores)
 
         results.append({
-            "dr_model": dr_name, "dr_params": dr_params,
+            "dr_model": dr_name, "dr_params": dr_params, "n_dimensions": n_dimensions,
             "cl_model": cl_name, "cl_params": cl_params,
             "n_clusters": n_clusters, "noise_pct": noise_pct,
             "silhouette": sil,
@@ -187,11 +189,14 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
             "knn_overlap": knn_overlap_score,
             "trustworthiness": trustworthiness_score,
             "pairwise_distance_correlation": pairwise_distance,
-            "mean_jaccard": m_jaccard,
-            "std_jaccard": sd_jaccard,
-            "mean_ari": m_ari,
-            "std_ari": sd_ari
         })
+        if bootstrapping:
+            results[-1].update({
+                "mean_jaccard": m_jaccard,
+                "std_jaccard": sd_jaccard,
+                "mean_ari": m_ari,
+                "std_ari": sd_ari
+            })
 
     # Create clustering output path
     clustering_output_path = os.path.join(output_path, "mri_clustering")
@@ -200,7 +205,15 @@ def mri_clustering(selected_subjects, output_path = Path("output")):
     results_df = pd.DataFrame(results).sort_values(by="silhouette", ascending=False)
     results_df.to_csv(os.path.join(clustering_output_path, "clustering_results.csv"), index=False)
 
-    results_df_filtered = results_df[results_df["silhouette"] > 0.25 & results_df["davies_bouldin"] < 1.0 & results_df["trustworthiness"] > 0.8 & results_df["pairwise_distance_correlation"] > 0.75 & results_df["knn_overlap"] > 0.5 & results_df["mean_jaccard"] > 0.5].sort_values(by="silhouette", ascending=False)
+    results_df_filtered = results_df[
+        (results_df["silhouette"] > 0.25) &
+        (results_df["davies_bouldin"] < 1.0) &
+        (results_df["trustworthiness"] > 0.8) &
+        (results_df["pairwise_distance_correlation"] > 0.75) &
+        (results_df["knn_overlap"] > 0.5)
+    ].sort_values(by="silhouette", ascending=False)
+    if bootstrapping:
+        results_df_filtered = results_df_filtered[(results_df_filtered["mean_jaccard"] > 0.5)]
     results_df_filtered.to_csv(os.path.join(clustering_output_path, "filtered_clustering_results.csv"), index=False)
 
     if results_df_filtered.empty:
@@ -293,11 +306,11 @@ def missingness_analysis(con, fit_meta_df, output_path = Path("output")):
     # For each subject create datetime index with proper missing days based on min and max of the Wear_Time column, and merge with original data to get missingness patterns
     def create_missingness_df(df, domain_name):
         missingness_list = []
-        grouped = df.groupby(["subject"])
-        for subject, group in tqdm(grouped, total=grouped.ngroups, desc=f"Creating missingness patterns for {domain_name}"):
+        grouped = df.groupby("subject")
+        for subject, group in grouped:
             min_date = group["Wear_Time"].min().floor("D")
             max_date = group["Wear_Time"].max().ceil("D")
-            value_cols = [c for c in group.columns if c not in ["subject", "timepoint", "Wear_Time"]]
+            value_cols = [c for c in group.columns if c not in ["subject", "Wear_Time"]]
             daily_means = group.set_index("Wear_Time")[value_cols].resample("D").mean().reset_index()
             date_range = pd.date_range(start=min_date, end=max_date, freq="D")
             date_df = pd.DataFrame({"Wear_Time": date_range})
@@ -334,26 +347,138 @@ def missingness_analysis(con, fit_meta_df, output_path = Path("output")):
         except Exception as e:
             return np.nan, f"test error: {e}"
         return pval, None
-
-    # Get unique names of data files from fit_meta_df
-    fitbit_files = fit_meta_df["data_file"].unique()
-
+    
     mcar_test = MCARTest(method="little")
 
+    # Setup bootstrapping for random selection of subjects to run Little's test with reduced memory load
+    bootstrap_results = []
+    for i in tqdm(range(10), desc="Bootstrapping Little's test for MCAR"):
+        
+        bootstrap_subjects = fit_meta_df["subject"].sample(frac=0.25, random_state=i).values
+        query = f"""
+            WITH earliest_timepoint AS (
+            SELECT subject, MIN(timepoint) AS first_tp
+            FROM fitbit_data
+            WHERE subject IN (SELECT unnest($subjects))
+            GROUP BY subject
+            ),
+            daily_agg AS (
+                SELECT 
+                    f.subject,
+                    CAST(f.Wear_Time AS DATE) AS date,
+                    AVG(f.Value_HR1m)       AS Value_HR1m,
+                    AVG(f.Steps_Stps1m)     AS Steps_Stps1m,
+                    AVG(f.Calories_Cal1m)   AS Calories_Cal1m,
+                    AVG(f.METs_METs1m)      AS METs_METs1m,
+                    AVG(f.Intensity_Int1m)  AS Intensity_Int1m,
+                    AVG(f.value_Slp1m)      AS value_Slp1m
+                FROM fitbit_data f
+                INNER JOIN earliest_timepoint e
+                    ON f.subject = e.subject 
+                    AND f.timepoint = e.first_tp
+                WHERE f.subject IN (SELECT unnest($subjects))
+                GROUP BY f.subject, CAST(f.Wear_Time AS DATE)
+            )
+            SELECT * FROM daily_agg
+            """
+        df = con.execute(query, {"subjects": list(bootstrap_subjects)}).df()
+
+        # Drop columns with all missing values and zero variance to avoid errors in Little's test
+        #df = df.drop(columns=["subject","timepoint", "Wear_Time", "Level_Slp1m"])  
+        df = df.drop(columns=["subject", "date"])
+        df = df.dropna(axis=1, how="all")
+        numeric_cols = df.select_dtypes(include="number").columns
+        zero_var_cols = numeric_cols[df[numeric_cols].std() == 0]
+        df = df.drop(columns=zero_var_cols)
+        df = df.apply(lambda col: col.astype(float) 
+                            if hasattr(col, 'dtype') and pd.api.types.is_extension_array_dtype(col) 
+                            else col)
+
+        # Convert columns to numeric and Wear_Time to datetime
+        cols_to_convert = [c for c in df.columns if c not in ["subject", "Wear_Time"]]
+        df[cols_to_convert] = df[cols_to_convert].apply(pd.to_numeric, errors='coerce')
+        #df["Wear_Time"] = pd.to_datetime(df["Wear_Time"])
+
+        #missingness_df = create_missingness_df(df, domain_name=f"bootstrap_{i}")
+        #df = None  # free memory
+
+        # --- Diagnostics ---
+        #test_df = missingness_df.drop(columns=["subject", "Wear_Time"])
+        #print(f"Shape: {test_df.shape}")
+        #print(f"Missingness per column (%):\n{test_df.isna().mean().sort_values(ascending=False).head(20)}")
+        #print(f"Columns with all NaN: {test_df.isna().all().sum()}")
+        #print(f"Columns with zero variance: {(test_df.std() == 0).sum()}")
+        #print(f"Sample of data:\n{test_df.head()}")
+
+        #print(f"Shape: {df.shape}")
+        #print(f"Missingness per column (%):\n{df.isna().mean().sort_values(ascending=False)}")
+        #print(f"Dtype of each column:\n{df.dtypes}")
+        #print(f"Any <NA> (pandas NA, not numpy NaN):\n{df.isin([pd.NA]).any()}")
+        #print(f"Sample:\n{df.head(10)}")
+        # ------------------
+
+        #mcar = mcar_test.little_mcar_test(missingness_df.drop(columns=["subject", "Wear_Time"]))
+        mcar = mcar_test.little_mcar_test(df)
+
+        # --- Diagnostics ---
+        #print(f"Raw result object: {mcar}")
+        #print(f"Type of result: {type(mcar)}")
+        # -------------------
+
+        print(f"Bootstrap iteration {i}: Little's test p-value = {mcar}")
+        bootstrap_results.append((i, mcar))
+
+    bootstrap_results_df = pd.DataFrame(bootstrap_results, columns=["bootstrap_iteration", "little_mcar_pval", "little_mcar_error"])
+    bootstrap_results_df.to_csv(os.path.join(output_path, "fitbit_missingness_mcar_bootstrap_results.csv"), index=False)
+    print("Completed bootstrapping for Little's test. Results saved to CSV.")
+    print("Average p-value across bootstraps:", bootstrap_results_df["little_mcar_pval"].mean())
+
+    # Get unique column names from fitbit tables
+    query = """
+    SELECT column_name
+    FROM (DESCRIBE fitbit_data)
+    """
+    fitbit_columns = con.execute(query).df()["column_name"].tolist()
+    fitbit_columns.remove("subject")
+    fitbit_columns.remove("timepoint")
+    fitbit_columns.remove("Wear_Time")
+
+    
+
+    query = f"""
+            SELECT subject, Wear_Time, {fitbit_columns[0]}
+            FROM fitbit_data   
+            WHERE timepoint = (
+                SELECT MIN(timepoint)
+                FROM fitbit_data f2
+                WHERE f2.subject = fitbit_data.subject
+            )
+            """
+    df = con.execute(query).df()
+
     results = []
-    for file in fitbit_files:
-        query = f"SELECT * FROM fitbit_data WHERE data_file = '{file}' AND timepoint = (SELECT MIN(timepoint) FROM fitbit_data f2 WHERE f2.subject = fitbit_data.subject)"
+    for column in tqdm(fitbit_columns, desc="Testing MCAR for each column"):
+        print(column)
+        query = f"""
+            SELECT subject, Wear_Time, {column}
+            FROM fitbit_data   
+            WHERE timepoint = (
+                SELECT MIN(timepoint)
+                FROM fitbit_data f2
+                WHERE f2.subject = fitbit_data.subject
+            )
+            """
         df = con.execute(query).df()
-        missingness_df = create_missingness_df(df, file)
+        missingness_df = create_missingness_df(df, column)
         df = None  # free memory
-        mcar = mcar_test.little_mcar_test(missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
-        print(f"Little's test for {file}: p-value = {mcar}")
+        mcar = mcar_test.little_mcar_test(missingness_df.drop(columns=["subject", "Wear_Time"]))
+        print(f"Little's test for {column}: p-value = {mcar}")
         print("Safe test:")
-        pval, error = safe_little_test(missingness_df.drop(columns=["subject", "timepoint", "Wear_Time"]))
-        print(f"File: {file}, p-value: {pval}, error: {error}")
+        pval, error = safe_little_test(missingness_df.drop(columns=["subject", "Wear_Time"]))
+        print(f"Column: {column}, p-value: {pval}, error: {error}")
         missingness_df = None  # free memory
-        results.append((file, mcar, pval, error))
-    mcar_results_df = pd.DataFrame(results, columns=["data_file", "little_mcar", "safe_little_pval", "safe_little_error"])
+        results.append((column, mcar, pval, error))
+    mcar_results_df = pd.DataFrame(results, columns=["filename", "little_mcar", "safe_little_pval", "safe_little_error"])
     mcar_results_df.to_csv(os.path.join(output_path, "fitbit_missingness_mcar_results.csv"), index=False)
 
     return mcar_results_df

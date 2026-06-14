@@ -38,7 +38,6 @@ def _recode_fitbit_data(fit_df):
         - Slp1m: Recode values to binary asleep (1) vs. awake/restless (0), with "unknown" as missing (None)
         and drops unncessary meta columns (pGUID, logId)
     '''
-    # TODO: Extract all column names with non-numeric content
 
     # drop unnecessary meta columns
     cols_to_drop = ["pGUID", "logId"]
@@ -70,6 +69,8 @@ def _recode_fitbit_data(fit_df):
         fit_df[col] = fit_df[col].replace(slp1m_mapping)
     # Rename "level" column to "value" for consistency with other fitbit files
     fit_df = fit_df.rename(columns={col: col.replace("Level", "value") for col in slp1m_cols})
+
+    #TODO: Find out why "Level_Slp1m" persists
 
     return fit_df
 

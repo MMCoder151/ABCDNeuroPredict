@@ -65,7 +65,10 @@ test_y.to_csv(os.path.join(output_path, "test_labels.csv"), index=False)
 # ---- DATA ANALYSIS ----
 
 # Conduct unsupervised clustering of selected subjects' z-scores for subtype discovery
-subject_subtypes = mri_clustering(selected_subjects)
+subject_subtypes = mri_clustering(selected_subjects, bootstrapping=True)
+
+# Calculate cluster association with age
+# TODO: Implement
 
 # Print number of unique subtypes discovered
 #print(f"Number of unique subtypes discovered: {len(set(subject_subtypes.values())) - (1 if -1 in subject_subtypes.values() else 0))}")  # Exclude -1 if it exists, which represents subjects not assigned to any subtype
