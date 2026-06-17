@@ -1,8 +1,8 @@
 from sklearn.base import clone
-from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, cross_val_score, StratifiedGroupKFold
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, cross_val_score, StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from xgboost import XGBClassifier
+#from xgboost import XGBClassifier --- Issues with xgboost installation
 from lightgbm import LGBMClassifier
 from sklearn.svm import SVC
 import numpy as np
@@ -11,12 +11,12 @@ from sklearn.metrics import roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.feature_selection import SelectKBest, mutual_info_classif, VarianceThreshold
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, FunctionTransformer
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.feature_selection import SelectFromModel
 from sklearn.ensemble import ExtraTreesClassifier
 import pandas as pd
-
+    
 class FractionalSelectKBest(BaseEstimator, TransformerMixin):
     """
     SelectKBest where k is defined as a fraction of incoming features,
@@ -38,11 +38,30 @@ class FractionalSelectKBest(BaseEstimator, TransformerMixin):
     def get_feature_names_out(self, input_features=None):
         return self.selector_.get_feature_names_out(input_features)
 
+class DropAllNaNColumns(BaseEstimator, TransformerMixin):
+    """Drop columns that are entirely NaN in the training split."""
+
+    def fit(self, X, y=None):
+        if hasattr(X, "columns"):
+            self._is_dataframe = True
+            self.kept_columns_ = X.columns[~X.isna().all(axis=0)].tolist()
+        else:
+            self._is_dataframe = False
+            X_array = np.asarray(X)
+            self.kept_indices_ = np.where(~np.isnan(X_array).all(axis=0))[0]
+        return self
+
+    def transform(self, X):
+        if self._is_dataframe:
+            return X.loc[:, self.kept_columns_]
+        X_array = np.asarray(X)
+        return X_array[:, self.kept_indices_]
+    
 def define_models():
     models = {
             "Logistic Regression": (
                 Pipeline([
-                    #("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+                    ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
                     ("thresholding", VarianceThreshold(threshold=0.01)),
                     ("tree_selector", SelectFromModel(ExtraTreesClassifier(n_estimators=100, random_state=42), threshold="median")),
                     ("scaler", StandardScaler()),
@@ -58,7 +77,7 @@ def define_models():
             ),
             "Random Forest": (
                 Pipeline([
-                    #("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+                    ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
                     ("thresholding", VarianceThreshold(threshold=0.01)),
                     ("tree_selector", SelectFromModel(ExtraTreesClassifier(n_estimators=100, random_state=42), threshold="median")),
                     ("scaler", StandardScaler()),
@@ -74,11 +93,12 @@ def define_models():
             }),
             "LightGBM": (
                 Pipeline([
-                    #("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+                    ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
                     ("thresholding", VarianceThreshold(threshold=0.01)),
                     ("tree_selector", SelectFromModel(ExtraTreesClassifier(n_estimators=100, random_state=42), threshold="median")),
                     ("scaler", StandardScaler()),
                     ("selector", FractionalSelectKBest(score_func=mutual_info_classif)),
+                    #("to_numpy", FunctionTransformer(_to_numpy_if_needed, validate=False)),
                     ("clf", LGBMClassifier(n_threads=1, verbose=-1, random_state=42))
                 ]),
                 {
@@ -91,28 +111,9 @@ def define_models():
                     "clf__min_child_samples": [20, 40],
                     "clf__is_unbalance": [True]
             }),
-            "XGBoost": (
-                Pipeline([
-                    #("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
-                    ("thresholding", VarianceThreshold(threshold=0.01)),
-                    ("tree_selector", SelectFromModel(ExtraTreesClassifier(n_estimators=100, random_state=42), threshold="median")),
-                    ("scaler", StandardScaler()),
-                    ("selector", FractionalSelectKBest(score_func=mutual_info_classif)),
-                    ("clf", XGBClassifier(n_jobs=1, use_label_encoder=False, eval_metric="auc", random_state=42))
-                ]),
-                {
-                    "selector__fraction": [0.3, 0.5, 0.7],
-                    "clf__n_estimators": [200, 500, 800],
-                    "clf__learning_rate": [0.01, 0.05, 0.1],
-                    "clf__max_depth": [3, 6, 9],
-                    "clf__subsample": [0.8],
-                    "clf__colsample_bytree": [0.8],
-                    "clf__min_child_weight": [1, 5, 10],
-                    "clf__scale_pos_weight": [1, 5, 10]
-            }),
             "SVM": (
                 Pipeline([
-                    #("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+                    ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
                     ("thresholding", VarianceThreshold(threshold=0.01)),
                     ("tree_selector", SelectFromModel(ExtraTreesClassifier(n_estimators=100, random_state=42), threshold="median")),
                     ("scaler", StandardScaler()),
@@ -129,6 +130,9 @@ def define_models():
         }
     return models
 
+def _to_numpy_if_needed(X):
+        return X.to_numpy() if hasattr(X, "to_numpy") else X
+
 def train_and_evaluate_models(X, y, search="random", outer_splits=10, inner_splits=10, models_to_train=None):
     ''' Trains and evaluates multiple machine learning models using nested cross-validation.
         
@@ -142,12 +146,12 @@ def train_and_evaluate_models(X, y, search="random", outer_splits=10, inner_spli
 
     # Define nested cross-validation structure
     cv_struct = {
-        "outer_cv": StratifiedGroupKFold(
+        "outer_cv": StratifiedKFold(
             n_splits=outer_splits,
             shuffle=True,
             random_state=42
         ),
-        "inner_cv": StratifiedGroupKFold(
+        "inner_cv": StratifiedKFold(
             n_splits=inner_splits,
             shuffle=True,
             random_state=42
@@ -215,19 +219,22 @@ def train_and_evaluate_models(X, y, search="random", outer_splits=10, inner_spli
         outer_best_params = []
         outer_inner_best_scores = []
 
-        subjects = X["subject"].values if "subject" in X.columns else None
+        if "subtype" in X.columns:
+            strat = X["subtype"]
+        else:
+            raise ValueError("Expected 'subtype' column in features for stratification during CV. Please ensure it is included in the input data.")
 
         # Nested CV Setup: inner tuning inside each outer training split
-        for train_idx, test_idx in tqdm(cv_struct["outer_cv"].split(X, y, subjects = subjects),desc=f"Running nested CV for {name}"):
+        for train_idx, test_idx in tqdm(cv_struct["outer_cv"].split(X, y = strat),desc=f"Running nested CV for {name}"):
             # Safely index data for current fold
             X_train = _safe_index(X, train_idx)
             y_train = _safe_index(y, train_idx)
             X_test = _safe_index(X, test_idx)
             y_test = _safe_index(y, test_idx)
-            subjects_train = _safe_index(subjects, train_idx) if subjects is not None else print("Warning: No subjects available for training split. Grouped CV may not work properly!")
+            #groups_train = _safe_index(groups, train_idx) if groups is not None else print("Warning: No groups available for training split. Grouped CV may not work properly!")
             
             fold_searcher = make_searcher(model, param_grid)
-            fold_searcher.fit(X_train, y_train, groups = subjects_train)  
+            fold_searcher.fit(X_train, y_train)  
 
             outer_best_params.append(fold_searcher.best_params_)
             outer_inner_best_scores.append(float(fold_searcher.best_score_))
@@ -257,3 +264,38 @@ def train_and_evaluate_models(X, y, search="random", outer_splits=10, inner_spli
     print("\nModel training and evaluation completed.")
 
     return nested_cv_scores
+
+def train_final_model(X, y, model):
+    ''' Trains the final model on the full dataset using the best hyperparameters identified from nested CV.
+        1. Performs a hyperparameter search (grid or random) on the entire dataset to find the best parameters.
+        2. Fits the model with the best hyperparameters on the full dataset to create a deployable model.
+        3. Returns the fully trained model and its best hyperparameters.
+        Note: This function should only be called after identifying the best model type from nested CV to avoid data leakage.
+    '''
+
+    all_models = define_models()
+    model_to_train, param_grid = all_models[model]
+        
+    grouped_cv = StratifiedKFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=42
+    )
+
+    searcher = GridSearchCV(
+                    estimator=model_to_train,
+                    param_grid=param_grid,
+                    cv=grouped_cv,
+                    scoring="roc_auc",
+                    n_jobs=3,
+                    verbose = 3
+                )
+    searcher.fit(X, y)
+    best_model = searcher.best_estimator_
+    best_hyperparams = searcher.best_params_
+    train_predictions = best_model.predict_proba(X)[:, 1]
+
+    print(f"Best hyperparameters for final model: {best_hyperparams}")
+    print(f"Best inner-CV AUC during final training: {float(searcher.best_score_):.4f}")
+
+    return best_model, best_hyperparams, train_predictions

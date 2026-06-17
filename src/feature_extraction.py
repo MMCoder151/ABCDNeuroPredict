@@ -496,7 +496,7 @@ def create_mri_composites(selected_subjects):
 
     return selected_subjects, composite_dict
 
-def extr_fitbit_features(con, selected_subjects):
+def extr_fitbit_features(con, selected_subjects, overwrite=True):
     '''
     This function extracts features from the fitbit data for the selected subjects.
         1. Creates daily mean, std, min, and max for each fitbit metric
@@ -509,6 +509,7 @@ def extr_fitbit_features(con, selected_subjects):
     Returns:
         fitbit_features_df (DataFrame): DataFrame containing the extracted fitbit features for each subject
     '''
+
     # Get a de-duplicated list of selected subjects.
     if hasattr(selected_subjects, "columns") and "subject" in selected_subjects.columns:
         selected_subjects_list = selected_subjects["subject"].dropna().unique().tolist()
@@ -593,5 +594,12 @@ def extr_fitbit_features(con, selected_subjects):
                         print(f"STL decomposition failed for subject {subject}, metric {metric}: {e}")
         features_list.append(feature_dict)
     fitbit_features_df = pd.DataFrame(features_list)
+    # add subtype labels
+    fitbit_features_df = fitbit_features_df.merge(
+        selected_subjects[["subject", "subtype"]],
+        left_on="subject",
+        right_on="subject",
+        how="left"
+    )
 
     return fitbit_features_df

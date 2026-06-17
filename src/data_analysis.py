@@ -20,7 +20,7 @@ from sklearn.neighbors import NearestNeighbors
 from itertools import product
 from sklearn.model_selection import ParameterGrid
 
-def mri_clustering(selected_subjects, output_path = Path("output"), bootstrapping = True):
+def mri_clustering(selected_subjects, output_path = Path("output"), bootstrapping = True, overwrite = True):
     '''
     This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data.
     It uses several different clustering algorithms (HBDSCAN and Bayesian Gaussian Mixture Models).
@@ -29,12 +29,25 @@ def mri_clustering(selected_subjects, output_path = Path("output"), bootstrappin
 
     Parameters:
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI z-scores
+        output_path (str or Path): Path to save clustering results and visualizations
+        bootstrapping (bool): Whether to perform bootstrapping for cluster stability assessment
+        overwrite (bool): Whether to overwrite existing clustering results if they exist
     Returns:
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their assigned cluster labels based on their MRI ROI z-scores 
-
-    TODO: Add descriptive analysis of clusters and graphs
-
     '''
+
+    # Create clustering output path
+    clustering_output_path = os.path.join(output_path, "mri_clustering")
+    os.makedirs(clustering_output_path, exist_ok=True)
+
+    if overwrite == False:
+        existing_results_path = os.path.join(clustering_output_path, "subject_subtypes.csv")
+        if os.path.exists(existing_results_path):
+            print(f"Overwrite set to False. Loading existing results.")
+            results_df = pd.read_csv(existing_results_path)
+            return selected_subjects.merge(results_df[["subject_ids", "subtype"]], left_on="subject_ids", right_on="subject_ids", how="left")
+        else:
+            print(f"No existing clustering results found at {existing_results_path}. Running clustering analysis.")
 
     # Read in the z-scores for the selected subjects and their MRI ROI data
     z_scores_path = os.path.join(output_path, "normative_modelling", "results", "Z_mri_norm.csv")
@@ -198,10 +211,6 @@ def mri_clustering(selected_subjects, output_path = Path("output"), bootstrappin
                 "std_ari": sd_ari
             })
 
-    # Create clustering output path
-    clustering_output_path = os.path.join(output_path, "mri_clustering")
-    os.makedirs(clustering_output_path, exist_ok=True)
-
     results_df = pd.DataFrame(results).sort_values(by="silhouette", ascending=False)
     results_df.to_csv(os.path.join(clustering_output_path, "clustering_results.csv"), index=False)
 
@@ -234,6 +243,8 @@ def mri_clustering(selected_subjects, output_path = Path("output"), bootstrappin
 
     # Save cluster labels to CSV
     selected_subjects[["subject_ids", "subtype"]].to_csv(os.path.join(clustering_output_path, "subject_subtypes.csv"), index=False)
+
+    # TODO: Fix visualization
 
     # Reduce dimensionality for visualization if not already 2D
     if X_dr.shape[1] > 2:
