@@ -28,7 +28,7 @@ con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
 
 # ---- DATA ANALYSIS ----
 
-# NORMATIVE SELECTION
+# NORMATIVE SELECTION OF MRI DATA
 # Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
 selected_subjects = normative_selection(con, mri_meta_df, overwrite=False)
 
@@ -47,6 +47,16 @@ describe_subjects(non_selected_fit_meta_df, non_selected_mri_meta_df)
 
 # Add group labels to dem_df based on selected_subjects
 dem_df["group"] = dem_df["subject"].apply(lambda x: 1 if x in selected_subjects["subject_ids"].values else 0)
+
+# NORMATIVE SELECTION OF FITBIT DATA
+# Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
+# TODO: Implement
+
+# Conduct confound analysis pre and post normative modeling
+# TODO: Implement
+
+# Calculate group overlap with selected subjects from MRI normative modeling
+# TODO: Implement
 
 # UNSUPERVISED CLUSTERING
 # Conduct unsupervised clustering of selected subjects' z-scores for subtype discovery
@@ -110,7 +120,8 @@ test_y = pd.read_csv(os.path.join(output_path, "test_labels.csv"))
 
 cv_logreg = train_and_evaluate_models(
     train_features.drop(columns=["subject"]), 
-    train_y, search="random", 
+    (train_y.drop(columns=["subject"])).squeeze(), 
+    search="random", 
     outer_splits=10, 
     inner_splits=10, 
     models_to_train=["Logistic Regression"]
@@ -118,7 +129,8 @@ cv_logreg = train_and_evaluate_models(
 
 cv_svm = train_and_evaluate_models(
     train_features.drop(columns=["subject"]), 
-    train_y, search="random", 
+    (train_y.drop(columns=["subject"])).squeeze(), 
+    search="random", 
     outer_splits=10, 
     inner_splits=10, 
     models_to_train=["SVM"]
@@ -126,7 +138,8 @@ cv_svm = train_and_evaluate_models(
 
 cv_rf = train_and_evaluate_models(
     train_features.drop(columns=["subject"]), 
-    train_y, search="random", 
+    (train_y.drop(columns=["subject"])).squeeze(), 
+    search="random", 
     outer_splits=10, 
     inner_splits=10, 
     models_to_train=["Random Forest"]
@@ -134,7 +147,8 @@ cv_rf = train_and_evaluate_models(
 
 cv_lightgbm = train_and_evaluate_models(
     train_features.drop(columns=["subject"]), 
-    train_y, search="random", 
+    (train_y.drop(columns=["subject"])).squeeze(), 
+    search="random", 
     outer_splits=10, 
     inner_splits=10, 
     models_to_train=["LightGBM"]
