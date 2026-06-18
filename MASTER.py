@@ -48,16 +48,6 @@ describe_subjects(non_selected_fit_meta_df, non_selected_mri_meta_df)
 # Add group labels to dem_df based on selected_subjects
 dem_df["group"] = dem_df["subject"].apply(lambda x: 1 if x in selected_subjects["subject_ids"].values else 0)
 
-# NORMATIVE SELECTION OF FITBIT DATA
-# Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
-# TODO: Implement
-
-# Conduct confound analysis pre and post normative modeling
-# TODO: Implement
-
-# Calculate group overlap with selected subjects from MRI normative modeling
-# TODO: Implement
-
 # UNSUPERVISED CLUSTERING
 # Conduct unsupervised clustering of selected subjects' z-scores for subtype discovery
 subject_subtypes = mri_clustering(selected_subjects, bootstrapping=True, overwrite=False)
@@ -87,16 +77,22 @@ print("Missingness association with group (coefficients):", pd.Series(model_miss
 
 # ---- FEATURE EXTRACTION ----
 
+dem_df["subject"].nunique()
+
+# Filter dem_df to include only non-short subjects
+dem_df_features = dem_df[~dem_df["subject"].isin(fit_meta_df[fit_meta_df["short"] == True]["subject"])]
+dem_df_features["subject"].nunique()
+
 # Train-test split of subjects in dem_df
-train_df, test_df = train_test_split(dem_df[["subject", "subtype"]], test_size=0.2, stratify=dem_df["group"], random_state=42)
+train_df, test_df = train_test_split(dem_df_features[["subject", "subtype"]], test_size=0.2, stratify=dem_df_features["group"], random_state=42)
 
 # Extract features from selected subjects fitbit data for train set
 train_features = extr_fitbit_features(con, train_df)
-train_y = dem_df[dem_df["subject"].isin(train_features["subject"])]["group"]
+train_y = dem_df_features[dem_df_features["subject"].isin(train_features["subject"])]["group"]
 
 # Extract features from selected subjects fitbit data for test set
 test_features = extr_fitbit_features(con, test_df)
-test_y = dem_df[dem_df["subject"].isin(test_features["subject"])][["subject", "group"]]
+test_y = dem_df_features[dem_df_features["subject"].isin(test_features["subject"])][["subject", "group"]]
 
 # Save features to CSV
 train_features.to_csv(os.path.join(output_path, "train_features.csv"), index=False)
@@ -114,6 +110,18 @@ test_y = pd.read_csv(os.path.join(output_path, "test_labels.csv"))
 # TODO: Implement
 
 # Create feature composites
+# TODO: Implement
+
+# ---- DATA ANALYSIS #2 ----
+
+# NORMATIVE SELECTION OF FITBIT DATA
+# Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
+# TODO: Implement
+
+# Conduct confound analysis pre and post normative modeling
+# TODO: Implement
+
+# Calculate group overlap with selected subjects from MRI normative modeling
 # TODO: Implement
 
 # ---- MODELING ----

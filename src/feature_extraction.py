@@ -541,15 +541,17 @@ def extr_fitbit_features(con, selected_subjects, overwrite=True):
         for metric in fitbit_metric_cols:
             # Check if the metric column exists in the group
             if metric in subject_fitbit_df.columns:
-                daily_data = subject_fitbit_df[["Wear_Time", metric]]#.dropna()
+                daily_data = subject_fitbit_df[["Wear_Time", metric]].dropna()
                 if not daily_data.empty:
                     # Create daily features (mean, std, min, max)
                     daily_data.set_index("Wear_Time", inplace=True)
                     daily_stats = daily_data.resample("D").agg(['mean', 'std', 'min', 'max'])
                     daily_stats.columns = ['_'.join(col) for col in daily_stats.columns]
                     # Create datetime index with proper missing days based on the daily resampling range
-                    min_date = daily_stats.index.min().floor("D")
-                    max_date = daily_stats.index.max().ceil("D")
+                    # TODO: Check if using the first non-NaN date as the start date for reindexing is more appropriate than using the min date of the daily_stats index, which may be affected by outliers or missing data.
+                    daily_stats = daily_stats.dropna(how="all")
+                    min_date = daily_stats.index.min()
+                    max_date = daily_stats.index.max()
                     date_range = pd.date_range(start=min_date, end=max_date, freq="D")
                     # Reindex to include missing days and impute missing values with multiple imputation
                     daily_stats = daily_stats.reindex(date_range)

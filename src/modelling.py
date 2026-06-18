@@ -221,6 +221,7 @@ def train_and_evaluate_models(X, y, search="random", outer_splits=10, inner_spli
 
         if "subtype" in X.columns:
             strat = X["subtype"]
+            X = X.drop(columns=["subtype"])
         else:
             raise ValueError("Expected 'subtype' column in features for stratification during CV. Please ensure it is included in the input data.")
 
