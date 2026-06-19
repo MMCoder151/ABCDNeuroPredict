@@ -24,7 +24,7 @@ dem_df, mri_meta_df, fit_meta_df = filter_subjects(dta_path, test=False, overwri
 describe_subjects(fit_meta_df, mri_meta_df)
 
 # Transform data to make it easier to query with DuckDB
-con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
+con = setup_duckdb(dta_path, fit_meta_df, overwrite=True)
 
 # ---- DATA ANALYSIS ----
 
@@ -80,19 +80,19 @@ print("Missingness association with group (coefficients):", pd.Series(model_miss
 dem_df["subject"].nunique()
 
 # Filter dem_df to include only non-short subjects
-dem_df_features = dem_df[~dem_df["subject"].isin(fit_meta_df[fit_meta_df["short"] == True]["subject"])]
-dem_df_features["subject"].nunique()
+#dem_df_features = dem_df[~dem_df["subject"].isin(fit_meta_df[fit_meta_df["short"] == True]["subject"])]
+#dem_df_features["subject"].nunique()
 
 # Train-test split of subjects in dem_df
-train_df, test_df = train_test_split(dem_df_features[["subject", "subtype"]], test_size=0.2, stratify=dem_df_features["group"], random_state=42)
+train_df, test_df = train_test_split(dem_df[["subject", "subtype"]], test_size=0.2, stratify=dem_df["group"], random_state=42)
 
 # Extract features from selected subjects fitbit data for train set
 train_features = extr_fitbit_features(con, train_df)
-train_y = dem_df_features[dem_df_features["subject"].isin(train_features["subject"])]["group"]
+train_y = dem_df[dem_df["subject"].isin(train_features["subject"])][["subject", "group"]]
 
 # Extract features from selected subjects fitbit data for test set
 test_features = extr_fitbit_features(con, test_df)
-test_y = dem_df_features[dem_df_features["subject"].isin(test_features["subject"])][["subject", "group"]]
+test_y = dem_df[dem_df["subject"].isin(test_features["subject"])][["subject", "group"]]
 
 # Save features to CSV
 train_features.to_csv(os.path.join(output_path, "train_features.csv"), index=False)

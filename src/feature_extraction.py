@@ -570,8 +570,8 @@ def extr_fitbit_features(con, selected_subjects, overwrite=True):
                         daily_stats = daily_stats.ffill().bfill()
                     feature_dict.update(daily_stats.mean().to_dict())
                     # STL decomposition on the imputed daily aggregate series.
-                    try:
-                        for agg in ["mean", "std", "min", "max"]:
+                    for agg in ["mean", "std", "min", "max"]:
+                        try:
                             stl_input = daily_stats[f"{metric}_{agg}"].copy()
                             stl_input.index = pd.to_datetime(stl_input.index)
                             stl_input = stl_input.sort_index().asfreq("D")
@@ -592,8 +592,8 @@ def extr_fitbit_features(con, selected_subjects, overwrite=True):
                                 f"{metric}_{agg}_resid_max": result.resid.max(),
                             }
                             feature_dict.update(stl_features)
-                    except Exception as e:
-                        print(f"STL decomposition failed for subject {subject}, metric {metric}: {e}")
+                        except Exception as e:
+                            print(f"STL decomposition failed for subject {subject}, metric {metric}: {e}")
         features_list.append(feature_dict)
     fitbit_features_df = pd.DataFrame(features_list)
     # add subtype labels

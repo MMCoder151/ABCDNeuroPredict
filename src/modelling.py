@@ -122,7 +122,7 @@ def define_models():
                 ]),
                 {
                     "selector__fraction": [0.3, 0.5, 0.7],
-                    "clf__kernel": ["rbf", "poly", "sigmoid"],
+                    "clf__kernel": ["rbf", "sigmoid"],
                     "clf__C": [0.1, 1.0, 10.0],
                     "clf__gamma": ["scale", "auto", 0.01, 0.1],
                     "clf__class_weight": [None, "balanced"]

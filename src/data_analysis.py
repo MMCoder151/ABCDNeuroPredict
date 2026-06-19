@@ -247,52 +247,52 @@ def mri_clustering(selected_subjects, output_path = Path("output"), bootstrappin
     # TODO: Fix visualization
 
     # Reduce dimensionality for visualization if not already 2D
-    if X_dr.shape[1] > 2:
-        dr_vis = umap.UMAP(n_components=2, random_state=42)
-        X_dr_vis = dr_vis.fit_transform(X_dr)
-    else:        X_dr_vis = X_dr
+    #if X_dr.shape[1] > 2:
+    #    dr_vis = umap.UMAP(n_components=2, random_state=42)
+    #    X_dr_vis = dr_vis.fit_transform(X_dr)
+    #else:        X_dr_vis = X_dr
 
     # Create colored scatter plot of clusters in dimensionality reduction space
-    plt.figure(figsize=(10, 6))
-    for subtype in np.unique(selected_subjects["subtype"]):
-        subtype_data = X_dr_vis[selected_subjects["subtype"] == subtype]
-        plt.scatter(subtype_data[:, 0], subtype_data[:, 1], label=f"Subtype {subtype}", alpha=0.6)
-    plt.title("Clusters in Dimensionality Reduction Space")
-    plt.xlabel("Component 1")
-    plt.ylabel("Component 2")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(clustering_output_path, f"clusters_in_dr_space.png"))
-    plt.close()
+    #plt.figure(figsize=(10, 6))
+    #for subtype in np.unique(selected_subjects["subtype"]):
+    #    subtype_data = X_dr_vis[selected_subjects["subtype"] == subtype]
+    #    plt.scatter(subtype_data[:, 0], subtype_data[:, 1], label=f"Subtype {subtype}", alpha=0.6)
+    #plt.title("Clusters in Dimensionality Reduction Space")
+    #plt.xlabel("Component 1")
+    #plt.ylabel("Component 2")
+    #plt.legend()
+    #plt.tight_layout()
+    #plt.savefig(os.path.join(clustering_output_path, f"clusters_in_dr_space.png"))
+    #plt.close()
 
     # Create cluster profile plots for top 5 clusters
-    top_clusters = selected_subjects["subtype"].value_counts().index[:5]
-    for cluster in top_clusters:
-        cluster_profile = selected_subjects[selected_subjects["subtype"] == cluster].drop(columns=["subject_ids", "subtype"]).mean()
-        plt.figure(figsize=(10, 6))
-        cluster_profile.plot(kind="bar")
-        plt.title(f"Cluster {cluster} Profile")
-        plt.ylabel("Mean Z-score")
-        plt.xticks(rotation=45, ha="right")
-        plt.tight_layout()
-        plt.savefig(os.path.join(clustering_output_path, f"cluster_{cluster}_profile.png"))
-        plt.close()
+    #top_clusters = selected_subjects["subtype"].value_counts().index[:5]
+    #for cluster in top_clusters:
+    #    cluster_profile = selected_subjects[selected_subjects["subtype"] == cluster].drop(columns=["subject_ids", "subtype"]).mean()
+    #    plt.figure(figsize=(10, 6))
+    #    cluster_profile.plot(kind="bar")
+    #    plt.title(f"Cluster {cluster} Profile")
+    #    plt.ylabel("Mean Z-score")
+    #    plt.xticks(rotation=45, ha="right")
+    #    plt.tight_layout()
+    #    plt.savefig(os.path.join(clustering_output_path, f"cluster_{cluster}_profile.png"))
+    #    plt.close()
 
     # Create cluster centoroid plots in dimensionality reduction space
-    plt.figure(figsize=(10, 6))
-    centroids = (
-        pd.DataFrame(X_dr_vis)
-        .groupby(selected_subjects["subtype"])
-        .mean()
-    )   
-    plt.scatter(centroids[0], centroids[1], s=200, marker="X")
-    plt.title("Cluster Centroids in Dimensionality Reduction Space")
-    plt.xlabel("Component 1")
-    plt.ylabel("Component 2")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(clustering_output_path, f"cluster_centroids_in_dr_space.png"))
-    plt.close()
+    #plt.figure(figsize=(10, 6))
+    #centroids = (
+    #    pd.DataFrame(X_dr_vis)
+    #    .groupby(selected_subjects["subtype"])
+    #    .mean()
+    #)   
+    #plt.scatter(centroids[0], centroids[1], s=200, marker="X")
+    #plt.title("Cluster Centroids in Dimensionality Reduction Space")
+    #plt.xlabel("Component 1")
+    #plt.ylabel("Component 2")
+    #plt.legend()
+    #plt.tight_layout()
+    #plt.savefig(os.path.join(clustering_output_path, f"cluster_centroids_in_dr_space.png"))
+    #plt.close()
 
     return selected_subjects
 

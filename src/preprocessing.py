@@ -355,34 +355,51 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
         return con
     
     # Combine fitbit files for each INCLUDED subject and timepoint into a single parquet file based on datetime index
-    for _, row in tqdm(fit_meta_df.iterrows(), total=len(fit_meta_df), desc="Combining Fitbit files"):
-        subject = row["subject"]
-        timepoint = row["timepoint"]
-        filepath = row["filepath"]
+    for (subject, timepoint), group in tqdm(
+        fit_meta_df.groupby(["subject", "timepoint"]),
+        total=fit_meta_df.groupby(["subject", "timepoint"]).ngroups,
+        desc="Combining Fitbit files",
+        ):
+        combined_df = None
 
-        # Read the fitbit file
-        fit_df = _load_fitbit_df(filepath)
+        for _, row in group.iterrows():
+            filepath = row["filepath"]
 
-        # Recode fitbit data
-        fit_df = _recode_fitbit_data(fit_df)
+            # Read the fitbit file
+            fit_df = _load_fitbit_df(filepath)
 
-        value_cols = [
-            col for col in fit_df.columns
-            if col != "Wear_Time" and fit_df[col].notna().any()
-        ]
-        if not value_cols:
+            # Recode fitbit data
+            fit_df = _recode_fitbit_data(fit_df)
+
+            value_cols = [
+                col for col in fit_df.columns
+                if col != "Wear_Time" and fit_df[col].notna().any()
+            ]
+            if not value_cols:
+                continue
+
+            # Extract metric name from filename (e.g., "Cal1m", "HR1m", etc.) and rename value columns
+            # to include metric name for easier identification after merging
+            stem = Path(filepath).stem
+            metric_name = stem.split("task-fitb", 1)[1].split("_", 1)[0]
+            fit_df = fit_df[["Wear_Time", *value_cols]].rename(
+                columns={col: f"{col}_{metric_name}" for col in value_cols}
+            )
+
+            # Merge into the running combined frame for this subject-timepoint, aligning on Wear_Time.
+            # Outer join so metrics with differing timestamp coverage don't drop each other's rows.
+            if combined_df is None:
+                combined_df = fit_df
+            else:
+                combined_df = combined_df.merge(fit_df, on="Wear_Time", how="outer")
+
+        # Skip if no file in this group contributed any data
+        if combined_df is None:
             continue
 
-        # Extract metric name from filename (e.g., "Cal1m", "HR1m", etc.) and rename value columns to include metric name for easier identification after merging
-        stem = Path(filepath).stem
-        metric_name = stem.split("task-fitb", 1)[1].split("_", 1)[0]
-        fit_df = fit_df[["Wear_Time", *value_cols]].rename(
-            columns={col: f"{col}_{metric_name}" for col in value_cols}
-        )
-
         # Add subject and timepoint columns
-        fit_df["subject"] = subject
-        fit_df["timepoint"] = timepoint
+        combined_df["subject"] = subject
+        combined_df["timepoint"] = timepoint
 
         # Define output path for combined parquet file
         subject_dir = output_dir_fit / f"{subject}"
@@ -391,14 +408,14 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
         output_file = timepoint_dir / "combined_fitbit.parquet"
 
         # Save combined dataframe as parquet file aligned on Wear_Time (overwrites existing files)
-        fit_df.to_parquet(output_file, index=False)
-    
-    # Get MRI ROIs and files to import
-    mri_files, mri_rois_dict = mri_rois()
+        combined_df.sort_values("Wear_Time").to_parquet(output_file, index=False)
+        
+        # Get MRI ROIs and files to import
+        mri_files, mri_rois_dict = mri_rois()
 
-    # Accumulate MRI data for each subject-timepoint across all phenotype files
-    mri_data_accumulator = {}  # {(subject, timepoint): {columns from all files}}
-    
+        # Accumulate MRI data for each subject-timepoint across all phenotype files
+        mri_data_accumulator = {}  # {(subject, timepoint): {columns from all files}}
+        
     # Extract MRI data for each subject and timepoint and accumulate across all files
     for file in tqdm(mri_files, total=len(mri_files), desc="Processing MRI phenotype files"):
         mri_df = pd.read_csv(dta_path / "phenotype" / file, sep="\t")
