@@ -5,7 +5,7 @@ from src.feature_extraction import *
 from src.data_analysis import *
 from src.modelling import *
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LogisticRegression, LinearRegression
 
 # Set data directory paths
 dta_path = Path.home() / "dairc" / "rawdata"
@@ -24,9 +24,9 @@ dem_df, mri_meta_df, fit_meta_df = filter_subjects(dta_path, test=False, overwri
 describe_subjects(fit_meta_df, mri_meta_df)
 
 # Transform data to make it easier to query with DuckDB
-con = setup_duckdb(dta_path, fit_meta_df, overwrite=True)
+con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
 
-# ---- DATA ANALYSIS ----
+# ---- DATA ANALYSIS MRI ----
 
 # NORMATIVE SELECTION OF MRI DATA
 # Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
@@ -66,68 +66,92 @@ model_cluster.fit(X_cluster, y_cluster)
 print("Cluster association with age (coefficients):", pd.Series(model_cluster.coef_, index=X_cluster.columns))
 
 # MISSINGNESS ANALYSIS
-# Calculate association of missingness in fitbit data with group using linear regression
+# Calculate association of missingness in fitbit data with group using logistic regression 
 missingness_df = fit_meta_df[["subject", "missing_days_percentage"]].merge(dem_df[["subject", "group"]], on="subject")
 missingness_df[["group"]].nunique()  # Check unique values in group column
 X_missingness = missingness_df[["group"]]
 y_missingness = missingness_df["missing_days_percentage"]
-model_missingness = LinearRegression()
+model_missingness = LogisticRegression()
 model_missingness.fit(X_missingness, y_missingness)
 print("Missingness association with group (coefficients):", pd.Series(model_missingness.coef_, index=X_missingness.columns))
 
-# ---- FEATURE EXTRACTION ----
+# ---- FITBIT FEATURE EXTRACTION ----
 
-dem_df["subject"].nunique()
+# TODO: Test changes!!!
 
-# Filter dem_df to include only non-short subjects
-#dem_df_features = dem_df[~dem_df["subject"].isin(fit_meta_df[fit_meta_df["short"] == True]["subject"])]
-#dem_df_features["subject"].nunique()
+# Extract features from fitbit data
+fitbit_features_df = extr_fitbit_features(con, dem_df)
 
-# Train-test split of subjects in dem_df
-train_df, test_df = train_test_split(dem_df[["subject", "subtype"]], test_size=0.2, stratify=dem_df["group"], random_state=42)
+# save extracted features to CSV
+fitbit_features_df.to_csv(os.path.join(output_path, "fitbit_features.csv"), index=False)
 
-# Extract features from selected subjects fitbit data for train set
-train_features = extr_fitbit_features(con, train_df)
-train_y = dem_df[dem_df["subject"].isin(train_features["subject"])][["subject", "group"]]
+# OPTIONAL: Reimport extracted features from CSV for analysis and modeling
+fitbit_features_df = pd.read_csv(os.path.join(output_path, "fitbit_features.csv"))
 
-# Extract features from selected subjects fitbit data for test set
-test_features = extr_fitbit_features(con, test_df)
-test_y = dem_df[dem_df["subject"].isin(test_features["subject"])][["subject", "group"]]
+# Analyse feature colinearity using Variance Inflation Factor (VIF) and create composite scores to account for multicollinearity
+fitbit_features_with_composites, composite_dict = create_composites(fitbit_features_df)
+
+# Save to CSV
+fitbit_features_with_composites.to_csv(os.path.join(output_path, "fitbit_features_with_composites.csv"), index=False)
+composite_df = pd.DataFrame({
+    "composite_name": list(composite_dict.keys()),
+    "features_included": [", ".join(features) for features in composite_dict.values()]
+})
+composite_df.to_csv(os.path.join(output_path, "composite_dictionary.csv"), index=False)
+
+# Add sex and age to selected_subjects_with_composites for modeling
+features = fitbit_features_with_composites.merge(dem_df[["subject", "sex", "age_at_first_mri"]], left_on="subject", right_on="subject", how="left")
+features["sex"] = features["sex"].map({"M": 0, "F": 1})
+features["sex"] = features["sex"].astype(np.float64)
+features["age_at_first_mri"] = features["age_at_first_mri"].astype(np.float64)
+
+if ["subtype"] not in features.columns:
+    features = features.merge(dem_df[["subject", "subtype"]], left_on="subject", right_on="subject", how="left")
+
+# RESIDUALIZATION OF FITBIT FEATURES
+# Residualize fitbit features for age and sex effects to match the MRI normative modeling approach
+# TODO: Implement
+
+# Conduct confound analysis of fitbit features pre and post residualization
+# TODO: Implement
+
+# Train-test split of extracted features
+train_X, test_X = train_test_split(features, test_size=0.2, stratify=dem_df["group"], random_state=42)
+
+# Create labels for train and test sets
+train_y = dem_df[dem_df["subject"].isin(train_X["subject"])][["subject", "group"]]
+test_y = dem_df[dem_df["subject"].isin(test_X["subject"])][["subject", "group"]]
 
 # Save features to CSV
-train_features.to_csv(os.path.join(output_path, "train_features.csv"), index=False)
-test_features.to_csv(os.path.join(output_path, "test_features.csv"), index=False)
+train_X.to_csv(os.path.join(output_path, "train_features.csv"), index=False)
+test_X.to_csv(os.path.join(output_path, "test_features.csv"), index=False)
 train_y.to_csv(os.path.join(output_path, "train_labels.csv"), index=False)
 test_y.to_csv(os.path.join(output_path, "test_labels.csv"), index=False)
 
 # OPTIONAL: Reimport features and labels from CSV for modeling
-train_features = pd.read_csv(os.path.join(output_path, "train_features.csv"))
-test_features = pd.read_csv(os.path.join(output_path, "test_features.csv"))
+train_X = pd.read_csv(os.path.join(output_path, "train_features.csv"))
+test_X = pd.read_csv(os.path.join(output_path, "test_features.csv"))
 train_y = pd.read_csv(os.path.join(output_path, "train_labels.csv"))
 test_y = pd.read_csv(os.path.join(output_path, "test_labels.csv"))
 
-# Analyse feature colinearity using Variance Inflation Factor (VIF)
-# TODO: Implement
-
-# Create feature composites
-# TODO: Implement
-
-# ---- DATA ANALYSIS #2 ----
+# ---- DATA ANALYSIS FITBIT ----
 
 # NORMATIVE SELECTION OF FITBIT DATA
 # Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
-# TODO: Implement
+selected_fitbit_subjects = normative_selection_fitbit(dem_df, fitbit_features_with_composites, overwrite=True)
 
 # Conduct confound analysis pre and post normative modeling
 # TODO: Implement
 
-# Calculate group overlap with selected subjects from MRI normative modeling
-# TODO: Implement
+# Calculate overlap of normative selected fitbit subjects with selected subjects from MRI normative modeling
+overlap_subjects = set(selected_subjects["subject_ids"]).intersection(set(selected_fitbit_subjects["subject_ids"]))
+print(f"Number of subjects selected by both MRI and fitbit normative modeling: {len(overlap_subjects)}")
+print(f"Overlap percentage: {len(overlap_subjects) / len(selected_subjects) * 100:.2f}%")
 
 # ---- MODELING ----
 
 cv_logreg = train_and_evaluate_models(
-    train_features.drop(columns=["subject"]), 
+    train_X.drop(columns=["subject"]), 
     (train_y.drop(columns=["subject"])).squeeze(), 
     search="random", 
     outer_splits=10, 
@@ -136,7 +160,7 @@ cv_logreg = train_and_evaluate_models(
     )
 
 cv_svm = train_and_evaluate_models(
-    train_features.drop(columns=["subject"]), 
+    train_X.drop(columns=["subject"]), 
     (train_y.drop(columns=["subject"])).squeeze(), 
     search="random", 
     outer_splits=10, 
@@ -145,7 +169,7 @@ cv_svm = train_and_evaluate_models(
     )
 
 cv_rf = train_and_evaluate_models(
-    train_features.drop(columns=["subject"]), 
+    train_X.drop(columns=["subject"]), 
     (train_y.drop(columns=["subject"])).squeeze(), 
     search="random", 
     outer_splits=10, 
@@ -154,7 +178,7 @@ cv_rf = train_and_evaluate_models(
     )
 
 cv_lightgbm = train_and_evaluate_models(
-    train_features.drop(columns=["subject"]), 
+    train_X.drop(columns=["subject"]), 
     (train_y.drop(columns=["subject"])).squeeze(), 
     search="random", 
     outer_splits=10, 

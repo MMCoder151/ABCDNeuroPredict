@@ -307,6 +307,9 @@ def filter_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
     mri_meta_df.drop_duplicates(subset=["subject", "timepoint"], inplace=True)
     demo_df.drop_duplicates(subset=["subject"], inplace=True)
 
+    # Add age at MRI to dem_df for first timepoint
+    demo_df["age_at_first_mri"] = demo_df["subject"].map(mri_meta_df.groupby("subject")["age_at_mri"].min())
+
     print(f"Final number of subjects included after filtering: {demo_df['subject'].nunique()}")
 
     # save metadata to csv

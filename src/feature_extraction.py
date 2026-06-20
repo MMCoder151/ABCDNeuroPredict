@@ -450,50 +450,139 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
 
     return selected_subjects
 
-def create_mri_composites(selected_subjects):
-    '''
-    This function creates composite scores out of selected subject's z-scores based on 
-    variance inflation factors (VIF) to account for multicollinearity between MRI ROIs.
-
+def create_composites(selected_subjects, vif_threshold=10, max_iterations=200):
+    """
+    Creates composite scores out of given variables based on variance inflation factors (VIF).
+ 
     Parameters:
-        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their
+            MRI ROI data and respective z-scores
+        vif_threshold (float): VIF value above which a variable triggers compositing
+        max_iterations (int): safety cap so a degenerate case can't loop forever
+ 
     Returns:
-        composite_scores_df (DataFrame): DataFrame containing the selected subjects and their composite scores based on the selected MRI ROIs
-        composite_dict (dict): Dictionary mapping composite score names to the MRI ROIs included in each composite
-    '''
-
-    # Get MRI ROIs to include in the normative model
-    _, mri_rois_dict = mri_rois()
-    mri_roi_cols = list(mri_rois_dict.keys())
-
-    # Calculate variance inflation factors (VIF) for the selected MRI ROIs
-    vif_data = selected_subjects[mri_roi_cols].dropna()
-    vif_df = pd.DataFrame({
-        "mri_roi": vif_data.columns,
-        "vif": [variance_inflation_factor(vif_data.values, i) for i in range(vif_data.shape[1])]
-    }).sort_values("vif", ascending=False)
-    vif_df.head()
-
-    # Replace variables with a vif above 10 with their average until all variables have a vif below 10
+        selected_subjects (DataFrame): DataFrame with high-VIF columns replaced by composites
+        composite_dict (dict): Maps composite score name -> list of *original* base columns
+                                that were averaged together to build it (flattened, not nested)
+    """
+    vif_cols = [
+        col for col in selected_subjects.columns
+        if col not in ["subject", "composite_z", "Wear_Time", "subtype", "group"]
+    ]
+ 
+    # Drop zero-variance columns (VIF undefined for these)
+    variances = selected_subjects[vif_cols].var()
+    zero_variance_cols = variances[variances == 0].index.tolist()
+    if zero_variance_cols:
+        print(f"Dropping columns with zero variance: {len(zero_variance_cols)}")
+        print(zero_variance_cols)
+        vif_cols = [c for c in vif_cols if c not in zero_variance_cols]
+ 
+    vif_data = selected_subjects[vif_cols].dropna()
+ 
+    # Snapshot of original values, indexed the same as vif_data, used so we can always
+    # average from true base columns even after they've been dropped from selected_subjects.
+    original_values = vif_data.copy()
+ 
+    # composite_dict maps a SHORT composite id -> flattened list of original base columns.
+    # base_members maps current-column-name -> flattened list of original base columns,
+    # for every column currently alive in vif_data (whether original or composite).
     composite_dict = {}
-    while vif_df["vif"].max() > 10:
-        # Get the variable with the highest VIF
-        high_vif_roi = vif_df.iloc[0]["mri_roi"]
-        # Create a composite score by averaging this variable with the variable it is most correlated with
-        correlations = vif_data.corr()[high_vif_roi].drop(high_vif_roi).abs()
-        most_correlated_roi = correlations.idxmax()
-        composite_name = f"composite_{high_vif_roi}_{most_correlated_roi}"
-        selected_subjects[composite_name] = selected_subjects[[high_vif_roi, most_correlated_roi]].mean(axis=1)
-        composite_dict[composite_name] = [high_vif_roi, most_correlated_roi]
-        # Drop the original variable with high VIF from the data used to calculate VIFs in the next iteration
-        vif_data = vif_data.drop(columns=[high_vif_roi])
-        # Recalculate VIFs
-        vif_df = pd.DataFrame({
-            "mri_roi": vif_data.columns,
-            "vif": [variance_inflation_factor(vif_data.values, i) for i in range(vif_data.shape[1])]
+    base_members = {col: [col] for col in vif_data.columns}
+    composite_counter = 0
+ 
+    def vif_table(df):
+        return pd.DataFrame({
+            "variable": df.columns,
+            "vif": [variance_inflation_factor(df.values, i) for i in range(df.shape[1])]
         }).sort_values("vif", ascending=False)
-    print(f"Composites created: {composite_dict}")
-
+ 
+    vif_df = vif_table(vif_data)
+ 
+    iterations = 0
+    while vif_df["vif"].max() > vif_threshold and iterations < max_iterations:
+        iterations += 1
+ 
+        high_vif_col = vif_df.iloc[0]["variable"]
+ 
+        correlations = vif_data.corr()[high_vif_col].drop(high_vif_col).abs()
+        if correlations.empty:
+            # Nothing left to pair with — stop rather than crash
+            break
+        most_correlated_col = correlations.idxmax()
+ 
+        # Short, stable, human-readable name — does NOT concatenate ancestry
+        composite_counter += 1
+        composite_name = f"composite_{composite_counter}"
+ 
+        # Flattened provenance: original base variables in both parents, deduped,
+        # order-preserved
+        merged_members = []
+        for c in base_members[high_vif_col] + base_members[most_correlated_col]:
+            if c not in merged_members:
+                merged_members.append(c)
+ 
+        print(
+            f"Created {composite_name} from '{high_vif_col}' + '{most_correlated_col}' "
+            f"(VIF={vif_df.iloc[0]['vif']:.1f}, corr={correlations.max():.3f}) "
+            f"-> {len(merged_members)} base vars: {merged_members}"
+        )
+ 
+        # Average from the ORIGINAL base columns (not from intermediate composites),
+        # so a variable's influence on the final composite doesn't depend on which
+        # merge order it happened to go through. We must read these from the
+        # `original_values` snapshot taken before the loop started, because by this
+        # point some of `merged_members` may already have been dropped from
+        # `selected_subjects` in an earlier iteration (folded into a prior composite).
+        # NOTE: `original_values` only has rows that survived the initial dropna() for
+        # VIF purposes, so this assignment will introduce NaN in `selected_subjects`
+        # for any row that had a NaN in ANY vif_col originally. If you need composite
+        # scores for those rows too, compute composites on a per-pair basis from
+        # selected_subjects directly instead (see alternative below).
+        selected_subjects[composite_name] = original_values[merged_members].mean(axis=1)
+ 
+        composite_dict[composite_name] = merged_members
+ 
+        # Drop the two parent columns, register the new composite
+        selected_subjects.drop(columns=[high_vif_col, most_correlated_col], inplace=True, errors="ignore")
+        vif_data = vif_data.drop(columns=[high_vif_col, most_correlated_col])
+        vif_data[composite_name] = selected_subjects[composite_name]
+ 
+        base_members.pop(high_vif_col, None)
+        base_members.pop(most_correlated_col, None)
+        base_members[composite_name] = merged_members
+ 
+        vif_df = vif_table(vif_data)
+ 
+    if iterations >= max_iterations:
+        print(f"Stopped after hitting max_iterations={max_iterations}; "
+              f"remaining max VIF = {vif_df['vif'].max():.1f}")
+ 
+    selected_subjects = selected_subjects.copy()  # defragment
+ 
+    # composite_dict can still contain entries for intermediate composites that were
+    # absorbed into a later, larger composite (e.g. composite_1 -> [A, B] got folded
+    # into composite_2 -> [A, B, C]). The composite_1 *column* is already gone from
+    # selected_subjects at this point — it was dropped the moment it got merged — but
+    # the dict entry lingers as a bookkeeping artifact. Prune any entry whose member
+    # set is a strict subset of another entry's member set, since it no longer
+    # corresponds to an actual column and is purely redundant provenance info.
+    obsolete = set()
+    for name_a, members_a in composite_dict.items():
+        set_a = set(members_a)
+        for name_b, members_b in composite_dict.items():
+            if name_a == name_b:
+                continue
+            if set_a < set(members_b):  # strict subset
+                obsolete.add(name_a)
+                break
+    for name in obsolete:
+        composite_dict.pop(name)
+ 
+    print(f"\nComposites created: {len(composite_dict)}")
+    for name, members in composite_dict.items():
+        print(f"  {name}: {members}")
+ 
     return selected_subjects, composite_dict
 
 def extr_fitbit_features(con, selected_subjects, overwrite=True):
@@ -605,3 +694,127 @@ def extr_fitbit_features(con, selected_subjects, overwrite=True):
     )
 
     return fitbit_features_df
+
+def normative_selection_fitbit(dem_df, fitbit_features, output_path = Path("output"), overwrite=True):
+    '''
+    This function performs normative selection on the fitbit features to test overlap with the MRI normative modeling.
+    Parameters:
+        dem_df (DataFrame): DataFrame containing demographic information for each subject
+        fitbit_features (DataFrame): DataFrame containing the extracted fitbit features for each subject
+        output_path (Path): Path to the output directory where the normative model results will be saved
+    Returns:
+        selected_fitbit_subjects (DataFrame): DataFrame containing the selected subjects based on normative modeling of fitbit features
+        normative_modelling_fitbit (Folder): Folder containing the normative model, results, and plots created in the output directory for fitbit features
+    '''
+    if overwrite == False:
+        print("Normative modeling and subject selection for fitbit features skipped (overwrite=False). To re-run normative modeling and subject selection for fitbit features, set overwrite=True.")
+        try:
+            selected_fitbit_subjects = pd.read_csv(Path(output_path) / "normative_modelling_fitbit" / "results" / "selected_fitbit_subjects.csv")
+            return selected_fitbit_subjects
+        except Exception as e:
+            print(f"Error loading selected subjects: {e}")
+            print("Please check that the selected_fitbit_subjects.csv file exists in the normative_modelling_fitbit results directory and is correctly formatted.")
+            raise e
+
+    # get columns to model
+    model_cols = [col for col in fitbit_features.columns if col not in ["subject", "subtype"]]
+
+    # Merge fitbit features with demographic data to get age, sex and scan site
+    df = fitbit_features.merge(
+        dem_df[["subject", "age_at_first_mri", "sex", "scan_site"]].drop_duplicates(),
+        left_on="subject",
+        right_on="subject",
+        how="inner"
+    )
+
+    # Encode sex explicitly so F/M map to 1/2 before passing data to NormData.
+    sex_map = {'F': 1, 'M': 2}
+    if not pd.api.types.is_numeric_dtype(df['sex']):
+        sex_values = df['sex'].astype('string').str.strip().str.upper()
+        mapped_sex = sex_values.map(sex_map)
+        if mapped_sex.isna().any():
+            unexpected_values = sorted(sex_values[mapped_sex.isna()].dropna().unique().tolist())
+            raise ValueError(
+                f"Unmapped sex values found: {unexpected_values}. Expected F/M or numeric input."
+            )
+        df['sex'] = mapped_sex.astype('Int64')
+
+    df['sex'] = pd.to_numeric(df['sex'], errors='raise').astype(float)
+    df['age_at_first_mri'] = pd.to_numeric(df['age_at_first_mri'], errors='raise').astype(float)
+    df['subject'] = df['subject'].astype(str)
+
+    # Encode scan site
+    df, site_dummy_cols, _ = _one_hot_encode_scan_site(df)
+
+    # Prepare data for normative modeling
+    data = NormData.from_dataframe(
+        name="fitbit_norm",
+        dataframe=df,
+        covariates=["sex", "age_at_first_mri"] + site_dummy_cols,
+        response_vars=model_cols,
+        subject_ids="subject",
+        remove_Nan=True,
+    )
+
+    # setup normative model
+    normative_output_dir = Path(output_path) / "normative_modelling_fitbit"
+    if not normative_output_dir.exists():
+        normative_output_dir.mkdir(parents=True)
+    normative_output_dir_str = str(normative_output_dir)
+
+    # setup normative model
+    model = NormativeModel(
+        BLR(),
+        savemodel=True,
+        evaluate_model=True,
+        saveresults=True,
+        saveplots=False,
+        save_dir=normative_output_dir_str,
+        inscaler="standardize",
+        outscaler="standardize",
+        )
+    model.fit(data)
+
+    # Read in z-score file from normative modeling 
+    centiles_df = pd.read_csv(normative_output_dir / "results" / "Z_fitbit_norm.csv")
+    # Calculate composite absolute z-score across all fitbit features for each subject
+    centiles_df["composite_z"] = centiles_df[model_cols].abs().sum(axis=1)
+    subject_scores = (
+        centiles_df[["subject_ids", "composite_z"]]
+        .dropna()
+        .drop_duplicates(subset=["subject_ids"])
+        .sort_values("composite_z")
+        .reset_index(drop=True)
+    )
+    subject_scores["subject_ids"].nunique()
+    subject_scores["rank"] = np.arange(len(subject_scores))
+    # Select top 10% of subjects with the highest composite z-score based on ranked prevalence
+    n_select = int(np.ceil(0.10 * len(subject_scores)))
+    selected_subject_ids = subject_scores.nlargest(n_select, "composite_z")["subject_ids"]
+    selected_fitbit_subjects = subject_scores[subject_scores["subject_ids"].isin(selected_subject_ids)]
+
+    print(f"Selected {len(selected_subject_ids)} subjects with the highest composite z-scores based on a prevalence threshold of 10%.")
+    selected_fitbit_subjects.to_csv(normative_output_dir / "results" / "selected_fitbit_subjects.csv", index=False)
+
+    # Create summary table with mean, std, min, and max per mri_roi for the selected subjects
+    stats_selected = (
+        centiles_df[model_cols]
+        .agg(['mean', 'std', 'min', 'max'])
+        .transpose()
+        .reset_index()
+        .rename(columns={"index": "mri_roi"})
+    )
+    stats_selected.to_csv(normative_output_dir / "results" / "mri_roi_statistics.csv", index=False)
+
+    # Create results summary table with mean, std, min, and max per metric
+    stats_df = pd.read_csv(normative_output_dir / "results" / "statistics_mri_norm.csv")
+    summary = stats_df.assign(
+        mean = stats_df[model_cols].mean(axis=1),
+        std  = stats_df[model_cols].std(axis=1),
+        min  = stats_df[model_cols].min(axis=1),
+        max  = stats_df[model_cols].max(axis=1),
+    )[["statistic", "mean", "std", "min", "max"]]
+    summary.to_csv(normative_output_dir / "results" / "statistics_summary.csv", index=False)
+
+    return selected_fitbit_subjects
+
