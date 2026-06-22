@@ -33,7 +33,8 @@ con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
 selected_subjects = normative_selection(con, mri_meta_df, overwrite=False)
 
 # Conduct confound analysis pre and post normative modeling
-confound_effects_df = analyse_confounds(con, dem_df, mri_meta_df)
+z_scores = pd.read_csv(os.path.join(output_path, "normative_modelling", "results","Z_mri_norm.csv"))
+confound_effects_df = analyse_confounds(dem_df, z_scores, con = con, view = "mri_data")
 
 # Print descriptive statistics of normative selected subjects
 selected_fit_meta_df = fit_meta_df[fit_meta_df["subject"].isin(selected_subjects["subject_ids"])]
@@ -77,8 +78,6 @@ print("Missingness association with group (coefficients):", pd.Series(model_miss
 
 # ---- FITBIT FEATURE EXTRACTION ----
 
-# TODO: Test changes!!!
-
 # Extract features from fitbit data
 fitbit_features_df = extr_fitbit_features(con, dem_df)
 
@@ -99,23 +98,20 @@ composite_df = pd.DataFrame({
 })
 composite_df.to_csv(os.path.join(output_path, "composite_dictionary.csv"), index=False)
 
+# OPTIONAL: Reimport features with composites from CSV for analysis and modeling
+fitbit_features_with_composites = pd.read_csv(os.path.join(output_path, "fitbit_features_with_composites.csv"))
+composite_df = pd.read_csv(os.path.join(output_path, "composite_dictionary.csv"))
+
 # Add sex and age to selected_subjects_with_composites for modeling
 features = fitbit_features_with_composites.merge(dem_df[["subject", "sex", "age_at_first_mri"]], left_on="subject", right_on="subject", how="left")
 features["sex"] = features["sex"].map({"M": 0, "F": 1})
 features["sex"] = features["sex"].astype(np.float64)
 features["age_at_first_mri"] = features["age_at_first_mri"].astype(np.float64)
 
-if ["subtype"] not in features.columns:
+if "subtype" not in features.columns:
     features = features.merge(dem_df[["subject", "subtype"]], left_on="subject", right_on="subject", how="left")
 
-# RESIDUALIZATION OF FITBIT FEATURES
-# Residualize fitbit features for age and sex effects to match the MRI normative modeling approach
-# TODO: Implement
-
-# Conduct confound analysis of fitbit features pre and post residualization
-# TODO: Implement
-
-# Train-test split of extracted features
+# TRAIN-TEST SPLIT
 train_X, test_X = train_test_split(features, test_size=0.2, stratify=dem_df["group"], random_state=42)
 
 # Create labels for train and test sets
@@ -141,12 +137,26 @@ test_y = pd.read_csv(os.path.join(output_path, "test_labels.csv"))
 selected_fitbit_subjects = normative_selection_fitbit(dem_df, fitbit_features_with_composites, overwrite=True)
 
 # Conduct confound analysis pre and post normative modeling
-# TODO: Implement
+z_scores_fitbit = pd.read_csv(os.path.join(output_path, "normative_modelling_fitbit", "results","Z_fitbit_norm.csv"))
+confound_effects_fitbit_df = analyse_confounds(dem_df, z_scores_fitbit, raw_data = fitbit_features_with_composites)
 
 # Calculate overlap of normative selected fitbit subjects with selected subjects from MRI normative modeling
 overlap_subjects = set(selected_subjects["subject_ids"]).intersection(set(selected_fitbit_subjects["subject_ids"]))
 print(f"Number of subjects selected by both MRI and fitbit normative modeling: {len(overlap_subjects)}")
 print(f"Overlap percentage: {len(overlap_subjects) / len(selected_subjects) * 100:.2f}%")
+
+# RESIDUALIZATION OF FITBIT FEATURES
+# Fit residualization models on training data to remove confounding effects of age and sex
+models = fit_residualiser(train_X, dem_df.loc[train_X.index])
+
+train_X.columns.nunique()
+
+# Apply residualization to training and test data
+train_X_residualized = apply_residualiser(train_X, models)
+test_X_residualized = apply_residualiser(test_X, models)
+
+# Conduct confound analysis of fitbit features pre and post residualization
+# TODO: Implement
 
 # ---- MODELING ----
 
