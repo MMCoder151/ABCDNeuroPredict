@@ -155,8 +155,12 @@ train_X.columns.nunique()
 train_X_residualized = apply_residualiser(train_X, models)
 test_X_residualized = apply_residualiser(test_X, models)
 
+# Save to csv
+train_X_residualized.to_csv(os.path.join(output_path, "train_features_residualized.csv"), index=False)
+test_X_residualized.to_csv(os.path.join(output_path, "test_features_residualized.csv"), index=False)
+
 # Conduct confound analysis of fitbit features pre and post residualization
-# TODO: Implement
+confound_effects_residualized_df = analyse_confounds(dem_df, train_X_residualized, raw_data = train_X)
 
 # ---- MODELING ----
 

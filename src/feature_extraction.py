@@ -880,6 +880,9 @@ def fit_residualiser(X_train, dem_df):
     Fit a GPR per feature on TRAINING data only.
     Covariates: age (continuous) + sex (dummy-coded).
     '''
+    X_train.dropna(inplace=True)
+    X_train.drop(columns=["subject", "subtype"], inplace=True, errors="ignore")
+
     # drop columns with zero variance
     variances = X_train.var()
     zero_variance_cols = variances[variances == 0].index.tolist()
@@ -887,9 +890,6 @@ def fit_residualiser(X_train, dem_df):
         print(f"Dropping columns with zero variance from residualisation: {len(zero_variance_cols)}")
         print(zero_variance_cols)
         X_train = X_train.drop(columns=zero_variance_cols, errors="ignore")
-
-    X_train.drop(columns=["subject", "subtype"], inplace=True, errors="ignore")
-    X_train.dropna(inplace=True)
 
     age_train = dem_df.loc[X_train.index, "age_at_first_mri"].values.reshape(-1, 1)
     sex_train = pd.get_dummies(dem_df.loc[X_train.index, "sex"], drop_first=True).values
