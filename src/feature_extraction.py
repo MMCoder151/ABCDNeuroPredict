@@ -78,6 +78,12 @@ def analyse_confounds(dem_df, transformed_data, output_path=pathlib.Path("output
                 "sex", "scan_site"]
     raw_analysis_cols = [col for col in raw_data.columns if col not in exclude_cols]
     transformed_analysis_cols = [col for col in transformed_data.columns if col not in exclude_cols]
+
+    if "subject_ids" in transformed_data.columns:
+        transformed_data.rename(columns={"subject_ids": "subject"}, inplace=True)
+    if "subject_ids" in raw_data.columns:
+        raw_data.rename(columns={"subject_ids": "subject"}, inplace=True)
+
     # Check that analysis_cols match in both raw and transformed data
     if not set(raw_analysis_cols).issubset(set(transformed_analysis_cols)):
         print(f"Error: Columns do not match between raw and transformed data.")
@@ -89,11 +95,11 @@ def analyse_confounds(dem_df, transformed_data, output_path=pathlib.Path("output
     # Merge z_scores_df with demographic data to get age, sex and scan_site for each subject
     transformed_data = transformed_data.merge(
         dem_df[["subject", "age_at_first_mri", "sex", "scan_site"]].drop_duplicates(),
-        left_on="subject_ids",
+        left_on="subject",
         right_on="subject",
         how="inner"
     )
-    transformed_data.drop(columns=["subject_ids"], inplace=True)
+    transformed_data.drop(columns=["subject"], inplace=True)
 
     # Merge raw data with demographic data to get age, sex and scan_site for each subject
     raw_data = raw_data.merge(
@@ -881,7 +887,9 @@ def fit_residualiser(X_train, dem_df):
     Covariates: age (continuous) + sex (dummy-coded).
     '''
     X_train.dropna(inplace=True)
-    X_train.drop(columns=["subject", "subtype"], inplace=True, errors="ignore")
+    columns_to_drop = ["subject", "subtype", "age_at_first_mri", "sex"]
+    columns_to_drop = [c for c in columns_to_drop if c in X_train.columns]
+    X_train = X_train.drop(columns=columns_to_drop, errors="ignore")
 
     # drop columns with zero variance
     variances = X_train.var()
@@ -909,12 +917,29 @@ def apply_residualiser(models, X, dem_df):
     '''
     Apply the fitted GPR residualiser to new data (e.g. test set).
     '''
+
+    X.dropna(inplace=True)
+    columns_to_drop = ["subject", "subtype", "age_at_first_mri", "sex"]
+    columns_to_drop = [c for c in columns_to_drop if c in X.columns]
+    dropped_cols_df = X[columns_to_drop].copy() if dropped_cols_df is None else dropped_cols_df
+    X = X.drop(columns=columns_to_drop, errors="ignore")
+
+    # drop columns with zero variance
+    variances = X.var()
+    zero_variance_cols = variances[variances == 0].index.tolist()
+    if zero_variance_cols:
+        print(f"Dropping columns with zero variance from residualisation: {len(zero_variance_cols)}")
+        print(zero_variance_cols)
+        X = X.drop(columns=zero_variance_cols, errors="ignore")
+
     age = dem_df.loc[X.index, "age_at_first_mri"].values.reshape(-1, 1)
     sex = pd.get_dummies(dem_df.loc[X.index, "sex"], drop_first=True).values
     design_matrix = np.hstack([age, sex])
     
     X_residualised = X.copy()
-    for i, gpr in enumerate(models):
+    for i, gpr in tqdm(enumerate(models), desc="Applying GPR residualiser", total=len(models)):
         X_residualised.iloc[:, i] = gpr.predict(design_matrix)
+
+    X_residualised = pd.concat([dropped_cols_df.loc[X_residualised.index], X_residualised], axis=1)
     
     return X_residualised

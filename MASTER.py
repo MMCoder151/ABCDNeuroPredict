@@ -149,15 +149,17 @@ print(f"Overlap percentage: {len(overlap_subjects) / len(selected_subjects) * 10
 # Fit residualization models on training data to remove confounding effects of age and sex
 models = fit_residualiser(train_X, dem_df.loc[train_X.index])
 
-train_X.columns.nunique()
-
 # Apply residualization to training and test data
-train_X_residualized = apply_residualiser(train_X, models)
-test_X_residualized = apply_residualiser(test_X, models)
+train_X_residualized = apply_residualiser(models, train_X, dem_df.loc[train_X.index])
+test_X_residualized = apply_residualiser(models, test_X, dem_df.loc[test_X.index])
 
 # Save to csv
 train_X_residualized.to_csv(os.path.join(output_path, "train_features_residualized.csv"), index=False)
 test_X_residualized.to_csv(os.path.join(output_path, "test_features_residualized.csv"), index=False)
+
+# OPTIONAL: Reimport resudialised fitbit features
+train_X_residualized = pd.read_csv(os.path.join(output_path, "train_features_residualized.csv"))
+test_X_residualized = pd.read_csv(os.path.join(output_path, "test_features_residualized.csv"))
 
 # Conduct confound analysis of fitbit features pre and post residualization
 confound_effects_residualized_df = analyse_confounds(dem_df, train_X_residualized, raw_data = train_X)
