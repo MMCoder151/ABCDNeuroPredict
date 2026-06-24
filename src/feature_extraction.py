@@ -92,14 +92,29 @@ def analyse_confounds(dem_df, transformed_data, output_path=pathlib.Path("output
     else:
         analysis_cols = raw_analysis_cols
 
+    # Drop zero variance columns in raw data from analysis_cols
+    zero_variance_cols = raw_data[analysis_cols].var()[raw_data[analysis_cols].var() == 0].index.tolist()
+    if zero_variance_cols:
+        print(f"Dropping zero variance columns from analysis: {len(zero_variance_cols)}")
+        print(zero_variance_cols)
+        analysis_cols = [c for c in analysis_cols if c not in zero_variance_cols]
+
     # Merge z_scores_df with demographic data to get age, sex and scan_site for each subject
+    dem_cols_to_attach = ["age_at_first_mri", "sex", "scan_site"]
+
+    transformed_data = transformed_data.drop(
+        columns=[c for c in dem_cols_to_attach if c in transformed_data.columns]
+    )
+    raw_data = raw_data.drop(
+        columns=[c for c in dem_cols_to_attach if c in raw_data.columns]
+    )
+
     transformed_data = transformed_data.merge(
         dem_df[["subject", "age_at_first_mri", "sex", "scan_site"]].drop_duplicates(),
         left_on="subject",
         right_on="subject",
         how="inner"
     )
-    transformed_data.drop(columns=["subject"], inplace=True)
 
     # Merge raw data with demographic data to get age, sex and scan_site for each subject
     raw_data = raw_data.merge(
@@ -182,6 +197,12 @@ def analyse_confounds(dem_df, transformed_data, output_path=pathlib.Path("output
         pre_df = pre_df.apply(pd.to_numeric, errors='coerce').astype('float64')
         post_df = transformed_data[["subject", "age_at_first_mri", "age_at_first_mri_c_sq", roi] + site_dummy_cols + sex_dummy_cols].dropna(subset=[roi])
         post_df = post_df.apply(pd.to_numeric, errors='coerce').astype('float64')
+
+        if pre_df[roi].nunique() <= 1 or len(pre_df) <= 1:
+            print(f"WARNING: {roi} has no variance or too few rows in raw_data (n={len(pre_df)}, unique={pre_df[roi].nunique()})")
+        if post_df[roi].nunique() <= 1 or len(post_df) <= 1:
+            print(f"WARNING: {roi} has no variance or too few rows in transformed_data (n={len(post_df)}, unique={post_df[roi].nunique()})")
+
         X_pre = pre_df[site_dummy_cols + ["age_at_first_mri", "age_at_first_mri_c_sq"] + sex_dummy_cols]
         X_post = post_df[site_dummy_cols + ["age_at_first_mri", "age_at_first_mri_c_sq"] + sex_dummy_cols]
         y_pre = pre_df[roi]
@@ -921,7 +942,7 @@ def apply_residualiser(models, X, dem_df):
     X.dropna(inplace=True)
     columns_to_drop = ["subject", "subtype", "age_at_first_mri", "sex"]
     columns_to_drop = [c for c in columns_to_drop if c in X.columns]
-    dropped_cols_df = X[columns_to_drop].copy() if dropped_cols_df is None else dropped_cols_df
+    dropped_cols_df = X[columns_to_drop].copy()
     X = X.drop(columns=columns_to_drop, errors="ignore")
 
     # drop columns with zero variance
@@ -930,6 +951,8 @@ def apply_residualiser(models, X, dem_df):
     if zero_variance_cols:
         print(f"Dropping columns with zero variance from residualisation: {len(zero_variance_cols)}")
         print(zero_variance_cols)
+        dropped_var_cols_df = X[zero_variance_cols].copy()
+        dropped_cols_df = pd.concat([dropped_cols_df, dropped_var_cols_df], axis=1)
         X = X.drop(columns=zero_variance_cols, errors="ignore")
 
     age = dem_df.loc[X.index, "age_at_first_mri"].values.reshape(-1, 1)

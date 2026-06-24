@@ -167,7 +167,7 @@ confound_effects_residualized_df = analyse_confounds(dem_df, train_X_residualize
 # ---- MODELING ----
 
 cv_logreg = train_and_evaluate_models(
-    train_X.drop(columns=["subject"]), 
+    train_X_residualized.drop(columns=["subject"]), 
     (train_y.drop(columns=["subject"])).squeeze(), 
     search="random", 
     outer_splits=10, 
@@ -176,7 +176,7 @@ cv_logreg = train_and_evaluate_models(
     )
 
 cv_svm = train_and_evaluate_models(
-    train_X.drop(columns=["subject"]), 
+    train_X_residualized.drop(columns=["subject"]), 
     (train_y.drop(columns=["subject"])).squeeze(), 
     search="random", 
     outer_splits=10, 
@@ -185,7 +185,7 @@ cv_svm = train_and_evaluate_models(
     )
 
 cv_rf = train_and_evaluate_models(
-    train_X.drop(columns=["subject"]), 
+    train_X_residualized.drop(columns=["subject"]), 
     (train_y.drop(columns=["subject"])).squeeze(), 
     search="random", 
     outer_splits=10, 
@@ -194,7 +194,7 @@ cv_rf = train_and_evaluate_models(
     )
 
 cv_lightgbm = train_and_evaluate_models(
-    train_X.drop(columns=["subject"]), 
+    train_X_residualized.drop(columns=["subject"]), 
     (train_y.drop(columns=["subject"])).squeeze(), 
     search="random", 
     outer_splits=10, 
