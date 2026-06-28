@@ -32,7 +32,7 @@ def _one_hot_encode(df, col="scan_site", prefix="scan_site", categories=None):
     encoded = pd.concat([encoded, dummies], axis=1)
     return encoded, list(dummies.columns), categories
 
-def analyse_confounds(dem_df, transformed_data, output_path=pathlib.Path("output"), raw_data = None, con = None, view = None):
+def analyse_confounds(dem_df, mri_meta_df, transformed_data, output_path=pathlib.Path("output"), raw_data = None, con = None, view = None):
     '''
     This function runs linear regression and extracts the total and unique variance explained (R squared and adjusted R squared) 
     for each confound before and after normative modeling of MRI data
@@ -75,7 +75,7 @@ def analyse_confounds(dem_df, transformed_data, output_path=pathlib.Path("output
     # Get columns to include in analysis
     exclude_cols = ["subject", "subject_ids", "timepoint", "Wear_Time", "subtype", "group",
                 "age_at_first_mri", "age_at_first_mri_c", "age_at_first_mri_c_sq",
-                "sex", "scan_site"]
+                "sex", "scan_site", "age_at_mri", "mr_y_smri__vol__aseg__icv_sum"]
     raw_analysis_cols = [col for col in raw_data.columns if col not in exclude_cols]
     transformed_analysis_cols = [col for col in transformed_data.columns if col not in exclude_cols]
 
@@ -99,26 +99,46 @@ def analyse_confounds(dem_df, transformed_data, output_path=pathlib.Path("output
         print(zero_variance_cols)
         analysis_cols = [c for c in analysis_cols if c not in zero_variance_cols]
 
-    # Merge z_scores_df with demographic data to get age, sex and scan_site for each subject
+    # Merge z_scores_df with demographic data to get age, sex, scan_site, and TIV for each subject
     dem_cols_to_attach = ["age_at_first_mri", "sex", "scan_site"]
+    mri_cols_to_attach = ["mr_y_smri__vol__aseg__icv_sum"]
 
     transformed_data = transformed_data.drop(
         columns=[c for c in dem_cols_to_attach if c in transformed_data.columns]
     )
+    transformed_data = transformed_data.drop(
+        columns=[c for c in mri_cols_to_attach if c in transformed_data.columns]
+    )
     raw_data = raw_data.drop(
         columns=[c for c in dem_cols_to_attach if c in raw_data.columns]
     )
+    raw_data = raw_data.drop(
+        columns=[c for c in mri_cols_to_attach if c in raw_data.columns]
+    )
 
+    # Merge transformed data with demographic data to get age, sex, scan_site, and TIV for each subject
     transformed_data = transformed_data.merge(
         dem_df[["subject", "age_at_first_mri", "sex", "scan_site"]].drop_duplicates(),
         left_on="subject",
         right_on="subject",
         how="inner"
     )
+    transformed_data = transformed_data.merge(
+        mri_meta_df[["subject", "mr_y_smri__vol__aseg__icv_sum"]].drop_duplicates(),
+        left_on="subject",
+        right_on="subject",
+        how="inner"
+    )
 
-    # Merge raw data with demographic data to get age, sex and scan_site for each subject
+    # Merge raw data with demographic data to get age, sex, scan_site, and TIV for each subject
     raw_data = raw_data.merge(
         dem_df[["subject", "age_at_first_mri", "sex", "scan_site"]].drop_duplicates(),
+        left_on="subject",
+        right_on="subject",
+        how="inner"
+    )
+    raw_data = raw_data.merge(
+        mri_meta_df[["subject", "mr_y_smri__vol__aseg__icv_sum"]].drop_duplicates(),
         left_on="subject",
         right_on="subject",
         how="inner"
@@ -185,17 +205,18 @@ def analyse_confounds(dem_df, transformed_data, output_path=pathlib.Path("output
     # then age (primary biological), then sex
     model_hierarchy = {
         'site only':          site_dummy_cols,
-        'site + age':         site_dummy_cols + ['age_at_first_mri'],
-        'site + age + age^2': site_dummy_cols + ['age_at_first_mri', 'age_at_first_mri_c_sq'],
-        'site + age + sex':   site_dummy_cols + ['age_at_first_mri'] + sex_dummy_cols,
-        'site + age + age^2 + sex': site_dummy_cols + ['age_at_first_mri', 'age_at_first_mri_c_sq'] + sex_dummy_cols 
+        'site + ITV':         site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum'],
+        'site + ITV + age':         site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri'],
+        'site + ITV + age^2': site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri_c_sq'],
+        'site + ITV + age + sex':   site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri'] + sex_dummy_cols,
+        'site + ITV + age + age^2 + sex': site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri', 'age_at_first_mri_c_sq'] + sex_dummy_cols 
     }
 
     for roi in tqdm(analysis_cols, desc="Analyzing confound effects"):
         # Prepare data for regression
-        pre_df = raw_data[["subject", "age_at_first_mri", "age_at_first_mri_c_sq", roi] + site_dummy_cols + sex_dummy_cols].dropna(subset=[roi])
+        pre_df = raw_data[["subject", "age_at_first_mri", "age_at_first_mri_c_sq", "mr_y_smri__vol__aseg__icv_sum", roi] + site_dummy_cols + sex_dummy_cols].dropna(subset=[roi])
         pre_df = pre_df.apply(pd.to_numeric, errors='coerce').astype('float64')
-        post_df = transformed_data[["subject", "age_at_first_mri", "age_at_first_mri_c_sq", roi] + site_dummy_cols + sex_dummy_cols].dropna(subset=[roi])
+        post_df = transformed_data[["subject", "age_at_first_mri", "age_at_first_mri_c_sq", "mr_y_smri__vol__aseg__icv_sum", roi] + site_dummy_cols + sex_dummy_cols].dropna(subset=[roi])
         post_df = post_df.apply(pd.to_numeric, errors='coerce').astype('float64')
 
         if pre_df[roi].nunique() <= 1 or len(pre_df) <= 1:
@@ -203,8 +224,8 @@ def analyse_confounds(dem_df, transformed_data, output_path=pathlib.Path("output
         if post_df[roi].nunique() <= 1 or len(post_df) <= 1:
             print(f"WARNING: {roi} has no variance or too few rows in transformed_data (n={len(post_df)}, unique={post_df[roi].nunique()})")
 
-        X_pre = pre_df[site_dummy_cols + ["age_at_first_mri", "age_at_first_mri_c_sq"] + sex_dummy_cols]
-        X_post = post_df[site_dummy_cols + ["age_at_first_mri", "age_at_first_mri_c_sq"] + sex_dummy_cols]
+        X_pre = pre_df[site_dummy_cols + ["age_at_first_mri", "age_at_first_mri_c_sq", "mr_y_smri__vol__aseg__icv_sum"] + sex_dummy_cols]
+        X_post = post_df[site_dummy_cols + ["age_at_first_mri", "age_at_first_mri_c_sq", "mr_y_smri__vol__aseg__icv_sum"] + sex_dummy_cols]
         y_pre = pre_df[roi]
         y_post = post_df[roi]
         X_pre_const = sm.add_constant(X_pre)
@@ -322,34 +343,9 @@ def analyse_confounds(dem_df, transformed_data, output_path=pathlib.Path("output
     stat, p_site = wilcoxon(site_R2_pre[valid], site_R2_post[valid])
     print('Site R2 Wilcoxon p=', p_site)
 
-    def extract_coef(series, key):
-        return series.map(lambda d: d.get(key, np.nan) if isinstance(d, dict) else np.nan)
-
-    pivot_coefs = df.copy()
-    pivot_coefs['age_coef_pre']  = extract_coef(pivot_coefs['coef_pre'], 'age_at_mri')
-    pivot_coefs['age_coef_post'] = extract_coef(pivot_coefs['coef_post'], 'age_at_mri')
-
-    plt.figure(figsize=(6,4))
-    plt.hist(age_R2_pre - age_R2_post, bins=40)
-    plt.axvline(0, color='k', linestyle='--')
-    plt.title('Age: reduction in R2 (pre - post)')
-    plt.xlabel('Δ R2')
-    plt.savefig(output_path / "confound_effects_analysis_age_R2_reduction.png")
-
-    plt.figure(figsize=(6,6))
-    plt.scatter(age_R2_pre, age_R2_post, alpha=0.7)
-    plt.plot([0, max(age_R2_pre.max(), age_R2_post.max())],[0, max(age_R2_pre.max(), age_R2_post.max())], 'k--')
-    plt.xlabel('R2 pre')
-    plt.ylabel('R2 post')
-    plt.title('R2 pre vs post (age effect)')
-    plt.savefig(output_path / "confound_effects_analysis_age_R2_pre_vs_post.png")
-
-    confound_effects_df = pd.DataFrame(confound_effects)
-    confound_effects_df.to_csv(output_path / "confound_effects_analysis.csv", index=False)
-    confound_effects_df.to_json(output_path / "confound_effects_analysis.json", orient="records", lines=False, indent=2)
     return confound_effects_df
 
-def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), overwrite=True):
+def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("output"), overwrite=True):
     '''
     This function performs normative modeling and selects subjects based on their composite absolute z-score. 
     It selects the top 10% (based on prevalence) of subjects with the highest cumulative z-score.
@@ -374,10 +370,6 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
             print(f"Error loading selected subjects: {e}")
             print("Please check that the selected_subjects.csv file exists in the normative_modelling results directory and is correctly formatted.")
             raise e
-
-    # Get MRI ROIs to include in the normative model
-    _, mri_rois_dict = mri_rois()
-    mri_roi_cols = list(mri_rois_dict.keys())
 
     # Get subjects to include from mri_meta_df
     included_subjects = mri_meta_df["subject"].unique()
@@ -408,7 +400,7 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
         how="inner"
     )
 
-    missing_cols = set(mri_roi_cols) - set(df.columns)
+    missing_cols = set(roi_cols) - set(df.columns)
     if missing_cols:
         print(f"Warning: The following MRI ROI columns are missing from the dataframe: {missing_cols}")
 
@@ -434,8 +426,8 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
     data = NormData.from_dataframe(
         name="mri_norm",
         dataframe=df,
-        covariates=["sex", "age_at_mri"] + site_dummy_cols,
-        response_vars=mri_roi_cols,
+        covariates=["sex", "age_at_mri", "mr_y_smri__vol__aseg__icv_sum"] + site_dummy_cols,
+        response_vars=roi_cols,
         subject_ids="subject",
         remove_Nan=True,
     )
@@ -475,7 +467,7 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
     # Read in z-score file from normative modeling 
     centiles_df = pd.read_csv(normative_output_dir / "results" / "Z_mri_norm.csv")
     # Calculate composite absolute z-score across all MRI ROIs for each subject
-    centiles_df["composite_z"] = centiles_df[mri_roi_cols].abs().sum(axis=1)
+    centiles_df["composite_z"] = centiles_df[roi_cols].abs().sum(axis=1)
     subject_scores = (
         centiles_df[["subject_ids", "composite_z"]]
         .dropna()
@@ -511,7 +503,7 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
 
     # Create summary table with mean, std, min, and max per mri_roi for the selected subjects
     stats_selected = (
-        centiles_df[mri_roi_cols]
+        centiles_df[roi_cols]
         .agg(['mean', 'std', 'min', 'max'])
         .transpose()
         .reset_index()
@@ -522,10 +514,10 @@ def normative_selection(con, mri_meta_df, output_path=pathlib.Path("output"), ov
     # Create results summary table with mean, std, min, and max per metric
     stats_df = pd.read_csv(normative_output_dir / "results" / "statistics_mri_norm.csv")
     summary = stats_df.assign(
-        mean = stats_df[mri_roi_cols].mean(axis=1),
-        std  = stats_df[mri_roi_cols].std(axis=1),
-        min  = stats_df[mri_roi_cols].min(axis=1),
-        max  = stats_df[mri_roi_cols].max(axis=1),
+        mean = stats_df[roi_cols].mean(axis=1),
+        std  = stats_df[roi_cols].std(axis=1),
+        min  = stats_df[roi_cols].min(axis=1),
+        max  = stats_df[roi_cols].max(axis=1),
     )[["statistic", "mean", "std", "min", "max"]]
     summary.to_csv(normative_output_dir / "results" / "statistics_summary.csv", index=False)
 

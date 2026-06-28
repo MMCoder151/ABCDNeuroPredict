@@ -19,6 +19,173 @@ from sklearn.manifold import trustworthiness
 from sklearn.neighbors import NearestNeighbors
 from itertools import product
 from sklearn.model_selection import ParameterGrid
+from statsmodels.stats.multitest import multipletests
+from pygam import LinearGAM, s, l
+from src.mri_rois import mri_rois
+
+def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, output_path=Path("output")):
+    '''
+    This function analyses group differences between depressed an non-depressed subjects for each MRI feature in the specified mri_files to 
+    extract the MRI ROIs that show significant differences between the two groups.
+    1. Extract binary depression marker
+    2. For each MRI feature, perform regression analysis using a generalized additive model (GAM) to account for sex and non-linear age influence and extract p-values for group differences
+    3. Return a list of MRI ROIs that show significant differences between the two groups (p < 0.05)
+    Parameters:
+        dta_path_tabular (Path): Path to the tabular data directory
+        dta_path (Path): Path to the raw data directory
+    Returns:
+        mri_rois (list): List of MRI ROIs that show significant differences between depressed and non-depressed subjects
+        mri_rois_results (DataFrame): DataFrame containing the regression results for each MRI feature
+        mri_rois_results (CSV): CSV file containing the regression results for each MRI feature
+    NOTE: This function currently doesn't use DuckDB 
+    '''
+
+    # Read in clinical data for depression marker
+    youth_directory = dta_path_tabular / "mh_y_ksads__dep.tsv"
+    parent_directory = dta_path_tabular / "mh_p_ksads__dep.tsv"
+
+    ksads_youth = pd.read_csv(youth_directory, sep="\t")
+    ksads_parent = pd.read_csv(parent_directory, sep="\t")
+    
+    # Filter to only include subjects and timepoints that are present in mri_meta_df
+    ksads_youth = ksads_youth.merge(
+        mri_meta_df[["subject", "timepoint"]],
+        left_on=["participant_id", "session_id"],
+        right_on=["subject", "timepoint"],
+        how="inner"
+    )
+    ksads_parent = ksads_parent.merge(
+        mri_meta_df[["subject", "timepoint"]],
+        left_on=["participant_id", "session_id"],
+        right_on=["subject", "timepoint"],
+        how="inner"
+    )
+
+    # Filter to only include the first timepoint for each subject
+    ksads_youth = ksads_youth.sort_values(by=["participant_id", "session_id"]).groupby("participant_id").first().reset_index()
+    ksads_parent = ksads_parent.sort_values(by=["participant_id", "session_id"]).groupby("participant_id").first().reset_index()
+
+    # Get list of depressed subjects based on KSADS depression diagnosis (youth and parent report)
+    diagnosis_cols_youth = {#"mh_y_ksads__dep__mdd__partrem_dx"  :"Diagnosis: Major depressive disorder (F32.4) - Partial remission [Youth]",
+                            "mh_y_ksads__dep__mdd__pres_dx"     :"Diagnosis: Major depressive disorder - Present [Youth]",
+                            #"mh_y_ksads__dep__pdd__oth__pres_dx":"Diagnosis: Other specified depressive disorder, persistent depressive disorder (impairment does not meet full criteria) (F32.8) - Present [Youth]",
+                            #"mh_y_ksads__dep__pdd__partrem_dx"  :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Partial remission [Youth]",
+                            "mh_y_ksads__dep__pdd__pres_dx"     :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Present [Youth]"}
+    diagnosis_cols_parent = {#"mh_p_ksads__dep__mdd__partrem_dx"  :"Diagnosis: Major depressive disorder (F32.4) - Partial remission [Parent]",
+                            "mh_p_ksads__dep__mdd__pres_dx"     :"Diagnosis: Major depressive disorder - Present [Parent]",
+                            #"mh_p_ksads__dep__pdd__oth__pres_dx":"Diagnosis: Other specified depressive disorder, persistent depressive disorder (impairment does not meet full criteria) (F32.8) - Present [Parent]",
+                            #"mh_p_ksads__dep__pdd__partrem_dx"  :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Partial remission [Parent]",
+                            "mh_p_ksads__dep__pdd__pres_dx"     :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Present [Parent]"}
+    
+    # Create a binary depression marker for each subject based on youth and parent report
+    diagnosis_youth_cols = list(diagnosis_cols_youth.keys())
+    y_depr = (ksads_youth[diagnosis_youth_cols] == 1).any(axis=1)
+
+    diagnosis_parent_cols = list(diagnosis_cols_parent.keys())
+    p_depr = (ksads_parent[diagnosis_parent_cols] == 1).any(axis=1)
+
+    depr = y_depr | p_depr
+
+    # Create a binary depression marker for each subject
+    subjects_depr = set(ksads_youth.loc[depr, "participant_id"]) | set(ksads_parent.loc[depr, "participant_id"])
+
+    # Read in MRI data for each subject and timepoint from mri_files
+    mri_files, roi_names = mri_rois()
+    # Filter to only include the last three mri_files (i.e., the MRI features of interest)
+    mri_files = mri_files[-3:]
+    mri_df = []
+    for mri_file in mri_files:
+        mri_df.append(pd.read_csv(dta_path / "phenotype" / mri_file, sep="\t"))
+
+    # Filter to only include subjects and timepoints that are present in mri_meta_df
+    mri_df = [df.merge(mri_meta_df[["subject", "timepoint"]], left_on=["participant_id", "session_id"], right_on=["subject", "timepoint"], how="inner") for df in mri_df]
+
+    # Filter to only include the first timepoint for each subject
+    mri_df = [df.sort_values(by=["participant_id", "session_id"]).groupby("participant_id").first().reset_index() for df in mri_df]
+
+    # TODO: Add a check to ensure subjects and timepoints match between mri and clinical data
+
+    # Add depression marker to each MRI dataframe
+    for df in mri_df:
+        df["depression_marker"] = df["participant_id"].apply(lambda x: 1 if x in subjects_depr else 0)
+
+    # Get demographic information
+    stc_df = pd.read_csv(dta_path / "participants.tsv", sep="\t")
+    
+    # Append age from clinical file and sex from dem_df to the mri dataframe
+    mri_df = [df.merge(ksads_youth[["participant_id", "mh_y_ksads__dep_age"]], on="participant_id", how="left") for df in mri_df]
+    mri_df = [df.merge(stc_df[["participant_id", "sex"]], on="participant_id", how="left") for df in mri_df]
+
+    # Print number and percentage of depressed subjects in the MRI dataframe
+    depressed_count = mri_df[0]["depression_marker"].sum()
+    total_count = len(mri_df[0])
+    print(f"Number of depressed subjects in MRI dataframe: {depressed_count} ({(depressed_count/total_count)*100:.2f}%)")
+
+    mri_df[0]["depression_marker"].value_counts()
+
+    print(len(subjects_depr))
+    print(ksads_youth["participant_id"].nunique())
+
+    print(ksads_youth.shape)
+    print(ksads_youth["participant_id"].nunique())
+    print(ksads_youth.shape[0] - ksads_youth["participant_id"].nunique())  # excess rows if duplicated
+
+    # look for a timepoint/wave/session column
+    print([c for c in ksads_youth.columns if any(k in c.lower() for k in ["session", "event", "wave", "visit", "year", "arm"])])
+
+    # Recode sex from M/F to 0/1
+    for df in mri_df:
+        df["sex"] = df["sex"].map({"M": 0, "F": 1})
+
+    # Get total intracranial volume (TIV)
+    subcortical_vol = pd.read_csv(dta_path / "phenotype" / "mr_y_smri__vol__aseg.tsv", sep="\t")
+    mri_df = [df.merge(subcortical_vol[["participant_id", "mr_y_smri__vol__aseg__icv_sum"]], on="participant_id", how="left") for df in mri_df]
+
+    # Drop subjects with sex, age or TIV missing
+    mri_df_filtered = [df.dropna(subset=["sex", "mh_y_ksads__dep_age", "mr_y_smri__vol__aseg__icv_sum"]) for df in mri_df]
+
+    print(subjects_depr_count := len(subjects_depr))  # should now be much smaller, e.g. low hundreds to ~1-2 thousand
+    mri_df[0]["depression_marker"].value_counts()
+    mri_df[0].groupby("depression_marker")[["mh_y_ksads__dep_age", "sex", "mr_y_smri__vol__aseg__icv_sum"]].mean()
+
+
+    # Perform regression analysis per MRI feature while accounting for sex and non-linear age influence using a generalized additive model (GAM) and extract p-values for group differences
+    gam_results = []
+    for df in tqdm(mri_df_filtered, desc="Performing GAM regression analysis for MRI features"):
+        for col in df.columns:
+            if col not in ["participant_id", "session_id", "subject", "acq_time", "depression_marker", "mh_y_ksads__dep_age", "sex", "mr_y_smri__vol__aseg__icv_sum", "timepoint"]:
+                model_cols = ["mh_y_ksads__dep_age", "sex", "depression_marker", "mr_y_smri__vol__aseg__icv_sum", col]
+                df_fit = df[model_cols].replace([np.inf, -np.inf], np.nan).dropna()
+                n_dropped = len(df) - len(df_fit)
+                if n_dropped > 0:
+                    print(f"{col}: dropped {n_dropped} rows ({(n_dropped/len(df)*100):.2f}%) with missing/invalid data")
+                try:
+                    gam = LinearGAM(s(0) + l(1) + l(2) +l(3)).fit(df_fit[["mh_y_ksads__dep_age", "sex","mr_y_smri__vol__aseg__icv_sum", "depression_marker"]], df_fit[col])
+                    gam_results.append((col, gam.statistics_['p_values'][3]))
+                except Exception as e:
+                    print(f"Error occurred while fitting GAM model for column {col}: {e}")
+    gam_results_df = pd.DataFrame(gam_results, columns=["mri_feature", "p_value"])
+    gam_results_df = gam_results_df.sort_values("p_value")
+
+    # Perform FDR correction for multiple comparisons
+    print("Performing FDR correction for multiple comparisons...")
+    rejected, corrected_p_values, _, _ = multipletests(gam_results_df["p_value"], alpha=0.05, method='fdr_bh')
+    gam_results_df["corrected_p_value"] = corrected_p_values
+    gam_results_df["significant_fdr"] = rejected
+
+    # Print the number of significant MRI ROIs after FDR correction
+    num_significant_rois = gam_results_df["significant_fdr"].sum()
+    print(f"Number of significant MRI ROIs after FDR correction: {num_significant_rois}")
+
+    # Save to CSV
+    gam_results_df.to_csv(output_path / "mri_rois_results.csv", index=False)
+
+    # Return list of MRI ROIs that show significant differences between depressed and non-depressed subjects (p < 0.05)
+    mri_rois_sig = gam_results_df.loc[gam_results_df["significant_fdr"], "mri_feature"].tolist()
+
+    # Return the list of MRI ROIs and the results dataframe
+    return mri_rois_sig, gam_results_df
+
 
 def mri_clustering(selected_subjects, output_path = Path("output"), bootstrapping = True, overwrite = True):
     '''

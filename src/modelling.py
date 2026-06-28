@@ -7,6 +7,10 @@ from lightgbm import LGBMClassifier
 from sklearn.svm import SVC
 import numpy as np
 from tqdm import tqdm
+import json
+import time
+import traceback
+from pathlib import Path
 from sklearn.metrics import roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.feature_selection import SelectKBest, mutual_info_classif, VarianceThreshold
@@ -381,6 +385,7 @@ def define_regression_models():
     }
     return models
  
+ 
 def train_and_evaluate_regression_models(
     X, y, search="random", outer_splits=10, inner_splits=10, models_to_train=None
 ):
@@ -412,15 +417,24 @@ def train_and_evaluate_regression_models(
             return data.iloc[indices]
         return data[indices]
  
-    def make_searcher(model, param_grid):
+    def make_searcher(model, param_grid, inner_splits_precomputed):
         # neg_root_mean_squared_error: sklearn convention is "higher is better" for all
         # scorers, so RMSE is negated. GridSearchCV/RandomizedSearchCV maximize this,
         # which is equivalent to minimizing RMSE.
+        #
+        # cv= receives a precomputed list of (train_idx, test_idx) tuples rather than a
+        # StratifiedKFold object. This is required because GridSearchCV/RandomizedSearchCV
+        # call cv.split(X, y) internally using the y passed to .fit() - which is the
+        # continuous z-score here. StratifiedKFold cannot stratify on a continuous y
+        # ('Supported target types are: (binary, multiclass). Got continuous instead.').
+        # Precomputing splits against strat_train (the subtype slice for this outer fold)
+        # lets us keep subtype-based stratification for the inner loop too, without ever
+        # handing a continuous y to StratifiedKFold's splitting logic.
         if search == "grid":
             return GridSearchCV(
                 estimator=clone(model),
                 param_grid=param_grid,
-                cv=cv_struct["inner_cv"],
+                cv=inner_splits_precomputed,
                 scoring="neg_root_mean_squared_error",
                 n_jobs=3,
                 verbose=3
@@ -429,7 +443,7 @@ def train_and_evaluate_regression_models(
             return RandomizedSearchCV(
                 estimator=clone(model),
                 param_distributions=param_grid,
-                cv=cv_struct["inner_cv"],
+                cv=inner_splits_precomputed,
                 scoring="neg_root_mean_squared_error",
                 n_jobs=3,
                 n_iter=40,
@@ -478,7 +492,21 @@ def train_and_evaluate_regression_models(
             X_test = _safe_index(X, test_idx)
             y_test = _safe_index(y, test_idx)
  
-            fold_searcher = make_searcher(model, param_grid)
+            # Subtype slice for THIS outer training fold only - used to stratify the
+            # inner CV splits below. Indices are positional (iloc-style), matching
+            # train_idx/test_idx coming from StratifiedKFold.split().
+            strat_train = _safe_index(strat, train_idx)
+ 
+            # Precompute inner splits against strat_train rather than y_train, since
+            # y_train is the continuous z-score and StratifiedKFold can't split on it.
+            # X_train.values / np.zeros(len(X_train)) as the first arg is irrelevant to
+            # StratifiedKFold.split - it only uses shape/length from X, and y for the
+            # actual stratification logic.
+            inner_splits_precomputed = list(
+                cv_struct["inner_cv"].split(X_train, y=strat_train)
+            )
+ 
+            fold_searcher = make_searcher(model, param_grid, inner_splits_precomputed)
             fold_searcher.fit(X_train, y_train)
  
             outer_best_params.append(fold_searcher.best_params_)
@@ -565,3 +593,171 @@ def train_final_regression_model(X, y, model):
     print(f"Best inner-CV RMSE during final training: {-float(searcher.best_score_):.4f}")
  
     return best_model, best_hyperparams, train_predictions
+
+def train_multi_target_regression(
+    X,
+    y_multi,
+    target_cols=None,
+    models_to_train=None,
+    search="random",
+    outer_splits=10,
+    inner_splits=10,
+    results_dir="multi_target_regression_results",
+    skip_existing=True
+):
+    """
+    Loop train_and_evaluate_regression_models over each z-score target column
+    independently.
+ 
+    Parameters
+    ----------
+    X : pd.DataFrame
+        Feature matrix. Must contain the 'subtype' column used for outer-fold
+        stratification, exactly as in train_and_evaluate_regression_models.
+    y_multi : pd.DataFrame
+        One column per ROI z-score target, same row index/order as X.
+    target_cols : list[str] or None
+        Which columns of y_multi to model. Defaults to all 64 columns.
+    models_to_train : str, list[str], or None
+        Forwarded to train_and_evaluate_regression_models. Restrict to your
+        1-2 candidate model types for speed, e.g. ["LightGBM"].
+    results_dir : str
+        Directory for per-target JSON results, written incrementally.
+    skip_existing : bool
+        Resume support - skips targets whose result file already exists.
+ 
+    Returns
+    -------
+    all_results : dict[str, dict]
+    failures : dict[str, str]
+    """
+    output_path = Path("output")
+    results_dir = output_path / results_dir
+    out_dir = Path(results_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+ 
+    if target_cols is None:
+        target_cols = list(y_multi.columns)
+ 
+    all_results = {}
+    failures = {}
+ 
+    for i, col in enumerate(target_cols, start=1):
+        result_path = out_dir / f"{col}.json"
+ 
+        print(f"\n[{i}/{len(target_cols)}] === Target: {col} ===")
+        t0 = time.time()
+ 
+        # Fresh copy per target - train_and_evaluate_regression_models drops
+        # 'subtype' from its local X reference, so don't let that bleed across targets.
+        X_target = X.copy()
+        y_target = y_multi[col].copy()
+ 
+        # Drop rows with missing z-score for this particular target (rather than
+        # imputing the OUTCOME - only features get imputed, inside the pipeline).
+        valid_mask = y_target.notna()
+        if not valid_mask.all():
+            n_dropped = (~valid_mask).sum()
+            print(f"Dropping {n_dropped} subjects with missing z-score for '{col}'.")
+            X_target = X_target.loc[valid_mask].reset_index(drop=True)
+            y_target = y_target.loc[valid_mask].reset_index(drop=True)
+ 
+        try:
+            scores = train_and_evaluate_regression_models(
+                X_target,
+                y_target,
+                search=search,
+                outer_splits=outer_splits,
+                inner_splits=inner_splits,
+                models_to_train=models_to_train,
+            )
+            all_results[col] = scores
+ 
+            with open(result_path, "w") as f:
+                json.dump(scores, f, indent=2)
+ 
+            elapsed = time.time() - t0
+            print(f"  Done in {elapsed/60:.1f} min.")
+ 
+        except Exception:
+            tb = traceback.format_exc()
+            failures[col] = tb
+            print(f"  FAILED on target '{col}':\n{tb}")
+            continue
+ 
+    # Summary table across all completed targets.
+    summary_rows = []
+    for col, model_results in all_results.items():
+        for model_name, scores in model_results.items():
+            summary_rows.append({
+                "target": col,
+                "model": model_name,
+                "mean_rmse": scores["mean_rmse"],
+                "std_rmse": scores["std_rmse"],
+                "mean_r2": scores["mean_r2"],
+                "std_r2": scores["std_r2"],
+            })
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        summary_df.to_csv(out_dir / "_summary.csv", index=False)
+        print(f"\nSummary written to {out_dir / '_summary.csv'}")
+ 
+        # Convenience: best model per target by LOWEST RMSE (note the direction -
+        # opposite of the classification version's AUC argmax).
+        best_per_target = (
+            summary_df.sort_values("mean_rmse")
+            .groupby("target", as_index=False)
+            .first()[["target", "model", "mean_rmse", "mean_r2"]]
+        )
+        best_per_target.to_csv(out_dir / "_best_model_per_target.csv", index=False)
+        print(f"Best model per target written to {out_dir / '_best_model_per_target.csv'}")
+ 
+    if failures:
+        print(f"\n{len(failures)} target(s) failed: {list(failures.keys())}")
+ 
+    return all_results, failures
+ 
+ 
+def train_final_models_multi_target_regression(
+    X,
+    y_multi,
+    best_model_per_target,
+    results_dir="multi_target_regression_results",
+):
+    """
+    Fit the final deployable regression model per target, after picking the
+    winning model type per target (e.g. from _best_model_per_target.csv above).
+ 
+    Parameters
+    ----------
+    best_model_per_target : dict[str, str]
+        e.g. {"roi_01": "LightGBM", "roi_02": "ElasticNet", ...}
+    """
+ 
+    out_dir = Path(results_dir)
+    final_dir = out_dir / "final_models"
+    final_dir.mkdir(parents=True, exist_ok=True)
+ 
+    final_models = {}
+    final_hyperparams = {}
+ 
+    for col, model_name in best_model_per_target.items():
+        print(f"\nTraining final model for '{col}' using {model_name}...")
+ 
+        X_target = X.copy()
+        y_target = y_multi[col].copy()
+        valid_mask = y_target.notna()
+        X_target = X_target.loc[valid_mask].reset_index(drop=True)
+        y_target = y_target.loc[valid_mask].reset_index(drop=True)
+ 
+        best_model, best_hyperparams, train_preds = train_final_regression_model(
+            X_target, y_target, model_name
+        )
+ 
+        final_models[col] = best_model
+        final_hyperparams[col] = best_hyperparams
+ 
+        with open(final_dir / f"{col}_hyperparams.json", "w") as f:
+            json.dump(best_hyperparams, f, indent=2)
+ 
+    return final_models, final_hyperparams

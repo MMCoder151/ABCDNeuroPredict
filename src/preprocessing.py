@@ -4,7 +4,7 @@ from src.mri_rois import mri_rois
 import duckdb
 from tqdm import tqdm
 import pathlib
-
+from src.mri_rois import mri_rois
 
 def _load_fitbit_df(filepath):
     '''
@@ -121,7 +121,7 @@ def filter_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
         sub_folders = sub_folders[:100] # Use only first 100 subjects for testing
 
     n_total_subs = len(sub_folders)
-    print(f"Total number of subjects made available: {n_total_subs}")
+    print(f"Raw fitbit data available for {n_total_subs} subjects")
 
     # GET FITBIT METADATA
 
@@ -295,6 +295,10 @@ def filter_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
     mri_meta_df["age_at_mri"] = ((mri_meta_df["mri_date"] - mri_meta_df["date_of_birth"]).dt.days / 365.25).round(0).astype("Int64")
     mri_meta_df = mri_meta_df.drop(columns=["date_of_birth"])
 
+    # Add total intracranial volume (TIV) to mri_meta_df per subject and time point
+    subcortical_vol = pd.read_csv(dta_path / "phenotype" / "mr_y_smri__vol__aseg.tsv", sep="\t")
+    mri_meta_df = mri_meta_df.merge(subcortical_vol[["participant_id", "session_id", "mr_y_smri__vol__aseg__icv_sum"]], left_on=["subject", "timepoint"], right_on=["participant_id", "session_id"], how="left")
+
     # Check that subject/timepoint PAIRS in mri_meta_df and fit_meta_df match exactly
     pairs_fit = set(map(tuple, fit_meta_df[["subject","timepoint"]].drop_duplicates().values))
     pairs_mri = set(map(tuple, mri_meta_df[["subject","timepoint"]].drop_duplicates().values))
@@ -413,50 +417,69 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
         # Save combined dataframe as parquet file aligned on Wear_Time (overwrites existing files)
         combined_df.sort_values("Wear_Time").to_parquet(output_file, index=False)
         
-        # Get MRI ROIs and files to import
-        mri_files, mri_rois_dict = mri_rois()
+    # Get MRI ROIs and files to import
+    mri_files, mri_rois_dict = mri_rois()
 
-        # Accumulate MRI data for each subject-timepoint across all phenotype files
-        mri_data_accumulator = {}  # {(subject, timepoint): {columns from all files}}
-        
+    # Accumulate MRI data for each subject-timepoint across all phenotype files
+    mri_data_accumulator = {}  # {(subject, timepoint): {columns from all files}}
+    mri_column_source = {}     # {(subject, timepoint): {column: source_file}} - tracks provenance to detect collisions
+
     # Extract MRI data for each subject and timepoint and accumulate across all files
     for file in tqdm(mri_files, total=len(mri_files), desc="Processing MRI phenotype files"):
         mri_df = pd.read_csv(dta_path / "phenotype" / file, sep="\t")
-        # Select only columns that exist in the dataframe
-        available_cols = ["participant_id", "session_id"] + [col for col in mri_rois_dict.keys() if col in mri_df.columns]
-        mri_df = mri_df[available_cols]
-        mri_df = mri_df.merge(
+
+        # CHANGE: keep all columns from the file (not just mri_rois_dict) for possible future analysis.
+        # participant_id/session_id are still needed for the merge below and dropped afterward.
+        if "participant_id" not in mri_df.columns or "session_id" not in mri_df.columns:
+            print(f"Warning: {file} missing participant_id/session_id — skipping file")
+            continue
+
+        merged_df = mri_df.merge(
             fit_meta_df[["subject", "timepoint"]].drop_duplicates(),
             left_on=["participant_id", "session_id"],
             right_on=["subject", "timepoint"],
             how="inner",
         ).drop(columns=["participant_id", "session_id"])
-        
+
+        # Warn if the inner join dropped everything (likely a session_id/timepoint encoding
+        # mismatch between this file and fit_meta_df), since that fails silently otherwise.
+        if len(mri_df) > 0 and len(merged_df) == 0:
+            print(f"Warning: {file} had {len(mri_df)} rows but 0 matched fit_meta_df on subject/timepoint — "
+                f"check session_id encoding (e.g. '{mri_df['session_id'].iloc[0]}' vs "
+                f"'{fit_meta_df['timepoint'].iloc[0]}')")
+
         # Accumulate this file's data for each subject-timepoint
-        for _, row in mri_df.iterrows():
+        for _, row in merged_df.iterrows():
             subject = row["subject"]
             timepoint = row["timepoint"]
             key = (subject, timepoint)
-            
+
             if key not in mri_data_accumulator:
                 mri_data_accumulator[key] = {}
-            
+                mri_column_source[key] = {}
+
             # Merge this row's data into the accumulator
             for col in row.index:
                 if col not in ["subject", "timepoint"]:
+                    # Detect collisions before overwriting instead of silently clobbering
+                    # an earlier file's value for this column.
+                    if col in mri_column_source[key] and mri_column_source[key][col] != file:
+                        print(f"Warning: column '{col}' for {key} present in both "
+                            f"'{mri_column_source[key][col]}' and '{file}' — keeping value from '{file}'")
                     mri_data_accumulator[key][col] = row[col]
-    
+                    mri_column_source[key][col] = file
+
     # Write accumulated MRI data to parquet files
     for (subject, timepoint), data_dict in tqdm(mri_data_accumulator.items(), total=len(mri_data_accumulator), desc="Writing MRI data"):
         subject_dir = output_dir_mri / f"{subject}"
         timepoint_dir = subject_dir / f"{timepoint}"
         timepoint_dir.mkdir(parents=True, exist_ok=True)
         output_file = timepoint_dir / "combined_mri.parquet"
-        
+
         # Add subject and timepoint back in
         data_dict["subject"] = subject
         data_dict["timepoint"] = timepoint
-        
+
         # Convert to a single-row DataFrame and save
         row_df = pd.DataFrame([data_dict])
         row_df.to_parquet(output_file, index=False)

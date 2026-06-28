@@ -6,9 +6,13 @@ from src.data_analysis import *
 from src.modelling import *
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression, LinearRegression
+import matplotlib.pyplot as plt
 
-# Set data directory paths
+# Set raw data directory 
 dta_path = Path.home() / "dairc" / "rawdata"
+
+# Set tabular data directory 
+dta_path_tabular = Path.home() / "dairc" / "abcd" / "rawdata" / "phenotype"
 
 # Set output path
 output_path = os.path.join(os.getcwd(), "output")
@@ -29,8 +33,11 @@ con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
 # ---- DATA ANALYSIS MRI ----
 
 # NORMATIVE SELECTION OF MRI DATA
+# Get mri rois that show significant differences between depressed and non-depressed subjects
+mri_rois_sig, mri_rois_results = extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df)
+
 # Select subjects based on normative modeling of FIRST TIMEPOINT and composite z-scores
-selected_subjects = normative_selection(con, mri_meta_df, overwrite=False)
+selected_subjects = normative_selection(con, mri_meta_df, mri_rois_sig, overwrite=True)
 
 # Conduct confound analysis pre and post normative modeling
 z_scores = pd.read_csv(os.path.join(output_path, "normative_modelling", "results","Z_mri_norm.csv"))
@@ -129,7 +136,7 @@ train_X = pd.read_csv(os.path.join(output_path, "train_features.csv"))
 test_X = pd.read_csv(os.path.join(output_path, "test_features.csv"))
 train_y = pd.read_csv(os.path.join(output_path, "train_labels.csv"))
 test_y = pd.read_csv(os.path.join(output_path, "test_labels.csv"))
-
+train_X.head()
 # ---- DATA ANALYSIS FITBIT ----
 
 # NORMATIVE SELECTION OF FITBIT DATA
@@ -215,3 +222,53 @@ nested_cv_scores_df = pd.DataFrame({
 })
 print(nested_cv_scores_df)
 nested_cv_scores_df.to_csv(os.path.join(output_path, "nested_cv_scores.csv"), index=False)
+
+# MULTI-TARGET REGRESSION MODELING
+z_scores_mri = pd.read_csv(os.path.join(output_path, "normative_modelling", "results","Z_mri_norm.csv"))
+# Train and evaluate regression models for each z-score target column
+regression_results, regression_failures = train_multi_target_regression(
+    train_X.drop(columns=["subject"]),
+    z_scores_mri.drop(columns=["subject_ids", "observations"])
+)
+
+# Save regression results and failures to JSON files
+with open(os.path.join(output_path, "multi_target_regression_results.json"), "w") as f:
+    json.dump(regression_results, f, indent=4)
+
+with open(os.path.join(output_path, "multi_target_regression_failures.json"), "w") as f:
+    json.dump(regression_failures, f, indent=4)
+
+# Train final regression models for each target using the best model identified in the previous step
+best_model_per_target = {target: max(models, key=lambda m: regression_results[target][m]["mean"]) for target, models in regression_results.items()}
+best_models, best_hyperparams = train_final_models_multi_target_regression(
+    train_X.drop(columns=["subject"]),
+    z_scores_mri.drop(columns=["subject_ids", "observations"]).squeeze(),
+    best_model_per_target=best_model_per_target,
+    results_dir="final_regression_models"
+)
+
+# Save best model per target to JSON file
+with open(os.path.join(output_path, "best_model_per_target.json"), "w") as f:
+    json.dump(best_model_per_target, f, indent=4)
+
+# Get predictions from the best models on the test set
+test_predictions = {}
+for target, model in best_models.items():
+    test_predictions[target] = model.predict(test_X.drop(columns=["subject"]))
+
+# Save test predictions to CSV
+test_predictions_df = pd.DataFrame(test_predictions)
+test_predictions_df.to_csv(os.path.join(output_path, "test_predictions.csv"), index=False)
+
+# Evaluate the performance of the best models on the test set by calculating RMSE and R-squared for each target
+test_performance = {}
+for target, model in best_models.items():
+    y_true = z_scores_mri.loc[test_X.index, target]
+    y_pred = test_predictions[target]
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred)
+    test_performance[target] = {"RMSE": rmse, "R-squared": r2}
+
+# Save test performance metrics to CSV
+test_performance_df = pd.DataFrame(test_performance).T
+test_performance_df.to_csv(os.path.join(output_path, "test_performance_metrics.csv"), index=True)
