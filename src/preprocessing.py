@@ -333,8 +333,9 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
         which are extracted from the file paths of the original fitbit files, for easy filtering in DuckDB. 
         The combined parquet file is saved in a new hive-style directory structure at the top of the dta_path: "processed_fitbit_data/subject=SUBJECT_ID/timepoint=TIMEPOINT/combined_fitbit.parquet"
         - Also recodes the fitbit data according to specific rules from the ABCD Data Release 6.0 documentation and drops unnecessary meta columns
-        - For MRI data, it extracts the MRI ROIs specified in mri_rois for each subject and timepoint and saves it in a similar hive-style directory structure 
-        at the top of the dta_path: "processed_mri_data/subject=SUBJECT_ID/timepoint=TIMEPOINT/combined_mri.parquet"
+        - For MRI data, it extracts all MRI ROIs for each selected subject and timepoint across the specified phenotype files and accumulates them into a single parquet file 
+        for easier querying with DuckDB. It adds two columns to the combined parquet file: "subject" and "timepoint", which are extracted from the file paths of the original MRI phenotype files, for easy filtering in DuckDB. 
+        The combined parquet file is saved in a new directory at the top of the dta_path: "processed_mri_data/all_subjects_combined_mri.parquet"
     Parameters:
         dta_path (Path): Path to the raw data directory
         fit_meta_df (DataFrame): DataFrame containing metadata for the selected fitbit files (subjects, timepoints, filepaths) -> also used for mri data to get selected subjects
@@ -353,7 +354,7 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
         try:
             con = duckdb.connect()
             con.execute(f"CREATE OR REPLACE VIEW fitbit_data AS SELECT * FROM read_parquet('{output_dir_fit}/**/combined_fitbit.parquet', union_by_name => TRUE)")
-            con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/**/combined_mri.parquet', union_by_name => TRUE)")
+            con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/all_subjects_combined_mri.parquet')")
         except Exception as e:
             print(f"Error setting up DuckDB views: {e}")
             print("Please check that the combined parquet files exist in the output directories and are correctly formatted.")
@@ -469,26 +470,24 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
                     mri_data_accumulator[key][col] = row[col]
                     mri_column_source[key][col] = file
 
-    # Write accumulated MRI data to parquet files
-    for (subject, timepoint), data_dict in tqdm(mri_data_accumulator.items(), total=len(mri_data_accumulator), desc="Writing MRI data"):
-        subject_dir = output_dir_mri / f"{subject}"
-        timepoint_dir = subject_dir / f"{timepoint}"
-        timepoint_dir.mkdir(parents=True, exist_ok=True)
-        output_file = timepoint_dir / "combined_mri.parquet"
+    # Write accumulated MRI data to one bit parquet file
+    all_rows = []
+    for (subject, timepoint), data_dict in mri_data_accumulator.items():
+        row = dict(data_dict)
+        row["subject"] = subject
+        row["timepoint"] = timepoint
+        all_rows.append(row)
 
-        # Add subject and timepoint back in
-        data_dict["subject"] = subject
-        data_dict["timepoint"] = timepoint
+    mri_combined_df = pd.DataFrame(all_rows)
 
-        # Convert to a single-row DataFrame and save
-        row_df = pd.DataFrame([data_dict])
-        row_df.to_parquet(output_file, index=False)
+    output_file = output_dir_mri / "all_subjects_combined_mri.parquet"
+    mri_combined_df.to_parquet(output_file, index=False)
     
     # Setup DuckDB connection to query the combined fitbit and mri data
     con = duckdb.connect()
     # Use read_parquet with union_by_name=True to allow files with differing schemas
     con.execute(f"CREATE OR REPLACE VIEW fitbit_data AS SELECT * FROM read_parquet('{output_dir_fit}/**/combined_fitbit.parquet', union_by_name => TRUE)")
-    con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/**/combined_mri.parquet', union_by_name => TRUE)")
+    con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/all_subjects_combined_mri.parquet')")
 
     # Sanity check
     n_fitbit = con.execute("SELECT COUNT(DISTINCT subject) FROM fitbit_data").fetchone()[0]
