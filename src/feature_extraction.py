@@ -16,7 +16,7 @@ import statsmodels.api as sm
 from scipy.stats import wilcoxon
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
-
+import joblib
 
 def _one_hot_encode(df, col="scan_site", prefix="scan_site", categories=None):
     """One-hot encode a scan-site column while keeping a stable category order."""
@@ -376,12 +376,12 @@ def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("ou
     first_mri_meta_df = (
         mri_meta_df.sort_values(["subject", "timepoint"])
         .drop_duplicates(subset=["subject"], keep="first")
-        [["subject", "sex", "age_at_mri", "scan_site"]]
+        [["subject", "sex", "age_at_mri", "scan_site", "mr_y_smri__vol__aseg__icv_sum"]]
     )
     
     # Query MRI data for the first timepoint for each included subject
     query = f"""
-        SELECT *
+        SELECT "subject", "timepoint", {', '.join(f'"{col}"' for col in roi_cols)}
         FROM mri_data
         WHERE subject IN ({', '.join(f"'{sub}'" for sub in included_subjects)})
         AND timepoint IN (
@@ -399,10 +399,6 @@ def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("ou
         on="subject",
         how="inner"
     )
-
-    missing_cols = set(roi_cols) - set(df.columns)
-    if missing_cols:
-        print(f"Warning: The following MRI ROI columns are missing from the dataframe: {missing_cols}")
 
     # Encode sex explicitly so F/M map to 1/2 before passing data to NormData.
     sex_map = {'F': 1, 'M': 2}
@@ -422,8 +418,21 @@ def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("ou
 
     df, site_dummy_cols, _ = _one_hot_encode(df, col="scan_site", prefix="scan_site")
 
+    # Filter df to only include healthy subjects (subjects with dep_dx == 0 in mri_meta_df)
+    healthy_subjects = mri_meta_df[mri_meta_df["dep_dx"] == 0]["subject"].unique()
+    df_reference = df[df["subject"].isin(healthy_subjects)]
+
     # Prepare data for normative modeling
-    data = NormData.from_dataframe(
+    data_reference = NormData.from_dataframe(
+        name="mri_norm_reference",
+        dataframe=df_reference,
+        covariates=["sex", "age_at_mri", "mr_y_smri__vol__aseg__icv_sum"] + site_dummy_cols,
+        response_vars=roi_cols,
+        subject_ids="subject",
+        remove_Nan=True,
+    )
+
+    data_full = NormData.from_dataframe(
         name="mri_norm",
         dataframe=df,
         covariates=["sex", "age_at_mri", "mr_y_smri__vol__aseg__icv_sum"] + site_dummy_cols,
@@ -456,7 +465,8 @@ def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("ou
         outscaler="standardize",
         )
 
-    model.fit(data)
+    model.fit(data_reference)
+    model.predict(data_full)
 
     # create a runner
     #runner = Runner(cross_validate = True)
@@ -466,33 +476,100 @@ def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("ou
 
     # Read in z-score file from normative modeling 
     centiles_df = pd.read_csv(normative_output_dir / "results" / "Z_mri_norm.csv")
+
+    # Read in results file from roi selection
+    mri_rois_results = pd.read_csv(output_path / "mri_rois_results.csv")
+
+    def _build_sign_aligned_composite(centiles_df, roi_cols, mri_rois_results):
+        """
+        Build a sign-aligned composite deviation score, using the direction of each
+        ROI's group-difference effect size to align z-scores before combining.
+        """
+        # Map each ROI to the sign of its effect size from the group-difference analysis
+        effect_size_lookup = mri_rois_results.set_index("mri_feature")["effect_size"]
+        sign_lookup = np.sign(effect_size_lookup.reindex(roi_cols))
+
+        # Sanity check: make sure every ROI used here actually has a known direction
+        missing = sign_lookup[sign_lookup.isna()]
+        if len(missing) > 0:
+            raise ValueError(f"Missing effect-size sign for ROIs: {missing.index.tolist()}")
+
+        aligned = centiles_df[roi_cols].copy()
+        for roi in roi_cols:
+            aligned[roi] = centiles_df[roi] * sign_lookup[roi]
+
+        # Now "more positive" consistently means "more depression-like" across all ROIs
+        centiles_df["composite_z_aligned"] = aligned.sum(axis=1)
+        return centiles_df
+
     # Calculate composite absolute z-score across all MRI ROIs for each subject
-    centiles_df["composite_z"] = centiles_df[roi_cols].abs().sum(axis=1)
+    centiles_df = _build_sign_aligned_composite(centiles_df, roi_cols, mri_rois_results)
+
+    from sklearn.metrics import roc_auc_score, roc_curve
+    depressed_subject_set = set(mri_meta_df[mri_meta_df["dep_dx"] == 1]["subject"].unique())
+    y_true = centiles_df["subject_ids"].isin(depressed_subject_set).astype(int)  # deduplicated!
+    y_score = centiles_df["composite_z_aligned"]
+    auc = roc_auc_score(y_true, y_score)
+    print(f"AUC: {auc:.4f}")
+
+    # Check AUC per ROI in roi_cols
+    print("Calculating AUC per ROI...")
+    y_true = centiles_df["subject_ids"].isin(depressed_subject_set).astype(int)
+
+    roi_auc_results = []
+    for roi in roi_cols:
+        roi_scores = centiles_df[roi]
+        valid = roi_scores.notna()
+        if valid.sum() < 10:  # skip ROIs with too little data to compute a meaningful AUC
+            continue
+        auc = roc_auc_score(y_true[valid], roi_scores[valid])
+        roi_auc_results.append({"roi": roi, "auc": auc, "n": valid.sum()})
+
+    roi_auc_df = pd.DataFrame(roi_auc_results).sort_values("auc", ascending=False).reset_index(drop=True)
+    print(roi_auc_df.to_string(index=False))
+
+    roi_auc_df["auc_abs"] = roi_auc_df["auc"].apply(lambda a: max(a, 1 - a))
+    roi_auc_df = roi_auc_df.sort_values("auc_abs", ascending=False).reset_index(drop=True)
+
+    roi_auc_df = roi_auc_df.merge(
+        mri_rois_results[["mri_feature", "effect_size"]],
+        left_on="roi", right_on="mri_feature", how="left"
+    )
+    roi_auc_df["direction_agrees"] = (
+        (roi_auc_df["effect_size"] > 0) & (roi_auc_df["auc"] > 0.5)
+    ) | (
+        (roi_auc_df["effect_size"] < 0) & (roi_auc_df["auc"] < 0.5)
+    )
+    print(roi_auc_df[["roi", "effect_size", "auc", "auc_abs", "direction_agrees"]].to_string(index=False))
+
     subject_scores = (
-        centiles_df[["subject_ids", "composite_z"]]
+        centiles_df[["subject_ids", "composite_z_aligned"]]
         .dropna()
         .drop_duplicates(subset=["subject_ids"])
-        .sort_values("composite_z")
+        .sort_values("composite_z_aligned")
         .reset_index(drop=True)
     )
+
+    subject_scores["subject_ids"] = subject_scores["subject_ids"].astype(str)
     subject_scores["subject_ids"].nunique()
     subject_scores["rank"] = np.arange(len(subject_scores))
-    # Select top 10% of subjects with the highest composite z-score based on ranked prevalence
-    n_select = int(np.ceil(0.10 * len(subject_scores)))
-    selected_subject_ids = subject_scores.nlargest(n_select, "composite_z")["subject_ids"]
+
+    # Select top 5% of subjects with the highest composite z-score based on ranked prevalence
+    n_select = int(np.ceil(0.05 * len(subject_scores)))
+    selected_subject_ids = subject_scores.nlargest(n_select, "composite_z_aligned")["subject_ids"]
     selected_subjects = subject_scores[subject_scores["subject_ids"].isin(selected_subject_ids)]
     
-    print(f"Selected {len(selected_subject_ids)} subjects with the highest composite z-scores based on a prevalence threshold of 10%.")
+    print(f"Selected {len(selected_subject_ids)} subjects with the highest composite z-scores based on a prevalence threshold of 5%.")
     selected_subjects.to_csv(normative_output_dir / "results" / "selected_subjects.csv", index=False)
     
     # create scatter plot of composite z-scores for all subjects, highlighting selected subjects in a different color
-    plot_df = centiles_df[["subject_ids", "composite_z"]].dropna().sort_values("composite_z").reset_index(drop=True)
+    plot_df = centiles_df[["subject_ids", "composite_z_aligned"]].dropna().sort_values("composite_z_aligned").reset_index(drop=True)
     plot_df["rank"] = np.arange(len(plot_df))
 
     plt.figure(figsize=(10, 6))
-    plt.scatter(subject_scores["rank"], subject_scores["composite_z"], label="All subjects", alpha=0.5, s=12)
+    plt.scatter(subject_scores["rank"], subject_scores["composite_z_aligned"], label="All subjects", alpha=0.5, s=12)
     selected_plot = subject_scores[subject_scores["subject_ids"].isin(selected_subject_ids)]
-    plt.scatter(selected_plot["rank"], selected_plot["composite_z"], label="Selected subjects", color="red", s=18)
+    plt.scatter(selected_plot["rank"], selected_plot["composite_z_aligned"], label="Selected subjects", color="red", s=18)
     plt.xlabel("Subject rank by composite z-score")
     plt.ylabel("Composite Absolute Z-Score")
     plt.title("Composite Absolute Z-Scores for MRI ROIs")
@@ -523,13 +600,12 @@ def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("ou
 
     return selected_subjects
 
-def create_composites(selected_subjects, vif_threshold=10):
+def create_composites(selected_subjects, vif_threshold=10, overwrite=True, output_path=Path("output")):
     """
     Creates composite scores out of given variables based on variance inflation factors (VIF).
  
     Parameters:
-        selected_subjects (DataFrame): DataFrame containing the selected subjects and their
-            MRI ROI data and respective z-scores
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their data to be analysed
         vif_threshold (float): VIF value above which a variable triggers compositing
         max_iterations (int): safety cap so a degenerate case can't loop forever
  
@@ -538,6 +614,16 @@ def create_composites(selected_subjects, vif_threshold=10):
         composite_dict (dict): Maps composite score name -> list of *original* base columns
                                 that were averaged together to build it (flattened, not nested)
     """
+
+    if overwrite == False:
+        print("Overwrite set to False. Reimporting composites.")
+        try:
+            features_with_composites = pd.read_csv(Path(output_path / "fitbit_features_with_composites.csv"))
+            composite_df = pd.read_csv(Path(output_path / "composite_dictionary.csv"))
+        except Exception as e:
+            print(f"An error occured: {e}")
+            return e
+
     vif_cols = [
         col for col in selected_subjects.columns
         if col not in ["subject", "composite_z", "Wear_Time", "subtype", "group"]
@@ -650,10 +736,17 @@ def create_composites(selected_subjects, vif_threshold=10):
     print(f"\nComposites created: {len(composite_dict)}")
     for name, members in composite_dict.items():
         print(f"  {name}: {members}")
+
+    selected_subjects.to_csv(Path(output_path / "fitbit_features_with_composites.csv"), index=False)
+    composite_df = pd.DataFrame({
+        "composite_name": list(composite_dict.keys()),
+        "features_included": [", ".join(features) for features in composite_dict.values()]
+    })
+    composite_df.to_csv(Path(output_path / "composite_dictionary.csv"), index=False)
  
     return selected_subjects, composite_dict
 
-def extr_fitbit_features(con, selected_subjects, overwrite=True):
+def extr_fitbit_features(con, selected_subjects, overwrite=True, output_path=Path("output")):
     '''
     This function extracts features from the fitbit data for the selected subjects.
         1. Creates daily mean, std, min, and max for each fitbit metric
@@ -666,6 +759,15 @@ def extr_fitbit_features(con, selected_subjects, overwrite=True):
     Returns:
         fitbit_features_df (DataFrame): DataFrame containing the extracted fitbit features for each subject
     '''
+
+    if overwrite == False:
+        print("Overwirte set to False. Reimporting features.")
+        try:
+            fitbit_features = pd.read_csv(Path(output_path) / "fitbit_features.csv")
+            return fitbit_features
+        except Exception as e:
+            print(f"An error occured: {e}")
+            return e
 
     # Get a de-duplicated list of selected subjects.
     if hasattr(selected_subjects, "columns") and "subject" in selected_subjects.columns:
@@ -753,13 +855,8 @@ def extr_fitbit_features(con, selected_subjects, overwrite=True):
                             print(f"STL decomposition failed for subject {subject}, metric {metric}: {e}")
         features_list.append(feature_dict)
     fitbit_features_df = pd.DataFrame(features_list)
-    # add subtype labels
-    fitbit_features_df = fitbit_features_df.merge(
-        selected_subjects[["subject", "subtype"]],
-        left_on="subject",
-        right_on="subject",
-        how="left"
-    )
+    
+    fitbit_features_df.to_csv(Path("output")/ "fitbit_features.csv", index=False)
 
     return fitbit_features_df
 
@@ -894,11 +991,26 @@ def normative_selection_fitbit(dem_df, fitbit_features, output_path = Path("outp
 
     return selected_fitbit_subjects
 
-def fit_residualiser(X_train, dem_df):
+def fit_residualiser(X_train, dem_df, overwrite=True):
     '''
     Fit a GPR per feature on TRAINING data only.
-    Covariates: age (continuous) + sex (dummy-coded).
+    Covariates: age (continuous) + sex (dummy-coded)
     '''
+
+    if overwrite == False:
+        print("Residualiser fitting skipped (overwrite=False). To re-run residualiser fitting, set overwrite=True.")
+        try:
+            models = []
+            residualisation_dir = Path("output") / "residualisation"
+            for i in range(len(X_train.columns)):
+                gpr = joblib.load(residualisation_dir / f"gpr_model_{i}.joblib")
+                models.append(gpr)
+            return models
+        except Exception as e:
+            print(f"Error loading GPR models: {e}")
+            print("Please check that the gpr_model_*.joblib files exist in the residualisation directory and are correctly formatted.")
+            raise e
+        
     X_train.dropna(inplace=True)
     columns_to_drop = ["subject", "subtype", "age_at_first_mri", "sex"]
     columns_to_drop = [c for c in columns_to_drop if c in X_train.columns]
@@ -924,6 +1036,13 @@ def fit_residualiser(X_train, dem_df):
         gpr = GaussianProcessRegressor(kernel=kernel, random_state=0)
         gpr.fit(design_matrix_train, y_train)
         models.append(gpr)
+        
+    #Save models to disk in residualisation folder
+    residualisation_dir = Path("output") / "residualisation"
+    if not residualisation_dir.exists():
+        residualisation_dir.mkdir(parents=True)
+    for i, gpr in enumerate(models):
+        joblib.dump(gpr, residualisation_dir / f"gpr_model_{i}.joblib")
     return models
 
 def apply_residualiser(models, X, dem_df):

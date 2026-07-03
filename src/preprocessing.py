@@ -74,7 +74,7 @@ def _recode_fitbit_data(fit_df):
 
     return fit_df
 
-def filter_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Path("output")):
+def filter_subjects(dta_path, dta_path_tabular, test=False, overwrite=True, output_path=pathlib.Path("output")):
     '''
     This function selects subjects and time points based on selection criteria (below) and extracts demographic and meta information for fitbit and mri data
         - Only subjects with both "fit" and "scans" files are included (=> subjects with both Fitbit and MRI data)
@@ -85,6 +85,7 @@ def filter_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
     Subjects/timepoints with less than 7 days of actually recorded Fitbit data and less than 60% missings are marked for later filtering
     Parameters:
         dta_path (Path): Path to the raw data directory
+        dta_path_tabular (Path): Path to the tabular data directory
         test (bool): Whether to run in test mode (only uses first 100 subjects for faster testing)
         overwrite (bool): Whether to overwrite existing metadata files (if False, will load existing metadata files if they exist and skip the selection process)
         output_path (Path): Path to the output directory to reimport metadata files if overwrite=False
@@ -295,6 +296,59 @@ def filter_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Pa
     mri_meta_df["age_at_mri"] = ((mri_meta_df["mri_date"] - mri_meta_df["date_of_birth"]).dt.days / 365.25).round(0).astype("Int64")
     mri_meta_df = mri_meta_df.drop(columns=["date_of_birth"])
 
+    # add depression marker to mri_meta_df
+    # Read in clinical data for depression marker
+    youth_directory = dta_path_tabular / "mh_y_ksads__dep.tsv"
+    parent_directory = dta_path_tabular / "mh_p_ksads__dep.tsv"
+
+    ksads_youth = pd.read_csv(youth_directory, sep="\t")
+    ksads_parent = pd.read_csv(parent_directory, sep="\t")
+    
+    # Filter to only include subjects and timepoints that are present in mri_meta_df
+    ksads_youth = ksads_youth.merge(
+        mri_meta_df[["subject", "timepoint"]],
+        left_on=["participant_id", "session_id"],
+        right_on=["subject", "timepoint"],
+        how="inner"
+    )
+    ksads_parent = ksads_parent.merge(
+        mri_meta_df[["subject", "timepoint"]],
+        left_on=["participant_id", "session_id"],
+        right_on=["subject", "timepoint"],
+        how="inner"
+    )
+
+    # Filter to only include the first timepoint for each subject
+    ksads_youth = ksads_youth.sort_values(by=["participant_id", "session_id"]).groupby("participant_id").first().reset_index()
+    ksads_parent = ksads_parent.sort_values(by=["participant_id", "session_id"]).groupby("participant_id").first().reset_index()
+
+    # Get list of depressed subjects based on KSADS depression diagnosis (youth and parent report)
+    diagnosis_cols_youth = {#"mh_y_ksads__dep__mdd__partrem_dx"  :"Diagnosis: Major depressive disorder (F32.4) - Partial remission [Youth]",
+                            "mh_y_ksads__dep__mdd__pres_dx"     :"Diagnosis: Major depressive disorder - Present [Youth]",
+                            #"mh_y_ksads__dep__pdd__oth__pres_dx":"Diagnosis: Other specified depressive disorder, persistent depressive disorder (impairment does not meet full criteria) (F32.8) - Present [Youth]",
+                            #"mh_y_ksads__dep__pdd__partrem_dx"  :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Partial remission [Youth]",
+                            "mh_y_ksads__dep__pdd__pres_dx"     :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Present [Youth]"}
+    diagnosis_cols_parent = {#"mh_p_ksads__dep__mdd__partrem_dx"  :"Diagnosis: Major depressive disorder (F32.4) - Partial remission [Parent]",
+                            "mh_p_ksads__dep__mdd__pres_dx"     :"Diagnosis: Major depressive disorder - Present [Parent]",
+                            #"mh_p_ksads__dep__pdd__oth__pres_dx":"Diagnosis: Other specified depressive disorder, persistent depressive disorder (impairment does not meet full criteria) (F32.8) - Present [Parent]",
+                            #"mh_p_ksads__dep__pdd__partrem_dx"  :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Partial remission [Parent]",
+                            "mh_p_ksads__dep__pdd__pres_dx"     :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Present [Parent]"}
+    
+    # Create a binary depression marker for each subject based on youth and parent report
+    diagnosis_youth_cols = list(diagnosis_cols_youth.keys())
+    y_depr = (ksads_youth[diagnosis_youth_cols] == 1).any(axis=1)
+
+    diagnosis_parent_cols = list(diagnosis_cols_parent.keys())
+    p_depr = (ksads_parent[diagnosis_parent_cols] == 1).any(axis=1)
+
+    depr = y_depr | p_depr
+
+    # Create a binary depression marker for each subject
+    subjects_depr = set(ksads_youth.loc[depr, "participant_id"]) | set(ksads_parent.loc[depr, "participant_id"])
+
+    # Add depression marker to mri_meta_df
+    mri_meta_df["dep_dx"] = mri_meta_df["subject"].apply(lambda x: 1 if x in subjects_depr else 0)
+
     # Add total intracranial volume (TIV) to mri_meta_df per subject and time point
     subcortical_vol = pd.read_csv(dta_path / "phenotype" / "mr_y_smri__vol__aseg.tsv", sep="\t")
     mri_meta_df = mri_meta_df.merge(subcortical_vol[["participant_id", "session_id", "mr_y_smri__vol__aseg__icv_sum"]], left_on=["subject", "timepoint"], right_on=["participant_id", "session_id"], how="left")
@@ -355,6 +409,7 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
             con = duckdb.connect()
             con.execute(f"CREATE OR REPLACE VIEW fitbit_data AS SELECT * FROM read_parquet('{output_dir_fit}/**/combined_fitbit.parquet', union_by_name => TRUE)")
             con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/all_subjects_combined_mri.parquet')")
+
         except Exception as e:
             print(f"Error setting up DuckDB views: {e}")
             print("Please check that the combined parquet files exist in the output directories and are correctly formatted.")

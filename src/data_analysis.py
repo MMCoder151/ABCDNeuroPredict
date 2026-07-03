@@ -23,7 +23,21 @@ from statsmodels.stats.multitest import multipletests
 from pygam import LinearGAM, s, l
 from src.mri_rois import mri_rois
 
-def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, output_path=Path("output")):
+def _cohens_d(x, y):
+    """
+    Calculate Cohen's d effect size between two groups.
+    Parameters:
+        x (array-like): Values for group 1
+        y (array-like): Values for group 2
+    Returns:
+        d (float): Cohen's d effect size
+    """
+    nx, ny = len(x), len(y)
+    dof = nx + ny - 2
+    pooled_std = np.sqrt(((nx - 1) * np.var(x, ddof=1) + (ny - 1) * np.var(y, ddof=1)) / dof)
+    return (np.mean(x) - np.mean(y)) / pooled_std
+
+def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, overwrite = True, output_path=Path("output")):
     '''
     This function analyses group differences between depressed an non-depressed subjects for each MRI feature in the specified mri_files to 
     extract the MRI ROIs that show significant differences between the two groups.
@@ -38,7 +52,18 @@ def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, output_path=Path("
         mri_rois_results (DataFrame): DataFrame containing the regression results for each MRI feature
         mri_rois_results (CSV): CSV file containing the regression results for each MRI feature
     NOTE: This function currently doesn't use DuckDB 
+    TODO: Include scan_site as a covariate in the regression analysis to account for site effects
+    TODO: Include effect size calculations for each MRI feature to quantify the magnitude of group differences
     '''
+    if overwrite == False:
+        existing_results_path = output_path / "mri_rois_results.csv"
+        if existing_results_path.exists():
+            print(f"Overwrite set to False. Loading existing results.")
+            gam_results_df = pd.read_csv(existing_results_path)
+            mri_rois_sig = gam_results_df.loc[gam_results_df["significant_fdr"], "mri_feature"].tolist()
+            return mri_rois_sig, gam_results_df
+        else:
+            print(f"No existing results found at {existing_results_path}. Running analysis.")
 
     # Read in clinical data for depression marker
     youth_directory = dta_path_tabular / "mh_y_ksads__dep.tsv"
@@ -116,6 +141,19 @@ def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, output_path=Path("
     mri_df = [df.merge(ksads_youth[["participant_id", "mh_y_ksads__dep_age"]], on="participant_id", how="left") for df in mri_df]
     mri_df = [df.merge(stc_df[["participant_id", "sex"]], on="participant_id", how="left") for df in mri_df]
 
+    # Add scan_site from mri_meta_df to the mri dataframe
+    mri_meta_first = mri_meta_df.sort_values(["subject", "timepoint"]).groupby("subject").first().reset_index()
+    mri_df = [
+        df.merge(mri_meta_first[["subject", "scan_site"]], left_on="participant_id", right_on="subject", how="left")
+        .drop(columns=["subject"], errors="ignore")  # drop the redundant key column from this merge
+        for df in mri_df
+    ]
+
+    # Encode scan_site to numerical values
+    scan_site_mapping = {site: idx for idx, site in enumerate(mri_meta_df["scan_site"].unique())}
+    for df in mri_df:
+        df["scan_site"] = df["scan_site"].map(scan_site_mapping)
+
     # Print number and percentage of depressed subjects in the MRI dataframe
     depressed_count = mri_df[0]["depression_marker"].sum()
     total_count = len(mri_df[0])
@@ -130,9 +168,6 @@ def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, output_path=Path("
     print(ksads_youth["participant_id"].nunique())
     print(ksads_youth.shape[0] - ksads_youth["participant_id"].nunique())  # excess rows if duplicated
 
-    # look for a timepoint/wave/session column
-    print([c for c in ksads_youth.columns if any(k in c.lower() for k in ["session", "event", "wave", "visit", "year", "arm"])])
-
     # Recode sex from M/F to 0/1
     for df in mri_df:
         df["sex"] = df["sex"].map({"M": 0, "F": 1})
@@ -144,50 +179,52 @@ def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, output_path=Path("
     # Drop subjects with sex, age or TIV missing
     mri_df_filtered = [df.dropna(subset=["sex", "mh_y_ksads__dep_age", "mr_y_smri__vol__aseg__icv_sum"]) for df in mri_df]
 
-    print(subjects_depr_count := len(subjects_depr))  # should now be much smaller, e.g. low hundreds to ~1-2 thousand
-    mri_df[0]["depression_marker"].value_counts()
-    mri_df[0].groupby("depression_marker")[["mh_y_ksads__dep_age", "sex", "mr_y_smri__vol__aseg__icv_sum"]].mean()
-
-
     # Perform regression analysis per MRI feature while accounting for sex and non-linear age influence using a generalized additive model (GAM) and extract p-values for group differences
+    # Also calculate the effect size (Cohen's d) for each MRI feature to quantify the magnitude of group differences
     gam_results = []
+    e_size_results = []
     for df in tqdm(mri_df_filtered, desc="Performing GAM regression analysis for MRI features"):
         for col in df.columns:
-            if col not in ["participant_id", "session_id", "subject", "acq_time", "depression_marker", "mh_y_ksads__dep_age", "sex", "mr_y_smri__vol__aseg__icv_sum", "timepoint"]:
-                model_cols = ["mh_y_ksads__dep_age", "sex", "depression_marker", "mr_y_smri__vol__aseg__icv_sum", col]
+            if col not in ["participant_id", "session_id", "subject", "subject_x", "subject_y", "acq_time", "depression_marker", "mh_y_ksads__dep_age", "sex", 
+                           "mr_y_smri__vol__aseg__icv_sum", "timepoint", "timepoint_x", "timepoint_y", "scan_site"]:
+                model_cols = ["mh_y_ksads__dep_age", "sex", "depression_marker", "mr_y_smri__vol__aseg__icv_sum", "scan_site", col]
                 df_fit = df[model_cols].replace([np.inf, -np.inf], np.nan).dropna()
                 n_dropped = len(df) - len(df_fit)
                 if n_dropped > 0:
                     print(f"{col}: dropped {n_dropped} rows ({(n_dropped/len(df)*100):.2f}%) with missing/invalid data")
                 try:
-                    gam = LinearGAM(s(0) + l(1) + l(2) +l(3)).fit(df_fit[["mh_y_ksads__dep_age", "sex","mr_y_smri__vol__aseg__icv_sum", "depression_marker"]], df_fit[col])
-                    gam_results.append((col, gam.statistics_['p_values'][3]))
+                    gam = LinearGAM(s(0) + l(1) + l(2) + l(3) + l(4)).fit(df_fit[["mh_y_ksads__dep_age", "scan_site", "sex","mr_y_smri__vol__aseg__icv_sum", "depression_marker"]], df_fit[col])
+                    gam_results.append((col, gam.statistics_['p_values'][4]))  # p-value for depression_marker
+                    group_dep = df_fit.loc[df_fit["depression_marker"] == 1, col]
+                    group_nondep = df_fit.loc[df_fit["depression_marker"] == 0, col]
+                    e_size_results.append((col, _cohens_d(group_dep, group_nondep)))
                 except Exception as e:
                     print(f"Error occurred while fitting GAM model for column {col}: {e}")
-    gam_results_df = pd.DataFrame(gam_results, columns=["mri_feature", "p_value"])
-    gam_results_df = gam_results_df.sort_values("p_value")
+    # Combine gam and effect size results into a single DataFrame
+    gam_results = [(col, pval, e_size) for (col, pval), (_, e_size) in zip(gam_results, e_size_results)]
+    results_df = pd.DataFrame(gam_results, columns=["mri_feature", "p_value", "effect_size"])
+    results_df = results_df.sort_values("p_value")
 
     # Perform FDR correction for multiple comparisons
     print("Performing FDR correction for multiple comparisons...")
-    rejected, corrected_p_values, _, _ = multipletests(gam_results_df["p_value"], alpha=0.05, method='fdr_bh')
-    gam_results_df["corrected_p_value"] = corrected_p_values
-    gam_results_df["significant_fdr"] = rejected
+    rejected, corrected_p_values, _, _ = multipletests(results_df["p_value"], alpha=0.05, method='fdr_bh')
+    results_df["corrected_p_value"] = corrected_p_values
+    results_df["significant_fdr"] = rejected
 
     # Print the number of significant MRI ROIs after FDR correction
-    num_significant_rois = gam_results_df["significant_fdr"].sum()
+    num_significant_rois = results_df["significant_fdr"].sum()
     print(f"Number of significant MRI ROIs after FDR correction: {num_significant_rois}")
 
     # Save to CSV
-    gam_results_df.to_csv(output_path / "mri_rois_results.csv", index=False)
+    results_df.to_csv(output_path / "mri_rois_results.csv", index=False)
 
     # Return list of MRI ROIs that show significant differences between depressed and non-depressed subjects (p < 0.05)
-    mri_rois_sig = gam_results_df.loc[gam_results_df["significant_fdr"], "mri_feature"].tolist()
+    mri_rois_sig = results_df.loc[results_df["significant_fdr"], "mri_feature"].tolist()
 
     # Return the list of MRI ROIs and the results dataframe
-    return mri_rois_sig, gam_results_df
+    return mri_rois_sig, results_df
 
-
-def mri_clustering(selected_subjects, output_path = Path("output"), bootstrapping = True, overwrite = True):
+def mri_clustering(data, output_path = Path("output"), clustering_output = None, bootstrapping = True, overwrite = True):
     '''
     This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data.
     It uses several different clustering algorithms (HBDSCAN and Bayesian Gaussian Mixture Models).
@@ -197,6 +234,7 @@ def mri_clustering(selected_subjects, output_path = Path("output"), bootstrappin
     Parameters:
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI z-scores
         output_path (str or Path): Path to save clustering results and visualizations
+        clustering_output (str or Path): Path to save clustering output
         bootstrapping (bool): Whether to perform bootstrapping for cluster stability assessment
         overwrite (bool): Whether to overwrite existing clustering results if they exist
     Returns:
@@ -204,26 +242,31 @@ def mri_clustering(selected_subjects, output_path = Path("output"), bootstrappin
     '''
 
     # Create clustering output path
-    clustering_output_path = os.path.join(output_path, "mri_clustering")
-    os.makedirs(clustering_output_path, exist_ok=True)
+    if clustering_output is None:
+        clustering_output_path = os.path.join(output_path, "clustering")
+        os.makedirs(clustering_output_path, exist_ok=True)
+    else: 
+        clustering_output_path = os.path.join(output_path, str(clustering_output))
+        os.makedirs(clustering_output_path, exist_ok=True)
 
+    # Load existing clustering results if overwrite is set to False
     if overwrite == False:
         existing_results_path = os.path.join(clustering_output_path, "subject_subtypes.csv")
         if os.path.exists(existing_results_path):
             print(f"Overwrite set to False. Loading existing results.")
             results_df = pd.read_csv(existing_results_path)
-            return selected_subjects.merge(results_df[["subject_ids", "subtype"]], left_on="subject_ids", right_on="subject_ids", how="left")
+            return results_df
         else:
             print(f"No existing clustering results found at {existing_results_path}. Running clustering analysis.")
 
-    # Read in the z-scores for the selected subjects and their MRI ROI data
-    z_scores_path = os.path.join(output_path, "normative_modelling", "results", "Z_mri_norm.csv")
-    subject_scores = pd.read_csv(z_scores_path)
+    # Drop columns that are not needed for clustering
+    columns_to_drop = ["subject_ids", "observations", "composite_z", "rank", "subject", "timepoint", "scan_site", "sex", "age", "mr_y_smri__vol__aseg__icv_sum"]
+    for col in columns_to_drop:
+        if col in data.columns:
+            data = data.drop(columns=[col])
 
-    # Filter to selected subjects
-    selected_subjects = selected_subjects.merge(subject_scores, left_on="subject_ids", right_on="subject_ids", how="left")
-
-    selected_subjects.drop(columns=["observations", "composite_z", "rank"], inplace=True)
+    # Drop nas's
+    data = data.dropna().reset_index(drop=True)
 
     def _align_labels(reference, target):
         '''Aligns cluster labels of the target clustering to the reference clustering using the Hungarian algorithm.'''
@@ -317,7 +360,7 @@ def mri_clustering(selected_subjects, output_path = Path("output"), bootstrappin
         dr_model = DR(**dr_params)
         cl_model = CL(**cl_params)
 
-        X_dr   = dr_model.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
+        X_dr   = dr_model.fit_transform(data)
         labels = cl_model.fit_predict(X_dr)
         n_dimensions = X_dr.shape[1]
 
@@ -328,23 +371,23 @@ def mri_clustering(selected_subjects, output_path = Path("output"), bootstrappin
             continue
 
         # Evaluate dimensionality reduction
-        knn_overlap_score = knn_overlap(selected_subjects.drop(columns=["subject_ids"]), X_dr)
-        trustworthiness_score = trustworthiness(selected_subjects.drop(columns=["subject_ids"]), X_dr, n_neighbors=10)
-        pairwise_distance = pairwise_distance_correlation(selected_subjects.drop(columns=["subject_ids"]), X_dr)
+        knn_overlap_score = knn_overlap(data, X_dr)
+        trustworthiness_score = trustworthiness(data, X_dr, n_neighbors=10)
+        pairwise_distance = pairwise_distance_correlation(data, X_dr)
 
         # Evaluate clusters in original space without noise points
         mask = labels != -1
-        sil = silhouette_score(selected_subjects.drop(columns=["subject_ids"])[mask], labels[mask])  
-        db  = davies_bouldin_score(selected_subjects.drop(columns=["subject_ids"])[mask], labels[mask])
-        ch  = calinski_harabasz_score(selected_subjects.drop(columns=["subject_ids"])[mask], labels[mask])
+        sil = silhouette_score(data[mask], labels[mask])  
+        db  = davies_bouldin_score(data[mask], labels[mask])
+        ch  = calinski_harabasz_score(data[mask], labels[mask])
 
         # Evaluate bootstrap stability with Jaccard index and ari score
         if bootstrapping:
             jaccard_scores = []
             ari_scores = []
             for i in range(10):  # Bootstrapping for clustering stability
-                bootstrap_sample = selected_subjects.sample(frac=1, replace=True, random_state=i)
-                X_bootstrap = dr_model.fit_transform(bootstrap_sample.drop(columns=["subject_ids"]))
+                bootstrap_sample = data.sample(frac=1, replace=True, random_state=i)
+                X_bootstrap = dr_model.fit_transform(bootstrap_sample)
                 labels_bootstrap = cl_model.fit_predict(X_bootstrap)
                 # skip degenerate solutions in bootstrap samples
                 if len(np.unique(labels_bootstrap[labels_bootstrap != -1])) < 2 or (labels_bootstrap == -1).sum() / len(labels_bootstrap) > 0.20:
@@ -394,7 +437,7 @@ def mri_clustering(selected_subjects, output_path = Path("output"), bootstrappin
 
     if results_df_filtered.empty:
         print("No clustering solutions met the filtering criteria.")
-        return selected_subjects
+        return data
     
     print(f"Best filtered clustering result: {results_df_filtered.iloc[0].to_dict()}")
 
@@ -405,63 +448,15 @@ def mri_clustering(selected_subjects, output_path = Path("output"), bootstrappin
     best_cl_params = results_df_filtered.iloc[0]['cl_params']
     dr_model = next(DR(**params) for name, DR, params in dr_models if name == best_dr)
     cl_model = next(CL(**params) for name, CL, params in cl_models if name == best_cl)
-    X_dr = dr_model.fit_transform(selected_subjects.drop(columns=["subject_ids"]))
-    selected_subjects["subtype"] = cl_model.fit_predict(X_dr) 
+    X_dr = dr_model.fit_transform(data)
+    data["subtype"] = cl_model.fit_predict(X_dr) 
 
     # Save cluster labels to CSV
-    selected_subjects[["subject_ids", "subtype"]].to_csv(os.path.join(clustering_output_path, "subject_subtypes.csv"), index=False)
+    data[["subject_ids", "subtype"]].to_csv(os.path.join(clustering_output_path, "subject_subtypes.csv"), index=False)
 
     # TODO: Fix visualization
 
-    # Reduce dimensionality for visualization if not already 2D
-    #if X_dr.shape[1] > 2:
-    #    dr_vis = umap.UMAP(n_components=2, random_state=42)
-    #    X_dr_vis = dr_vis.fit_transform(X_dr)
-    #else:        X_dr_vis = X_dr
-
-    # Create colored scatter plot of clusters in dimensionality reduction space
-    #plt.figure(figsize=(10, 6))
-    #for subtype in np.unique(selected_subjects["subtype"]):
-    #    subtype_data = X_dr_vis[selected_subjects["subtype"] == subtype]
-    #    plt.scatter(subtype_data[:, 0], subtype_data[:, 1], label=f"Subtype {subtype}", alpha=0.6)
-    #plt.title("Clusters in Dimensionality Reduction Space")
-    #plt.xlabel("Component 1")
-    #plt.ylabel("Component 2")
-    #plt.legend()
-    #plt.tight_layout()
-    #plt.savefig(os.path.join(clustering_output_path, f"clusters_in_dr_space.png"))
-    #plt.close()
-
-    # Create cluster profile plots for top 5 clusters
-    #top_clusters = selected_subjects["subtype"].value_counts().index[:5]
-    #for cluster in top_clusters:
-    #    cluster_profile = selected_subjects[selected_subjects["subtype"] == cluster].drop(columns=["subject_ids", "subtype"]).mean()
-    #    plt.figure(figsize=(10, 6))
-    #    cluster_profile.plot(kind="bar")
-    #    plt.title(f"Cluster {cluster} Profile")
-    #    plt.ylabel("Mean Z-score")
-    #    plt.xticks(rotation=45, ha="right")
-    #    plt.tight_layout()
-    #    plt.savefig(os.path.join(clustering_output_path, f"cluster_{cluster}_profile.png"))
-    #    plt.close()
-
-    # Create cluster centoroid plots in dimensionality reduction space
-    #plt.figure(figsize=(10, 6))
-    #centroids = (
-    #    pd.DataFrame(X_dr_vis)
-    #    .groupby(selected_subjects["subtype"])
-    #    .mean()
-    #)   
-    #plt.scatter(centroids[0], centroids[1], s=200, marker="X")
-    #plt.title("Cluster Centroids in Dimensionality Reduction Space")
-    #plt.xlabel("Component 1")
-    #plt.ylabel("Component 2")
-    #plt.legend()
-    #plt.tight_layout()
-    #plt.savefig(os.path.join(clustering_output_path, f"cluster_centroids_in_dr_space.png"))
-    #plt.close()
-
-    return selected_subjects
+    return data
 
 def missingness_analysis(con, fit_meta_df, output_path = Path("output")):
     '''

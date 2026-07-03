@@ -141,9 +141,6 @@ def define_models():
         }
     return models
 
-def _to_numpy_if_needed(X):
-        return X.to_numpy() if hasattr(X, "to_numpy") else X
-
 def train_and_evaluate_models(X, y, search="random", outer_splits=10, inner_splits=10, models_to_train=None):
     ''' Trains and evaluates multiple machine learning models using nested cross-validation.
         
@@ -234,7 +231,8 @@ def train_and_evaluate_models(X, y, search="random", outer_splits=10, inner_spli
             strat = X["subtype"]
             X = X.drop(columns=["subtype"])
         else:
-            raise ValueError("Expected 'subtype' column in features for stratification during CV. Please ensure it is included in the input data.")
+            print("Expected 'subtype' column in features for stratification during CV. Stratifying according to labels instead.")
+            strat = y
 
         # Nested CV Setup: inner tuning inside each outer training split
         for train_idx, test_idx in tqdm(cv_struct["outer_cv"].split(X, y = strat),desc=f"Running nested CV for {name}"):
@@ -243,8 +241,7 @@ def train_and_evaluate_models(X, y, search="random", outer_splits=10, inner_spli
             y_train = _safe_index(y, train_idx)
             X_test = _safe_index(X, test_idx)
             y_test = _safe_index(y, test_idx)
-            #groups_train = _safe_index(groups, train_idx) if groups is not None else print("Warning: No groups available for training split. Grouped CV may not work properly!")
-            
+
             fold_searcher = make_searcher(model, param_grid)
             fold_searcher.fit(X_train, y_train)  
 
@@ -279,7 +276,7 @@ def train_and_evaluate_models(X, y, search="random", outer_splits=10, inner_spli
 
 def train_final_model(X, y, model):
     ''' Trains the final model on the full dataset using the best hyperparameters identified from nested CV.
-        1. Performs a hyperparameter search (grid or random) on the entire dataset to find the best parameters.
+        1. Performs a hyperparameter search on the entire dataset to find the best parameters.
         2. Fits the model with the best hyperparameters on the full dataset to create a deployable model.
         3. Returns the fully trained model and its best hyperparameters.
         Note: This function should only be called after identifying the best model type from nested CV to avoid data leakage.
@@ -385,7 +382,6 @@ def define_regression_models():
     }
     return models
  
- 
 def train_and_evaluate_regression_models(
     X, y, search="random", outer_splits=10, inner_splits=10, models_to_train=None
 ):
@@ -484,7 +480,8 @@ def train_and_evaluate_regression_models(
             strat = X["subtype"]
             X = X.drop(columns=["subtype"])
         else:
-            raise ValueError("Expected 'subtype' column in features for stratification during CV. Please ensure it is included in the input data.")
+            print("Expected 'subtype' column in features for stratification during CV. Stratifying according to labels instead.")
+            strat = y
  
         for train_idx, test_idx in tqdm(cv_struct["outer_cv"].split(X, y=strat), desc=f"Running nested CV for {name}"):
             X_train = _safe_index(X, train_idx)
@@ -549,7 +546,6 @@ def train_and_evaluate_regression_models(
  
     return nested_cv_scores
  
- 
 def train_final_regression_model(X, y, model):
     """ Trains the final regression model on the full dataset using the best
         hyperparameters identified from nested CV. Mirrors part 1's
@@ -602,8 +598,7 @@ def train_multi_target_regression(
     search="random",
     outer_splits=10,
     inner_splits=10,
-    results_dir="multi_target_regression_results",
-    skip_existing=True
+    results_dir="multi_target_regression_results"
 ):
     """
     Loop train_and_evaluate_regression_models over each z-score target column
@@ -658,7 +653,7 @@ def train_multi_target_regression(
         valid_mask = y_target.notna()
         if not valid_mask.all():
             n_dropped = (~valid_mask).sum()
-            print(f"Dropping {n_dropped} subjects with missing z-score for '{col}'.")
+            print(f"Dropping {n_dropped} subjects with missing data for '{col}'.")
             X_target = X_target.loc[valid_mask].reset_index(drop=True)
             y_target = y_target.loc[valid_mask].reset_index(drop=True)
  
@@ -716,7 +711,6 @@ def train_multi_target_regression(
         print(f"\n{len(failures)} target(s) failed: {list(failures.keys())}")
  
     return all_results, failures
- 
  
 def train_final_models_multi_target_regression(
     X,
