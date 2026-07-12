@@ -17,6 +17,8 @@ from scipy.stats import wilcoxon
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
 import joblib
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
 
 def _one_hot_encode(df, col="scan_site", prefix="scan_site", categories=None):
     """One-hot encode a scan-site column while keeping a stable category order."""
@@ -99,7 +101,7 @@ def analyse_confounds(dem_df, mri_meta_df, transformed_data, output_path=pathlib
         print(zero_variance_cols)
         analysis_cols = [c for c in analysis_cols if c not in zero_variance_cols]
 
-    # Merge z_scores_df with demographic data to get age, sex, scan_site, and TIV for each subject
+    # Define columns to attach and merge them onto both raw and transformed data
     dem_cols_to_attach = ["age_at_first_mri", "sex", "scan_site"]
     mri_cols_to_attach = ["mr_y_smri__vol__aseg__icv_sum"]
 
@@ -196,21 +198,23 @@ def analyse_confounds(dem_df, mri_meta_df, transformed_data, output_path=pathlib
     if sex_dummy_cols != transformed_sex_dummy_cols:
         raise ValueError("Sex dummy columns do not align between raw and post-normative data.")
 
-    # Fit hierarchical linear regression models for each MRI ROI with age, sex, and site as predictors before and after noromative modeling
-    # and extract both total and unique variance explained (R squared and adjusted R squared) for each confound
     confound_effects = []
 
     # Define model hierarchy
-    # Order reflects theoretical priority: site first (nuisance),
-    # then age (primary biological), then sex
     model_hierarchy = {
         'site only':          site_dummy_cols,
-        'site + ITV':         site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum'],
-        'site + ITV + age':         site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri'],
-        'site + ITV + age^2': site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri_c_sq'],
-        'site + ITV + age + sex':   site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri'] + sex_dummy_cols,
-        'site + ITV + age + age^2 + sex': site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri', 'age_at_first_mri_c_sq'] + sex_dummy_cols 
+        'site + TIV':         site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum'],
+        'site + TIV + age':         site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri'],
+        'site + TIV + age^2': site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri_c_sq'],
+        'site + TIV + age + sex':   site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri'] + sex_dummy_cols,
+        'site + TIV + age^2 + sex': site_dummy_cols + ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri_c_sq'] + sex_dummy_cols,
+        'TIV + age^2 + sex': ['mr_y_smri__vol__aseg__icv_sum', 'age_at_first_mri_c_sq'] + sex_dummy_cols
     }
+
+    # Impute missing TIV values
+    imputer = SimpleImputer(strategy='mean')
+    raw_data['mr_y_smri__vol__aseg__icv_sum'] = imputer.fit_transform(raw_data[['mr_y_smri__vol__aseg__icv_sum']])
+    transformed_data['mr_y_smri__vol__aseg__icv_sum'] = imputer.fit_transform(transformed_data[['mr_y_smri__vol__aseg__icv_sum']])
 
     for roi in tqdm(analysis_cols, desc="Analyzing confound effects"):
         # Prepare data for regression
@@ -268,35 +272,42 @@ def analyse_confounds(dem_df, mri_meta_df, transformed_data, output_path=pathlib
             })
     df = pd.DataFrame(rows)
 
+    # Print site effect R2 pre and post per ROI
+    site_effects = df[df['model'] == 'site only']
+    print("Site Effect R2 per ROI:")
+    for _, row in site_effects.iterrows():
+        print(f"  {row['variable']}: R2 pre={row['R2_pre']:.4f}, R2 post={row['R2_post']:.4f}")
+
+    # Pivot the dataframe to have models as columns and variables as rows for easier comparison
     pivot = df.pivot(index='variable', columns='model')
 
-    # Age effect = (site+age) - (site only)
-    age_R2_pre  = pivot['R2_pre']['site + age'] - pivot['R2_pre']['site only']
-    age_R2_post = pivot['R2_post']['site + age'] - pivot['R2_post']['site only']
+    # TIV effect = (site+TIV) - (site only)
+    tiv_R2_pre  = pivot['R2_pre']['site + TIV'] - pivot['R2_pre']['site only']
+    tiv_R2_post = pivot['R2_post']['site + TIV'] - pivot['R2_post']['site only']
+    tiv_reduction = (tiv_R2_pre - tiv_R2_post)
+    print(f"TIV effect: mean R2 pre={tiv_R2_pre.mean():.4f}, mean R2 post={tiv_R2_post.mean():.4f}")
+    print(f"TIV effect: mean R2 reduction={tiv_reduction.mean():.4f}")
+
+    # Age effect = (site+TIV+age) - (site+TIV)
+    age_R2_pre  = pivot['R2_pre']['site + TIV + age'] - pivot['R2_pre']['site + TIV']
+    age_R2_post = pivot['R2_post']['site + TIV + age'] - pivot['R2_post']['site + TIV']
     age_reduction = (age_R2_pre - age_R2_post)
     print(f"Age effect: mean R2 pre={age_R2_pre.mean():.4f}, mean R2 post={age_R2_post.mean():.4f}")
     print(f"Age effect: mean R2 reduction={age_reduction.mean():.4f}")
 
-    # Age effect with age^2 = (site+age+age^2) - (site only)
-    age2_R2_pre  = pivot['R2_pre']['site + age + age^2'] - pivot['R2_pre']['site only']
-    age2_R2_post = pivot['R2_post']['site + age + age^2'] - pivot['R2_post']['site only']
+    # Age^2 effect = (site+TIV+age^2) - (site+TIV)
+    age2_R2_pre  = pivot['R2_pre']['site + TIV + age^2'] - pivot['R2_pre']['site + TIV']
+    age2_R2_post = pivot['R2_post']['site + TIV + age^2'] - pivot['R2_post']['site + TIV']
     age2_reduction = (age2_R2_pre - age2_R2_post)
     print(f"Age^2 effect: mean R2 pre={age2_R2_pre.mean():.4f}, mean R2 post={age2_R2_post.mean():.4f}")
     print(f"Age^2 effect: mean R2 reduction={age2_reduction.mean():.4f}")
 
-    # Sex effect = (site+age+sex) - (site+age)
-    sex_R2_pre  = pivot['R2_pre']['site + age + sex'] - pivot['R2_pre']['site + age']
-    sex_R2_post = pivot['R2_post']['site + age + sex'] - pivot['R2_post']['site + age']
+    # Sex effect = (site+TIV+age+sex) - (site+TIV+age)
+    sex_R2_pre  = pivot['R2_pre']['site + TIV + age + sex'] - pivot['R2_pre']['site + TIV + age']
+    sex_R2_post = pivot['R2_post']['site + TIV + age + sex'] - pivot['R2_post']['site + TIV + age']
     sex_reduction = (sex_R2_pre - sex_R2_post)
     print(f"Sex effect: mean R2 pre={sex_R2_pre.mean():.4f}, mean R2 post={sex_R2_post.mean():.4f}")
     print(f"Sex effect: mean R2 reduction={sex_reduction.mean():.4f}")
-
-    # Sex effect with age^2 = (site+age+age^2+sex) - (site+age+age^2)
-    sex2_R2_pre  = pivot['R2_pre']['site + age + age^2 + sex'] - pivot['R2_pre']['site + age + age^2']
-    sex2_R2_post = pivot['R2_post']['site + age + age^2 + sex'] - pivot['R2_post']['site + age + age^2']
-    sex2_reduction = (sex2_R2_pre - sex2_R2_post)
-    print(f"Sex with age^2 effect: mean R2 pre={sex2_R2_pre.mean():.4f}, mean R2 post={sex2_R2_post.mean():.4f}")
-    print(f"Sex with age^2 effect: mean R2 reduction={sex2_reduction.mean():.4f}")
 
     # Site effect is just the R2 of 'site only'
     site_R2_pre  = pivot['R2_pre']['site only']
@@ -304,6 +315,13 @@ def analyse_confounds(dem_df, mri_meta_df, transformed_data, output_path=pathlib
     site_reduction = site_R2_pre - site_R2_post
     print(f"Site effect: mean R2 pre={site_R2_pre.mean():.4f}, mean R2 post={site_R2_post.mean():.4f}")
     print(f"Site effect: mean R2 reduction={site_reduction.mean():.4f}")
+
+    # Partial site efffect = (site + TIV + age^2 + sex) - (TIV + age^2 + sex)
+    site_partial_R2_pre  = pivot['R2_pre']['site + TIV + age^2 + sex'] - pivot['R2_pre']['TIV + age^2 + sex']
+    site_partial_R2_post = pivot['R2_post']['site + TIV + age^2 + sex'] - pivot['R2_post']['TIV + age^2 + sex']
+    site_partial_reduction = (site_partial_R2_pre - site_partial_R2_post)
+    print(f"Partial site effect: mean R2 pre={site_partial_R2_pre.mean():.4f}, mean R2 post={site_partial_R2_post.mean():.4f}")
+    print(f"Partial site effect: mean R2 reduction={site_partial_reduction.mean():.4f}")
 
     residual_association_df = df[df["model"].isin(model_hierarchy)].copy()
     residual_association_df = residual_association_df[[
@@ -321,9 +339,12 @@ def analyse_confounds(dem_df, mri_meta_df, transformed_data, output_path=pathlib
     print(
         "Post-normative residual association (mean R2): "
         f"site-only={residual_association_df.loc[residual_association_df['model'] == 'site only', 'R2_post'].mean():.4f}, "
-        f"site+age={residual_association_df.loc[residual_association_df['model'] == 'site + age', 'R2_post'].mean():.4f}, "
-        f"site+age+age^2={residual_association_df.loc[residual_association_df['model'] == 'site + age + age^2', 'R2_post'].mean():.4f}, "
-        f"site+age+age^2+sex={residual_association_df.loc[residual_association_df['model'] == 'site + age + age^2 + sex', 'R2_post'].mean():.4f}"
+        f"site + TIV={residual_association_df.loc[residual_association_df['model'] == 'site + TIV', 'R2_post'].mean():.4f}, "
+        f"site + TIV + age={residual_association_df.loc[residual_association_df['model'] == 'site + TIV + age', 'R2_post'].mean():.4f}, "
+        f"site + TIV + age^2={residual_association_df.loc[residual_association_df['model'] == 'site + TIV + age^2', 'R2_post'].mean():.4f}, "
+        f"site + TIV + age + sex={residual_association_df.loc[residual_association_df['model'] == 'site + TIV + age + sex', 'R2_post'].mean():.4f}, "
+        f"site + TIV + age^2 + sex={residual_association_df.loc[residual_association_df['model'] == 'site + TIV + age^2 + sex', 'R2_post'].mean():.4f}, "
+        f"TIV + age^2 + sex={residual_association_df.loc[residual_association_df['model'] == 'TIV + age^2 + sex', 'R2_post'].mean():.4f}"
     )
 
     # Wilcoxon signed-rank test to compare the R2 values for each confound pre and post normative modeling across all MRI ROIs
@@ -343,9 +364,29 @@ def analyse_confounds(dem_df, mri_meta_df, transformed_data, output_path=pathlib
     stat, p_site = wilcoxon(site_R2_pre[valid], site_R2_post[valid])
     print('Site R2 Wilcoxon p=', p_site)
 
+    valid = (~tiv_R2_pre.isna()) & (~tiv_R2_post.isna())
+    stat, p_tiv = wilcoxon(tiv_R2_pre[valid], tiv_R2_post[valid])
+    print('TIV R2 Wilcoxon p=', p_tiv)
+
+    valid = (~site_partial_R2_pre.isna()) & (~site_partial_R2_post.isna())
+    stat, p_site_partial = wilcoxon(site_partial_R2_pre[valid], site_partial_R2_post[valid])
+    print('Partial Site R2 Wilcoxon p=', p_site_partial)
+
+    confound_effects_df = pd.DataFrame({
+        "variable": analysis_cols,
+        "site_R2_pre": site_R2_pre.values,
+        "site_R2_post": site_R2_post.values,
+        "age_R2_pre": age_R2_pre.values,
+        "age_R2_post": age_R2_post.values,
+        "age2_R2_pre": age2_R2_pre.values,
+        "age2_R2_post": age2_R2_post.values,
+        "tiv_R2_pre": tiv_R2_pre.values,
+        "tiv_R2_post": tiv_R2_post.values
+    })
+
     return confound_effects_df
 
-def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("output"), overwrite=True):
+def normative_selection(mri_meta_df, roi_cols, data = None, con = None, output_path=pathlib.Path("output"), overwrite=True):
     '''
     This function performs normative modeling and selects subjects based on their composite absolute z-score. 
     It selects the top 10% (based on prevalence) of subjects with the highest cumulative z-score.
@@ -354,7 +395,8 @@ def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("ou
     Parameters:
         con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
         mri_meta_df (DataFrame): DataFrame containing MRI metadata
-        dem_df (DataFrame): DataFrame containing demographic data
+        roi_cols (list): List of MRI ROI column names
+        data (DataFrame, optional): Pre-loaded MRI data. If provided, this will be used instead of querying the database.
         output_path (pathlib.Path): Path to the output directory where the normative model results will be saved
     Returns:
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI data and respective z-scores
@@ -379,19 +421,23 @@ def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("ou
         [["subject", "sex", "age_at_mri", "scan_site", "mr_y_smri__vol__aseg__icv_sum"]]
     )
     
-    # Query MRI data for the first timepoint for each included subject
-    query = f"""
-        SELECT "subject", "timepoint", {', '.join(f'"{col}"' for col in roi_cols)}
-        FROM mri_data
-        WHERE subject IN ({', '.join(f"'{sub}'" for sub in included_subjects)})
-        AND timepoint IN (
-            SELECT MIN(timepoint)
-            FROM mri_data AS sub_mri
-            WHERE sub_mri.subject = mri_data.subject
-        )
-    """
-    mri_df = con.execute(query).df()
-    print(f"MRI data loaded: {len(mri_df)} subjects")
+    if data is not None:
+        print("Using provided data for normative modeling.")
+        mri_df = data
+    else:
+        # Query MRI data for the first timepoint for each included subject
+        query = f"""
+            SELECT "subject", "timepoint", {', '.join(f'"{col}"' for col in roi_cols)}
+            FROM mri_data
+            WHERE subject IN ({', '.join(f"'{sub}'" for sub in included_subjects)})
+            AND timepoint IN (
+                SELECT MIN(timepoint)
+                FROM mri_data AS sub_mri
+                WHERE sub_mri.subject = mri_data.subject
+            )
+        """
+        mri_df = con.execute(query).df()
+        print(f"MRI data loaded: {len(mri_df)} subjects")
 
     # Merge MRI data 
     df = mri_df.merge(
@@ -505,6 +551,13 @@ def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("ou
     # Calculate composite absolute z-score across all MRI ROIs for each subject
     centiles_df = _build_sign_aligned_composite(centiles_df, roi_cols, mri_rois_results)
 
+    # Weigh z-scores by absolute effect size of each ROI from the group-difference analysis
+    effect_size_lookup = mri_rois_results.set_index("mri_feature")["effect_size"]
+    weighted = centiles_df[roi_cols].copy()
+    for roi in roi_cols:
+        weighted[roi] = centiles_df[roi] * abs(effect_size_lookup[roi])
+    centiles_df["composite_z_weighted"] = weighted.sum(axis=1)
+
     from sklearn.metrics import roc_auc_score, roc_curve
     depressed_subject_set = set(mri_meta_df[mri_meta_df["dep_dx"] == 1]["subject"].unique())
     y_true = centiles_df["subject_ids"].isin(depressed_subject_set).astype(int)  # deduplicated!
@@ -600,9 +653,9 @@ def normative_selection(con, mri_meta_df, roi_cols, output_path=pathlib.Path("ou
 
     return selected_subjects
 
-def create_composites(selected_subjects, vif_threshold=10, overwrite=True, output_path=Path("output")):
+def create_composites(selected_subjects, vif_threshold=10, overwrite=True, output_path=Path("output"), composite_output = None):
     """
-    Creates composite scores out of given variables based on variance inflation factors (VIF).
+    Creates composite scores out of given variables based on variance inflation factors (VIF) and drops zero variance columns.
  
     Parameters:
         selected_subjects (DataFrame): DataFrame containing the selected subjects and their data to be analysed
@@ -620,13 +673,14 @@ def create_composites(selected_subjects, vif_threshold=10, overwrite=True, outpu
         try:
             features_with_composites = pd.read_csv(Path(output_path / "fitbit_features_with_composites.csv"))
             composite_df = pd.read_csv(Path(output_path / "composite_dictionary.csv"))
+            return features_with_composites, composite_df
         except Exception as e:
             print(f"An error occured: {e}")
             return e
 
     vif_cols = [
         col for col in selected_subjects.columns
-        if col not in ["subject", "composite_z", "Wear_Time", "subtype", "group"]
+        if col not in ["subject", "participant_id", "composite_z", "Wear_Time", "subtype", "group"]
     ]
  
     # Drop zero-variance columns (VIF undefined for these)
@@ -737,13 +791,29 @@ def create_composites(selected_subjects, vif_threshold=10, overwrite=True, outpu
     for name, members in composite_dict.items():
         print(f"  {name}: {members}")
 
-    selected_subjects.to_csv(Path(output_path / "fitbit_features_with_composites.csv"), index=False)
-    composite_df = pd.DataFrame({
-        "composite_name": list(composite_dict.keys()),
-        "features_included": [", ".join(features) for features in composite_dict.values()]
-    })
-    composite_df.to_csv(Path(output_path / "composite_dictionary.csv"), index=False)
- 
+    if zero_variance_cols:
+        print(f"Dropping columns with zero variance: {len(zero_variance_cols)}")
+        print(zero_variance_cols)
+        selected_subjects.drop(columns=zero_variance_cols, inplace=True, errors="ignore")
+
+    if composite_output is not None:
+        composite_output_path = Path(output_path) / composite_output
+        if not composite_output_path.exists():
+            composite_output_path.mkdir(parents=True)
+        selected_subjects.to_csv(Path(composite_output_path / "features_with_composites.csv"), index=False)
+        composite_df = pd.DataFrame({
+            "composite_name": list(composite_dict.keys()),
+            "features_included": [", ".join(features) for features in composite_dict.values()]
+        })
+        composite_df.to_csv(Path(composite_output_path / "composite_dictionary.csv"), index=False)
+    else:    
+        selected_subjects.to_csv(Path(output_path / "features_with_composites.csv"), index=False)
+        composite_df = pd.DataFrame({
+            "composite_name": list(composite_dict.keys()),
+            "features_included": [", ".join(features) for features in composite_dict.values()]
+        })
+        composite_df.to_csv(Path(output_path / "composite_dictionary.csv"), index=False)
+    
     return selected_subjects, composite_dict
 
 def extr_fitbit_features(con, selected_subjects, overwrite=True, output_path=Path("output")):
@@ -991,18 +1061,18 @@ def normative_selection_fitbit(dem_df, fitbit_features, output_path = Path("outp
 
     return selected_fitbit_subjects
 
-def fit_residualiser(X_train, dem_df, overwrite=True):
+def fit_residualiser(X_train, dem_df, mri_meta_df, overwrite=True, residualiser_output="residualisation"):
     '''
     Fit a GPR per feature on TRAINING data only.
-    Covariates: age (continuous) + sex (dummy-coded)
+    Covariates: age (continuous) + sex (dummy-coded) + scan site (dummy-coded) + TIV (continuous)
     '''
 
     if overwrite == False:
         print("Residualiser fitting skipped (overwrite=False). To re-run residualiser fitting, set overwrite=True.")
         try:
             models = []
-            residualisation_dir = Path("output") / "residualisation"
-            for i in range(len(X_train.columns)):
+            residualisation_dir = Path("output") / residualiser_output
+            for i in range(len(X_train.columns)-1):
                 gpr = joblib.load(residualisation_dir / f"gpr_model_{i}.joblib")
                 models.append(gpr)
             return models
@@ -1012,7 +1082,7 @@ def fit_residualiser(X_train, dem_df, overwrite=True):
             raise e
         
     X_train.dropna(inplace=True)
-    columns_to_drop = ["subject", "subtype", "age_at_first_mri", "sex"]
+    columns_to_drop = ["subject", "subtype", "age_at_first_mri", "sex", "Wear_Time", "timepoint"]
     columns_to_drop = [c for c in columns_to_drop if c in X_train.columns]
     X_train = X_train.drop(columns=columns_to_drop, errors="ignore")
 
@@ -1026,7 +1096,10 @@ def fit_residualiser(X_train, dem_df, overwrite=True):
 
     age_train = dem_df.loc[X_train.index, "age_at_first_mri"].values.reshape(-1, 1)
     sex_train = pd.get_dummies(dem_df.loc[X_train.index, "sex"], drop_first=True).values
-    design_matrix_train = np.hstack([age_train, sex_train])
+    scan_site_train = pd.get_dummies(dem_df.loc[X_train.index, "scan_site"], drop_first=True).values
+    tiv_train = mri_meta_df.loc[X_train.index, "mr_y_smri__vol__aseg__icv_sum"].values.reshape(-1, 1)
+    tiv_train = np.nan_to_num(tiv_train, nan=np.nanmean(tiv_train))
+    design_matrix_train = np.hstack([age_train, sex_train, scan_site_train, tiv_train])
 
     n_features = X_train.shape[1]
     models = []
@@ -1038,20 +1111,20 @@ def fit_residualiser(X_train, dem_df, overwrite=True):
         models.append(gpr)
         
     #Save models to disk in residualisation folder
-    residualisation_dir = Path("output") / "residualisation"
+    residualisation_dir = Path("output") / residualiser_output
     if not residualisation_dir.exists():
         residualisation_dir.mkdir(parents=True)
     for i, gpr in enumerate(models):
         joblib.dump(gpr, residualisation_dir / f"gpr_model_{i}.joblib")
     return models
 
-def apply_residualiser(models, X, dem_df):
+def apply_residualiser(models, X, dem_df, mri_meta_df):
     '''
     Apply the fitted GPR residualiser to new data (e.g. test set).
     '''
 
     X.dropna(inplace=True)
-    columns_to_drop = ["subject", "subtype", "age_at_first_mri", "sex"]
+    columns_to_drop = ["subject", "subtype", "age_at_first_mri", "sex", "Wear_Time", "timepoint"]
     columns_to_drop = [c for c in columns_to_drop if c in X.columns]
     dropped_cols_df = X[columns_to_drop].copy()
     X = X.drop(columns=columns_to_drop, errors="ignore")
@@ -1068,12 +1141,102 @@ def apply_residualiser(models, X, dem_df):
 
     age = dem_df.loc[X.index, "age_at_first_mri"].values.reshape(-1, 1)
     sex = pd.get_dummies(dem_df.loc[X.index, "sex"], drop_first=True).values
-    design_matrix = np.hstack([age, sex])
-    
+    scan_site = pd.get_dummies(dem_df.loc[X.index, "scan_site"], drop_first=True).values
+    tiv = mri_meta_df.loc[X.index, "mr_y_smri__vol__aseg__icv_sum"].values.reshape(-1, 1)
+    tiv = np.nan_to_num(tiv, nan=np.nanmean(tiv))
+    design_matrix = np.hstack([age, sex, scan_site, tiv])
+
     X_residualised = X.copy()
     for i, gpr in tqdm(enumerate(models), desc="Applying GPR residualiser", total=len(models)):
-        X_residualised.iloc[:, i] = gpr.predict(design_matrix)
+        predicted = gpr.predict(design_matrix)
+        X_residualised.iloc[:, i] = X.iloc[:, i].values - predicted
 
     X_residualised = pd.concat([dropped_cols_df.loc[X_residualised.index], X_residualised], axis=1)
     
     return X_residualised
+
+def resample(X, y):
+    '''
+    Resamples data to balance classes in the target y using a hybrid under- and over-sampling approach, while minimising the amount of synthetic data generated.
+        1. Under-sample the majority class using RandomUnderSampler to 75% of the original majority class size
+        2. Over-sample the minority class using SMOTE to 25% of the original majority class size
+    Parameters:
+        X (DataFrame): DataFrame containing the features to be resampled
+        y (Series): Series containing the target variable to be resampled
+    Returns:
+        X_resampled (DataFrame): DataFrame containing the resampled features
+        y_resampled (Series): Series containing the resampled target variable
+    NOTE: Works mainly with binary class labels
+    '''
+
+    # Get feature columns
+    cols_to_exclude = ["subject", "subtype", "age_at_first_mri", "sex", "Wear_Time", "timepoint"]
+    feature_cols = [col for col in X.columns if col not in cols_to_exclude]
+
+    # Under-sample the majority class to 75% of the original majority class size
+    original_class_distribution = y.value_counts()
+    print(f"Original class distribution: {original_class_distribution.to_dict()}")
+
+    majority_class = original_class_distribution.idxmax()
+    minority_class = original_class_distribution.idxmin()
+
+    target_majority_count = int(original_class_distribution[majority_class] * 0.75)
+
+    undersample = RandomUnderSampler(
+        sampling_strategy={
+            majority_class: target_majority_count,
+            minority_class: original_class_distribution[minority_class]
+        },
+        random_state=42
+    )
+
+    X_undersampled, y_undersampled = undersample.fit_resample(
+        X, y
+    )
+
+    # Recover subject IDs for the original undersampled rows; synthetic SMOTE rows get missing IDs.
+    undersampled_source_indices = getattr(undersample, "sample_indices_", None)
+    if undersampled_source_indices is None:
+        raise RuntimeError("RandomUnderSampler did not expose sample_indices_; cannot recover subject IDs safely.")
+    undersampled_subject_ids = X.iloc[undersampled_source_indices]["subject"].reset_index(drop=True)
+
+    # Impute missing values in the undersampled data using IterativeImputer
+    print("Imputing missing values in undersampled data using IterativeImputer...")
+    imputer = IterativeImputer(random_state=0, max_iter=20)
+    X_undersampled_imputed = pd.DataFrame(
+        imputer.fit_transform(X_undersampled[feature_cols]),
+        columns=feature_cols,
+        index=X_undersampled.index
+    )
+
+    # Over-sample the minority class to 25% of the original majority class size
+    target_minority_count = int(original_class_distribution[majority_class] * 0.25)
+
+    smote = SMOTE(
+        sampling_strategy={
+            majority_class: target_majority_count,
+            minority_class: target_minority_count
+        },
+        random_state=42
+    )
+
+    X_resampled, y_resampled = smote.fit_resample(
+        X_undersampled_imputed, y_undersampled
+    )
+
+    X_resampled["subject_ids"] = pd.concat(
+    [
+        undersampled_subject_ids,
+        pd.Series([pd.NA] * (len(X_resampled) - len(undersampled_subject_ids))),
+    ],
+    ignore_index=True,
+    )   
+
+    # Print class distribution of original and resampled data
+    resampled_class_distribution = pd.Series(y_resampled).value_counts()
+    print("Original class distribution:")
+    print(original_class_distribution)
+    print("Resampled class distribution:")
+    print(resampled_class_distribution)
+
+    return X_resampled, y_resampled

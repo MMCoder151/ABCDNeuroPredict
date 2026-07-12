@@ -10,18 +10,18 @@ import hdbscan
 from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.metrics import confusion_matrix, silhouette_score
 from scipy.optimize import linear_sum_assignment
-from sklearn.metrics import jaccard_score, davies_bouldin_score, calinski_harabasz_score, adjusted_rand_score
+from sklearn.metrics import jaccard_score, davies_bouldin_score, calinski_harabasz_score, adjusted_rand_score, matthews_corrcoef
 from pyampute.exploration.mcar_statistical_tests import MCARTest
 import pacmap
 from sklearn.decomposition import PCA
 import umap
 from sklearn.manifold import trustworthiness
 from sklearn.neighbors import NearestNeighbors
-from itertools import product
 from sklearn.model_selection import ParameterGrid
 from statsmodels.stats.multitest import multipletests
 from pygam import LinearGAM, s, l
 from src.mri_rois import mri_rois
+from scipy.stats import fisher_exact
 
 def _cohens_d(x, y):
     """
@@ -36,6 +36,24 @@ def _cohens_d(x, y):
     dof = nx + ny - 2
     pooled_std = np.sqrt(((nx - 1) * np.var(x, ddof=1) + (ny - 1) * np.var(y, ddof=1)) / dof)
     return (np.mean(x) - np.mean(y)) / pooled_std
+
+def _cohens_d_std(x, y, d=None):
+    """
+    Approximate standard deviation (standard error) of Cohen's d.
+    Parameters:
+        x (array-like): Values for group 1
+        y (array-like): Values for group 2
+        d (float, optional): Precomputed Cohen's d
+    Returns:
+        float: Standard deviation (SE) estimate for Cohen's d
+    """
+    nx, ny = len(x), len(y)
+    if nx < 2 or ny < 2:
+        return np.nan
+    if d is None:
+        d = _cohens_d(x, y)
+    var_d = ((nx + ny) / (nx * ny)) + ((d ** 2) / (2 * (nx + ny - 2)))
+    return np.sqrt(var_d)
 
 def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, overwrite = True, output_path=Path("output")):
     '''
@@ -182,7 +200,6 @@ def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, overwrite = True, 
     # Perform regression analysis per MRI feature while accounting for sex and non-linear age influence using a generalized additive model (GAM) and extract p-values for group differences
     # Also calculate the effect size (Cohen's d) for each MRI feature to quantify the magnitude of group differences
     gam_results = []
-    e_size_results = []
     for df in tqdm(mri_df_filtered, desc="Performing GAM regression analysis for MRI features"):
         for col in df.columns:
             if col not in ["participant_id", "session_id", "subject", "subject_x", "subject_y", "acq_time", "depression_marker", "mh_y_ksads__dep_age", "sex", 
@@ -194,15 +211,15 @@ def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, overwrite = True, 
                     print(f"{col}: dropped {n_dropped} rows ({(n_dropped/len(df)*100):.2f}%) with missing/invalid data")
                 try:
                     gam = LinearGAM(s(0) + l(1) + l(2) + l(3) + l(4)).fit(df_fit[["mh_y_ksads__dep_age", "scan_site", "sex","mr_y_smri__vol__aseg__icv_sum", "depression_marker"]], df_fit[col])
-                    gam_results.append((col, gam.statistics_['p_values'][4]))  # p-value for depression_marker
                     group_dep = df_fit.loc[df_fit["depression_marker"] == 1, col]
                     group_nondep = df_fit.loc[df_fit["depression_marker"] == 0, col]
-                    e_size_results.append((col, _cohens_d(group_dep, group_nondep)))
+                    effect_size = _cohens_d(group_dep, group_nondep)
+                    effect_size_std = _cohens_d_std(group_dep, group_nondep, d=effect_size)
+                    gam_results.append((col, gam.statistics_['p_values'][4], effect_size, effect_size_std))  # p-value for depression_marker
                 except Exception as e:
                     print(f"Error occurred while fitting GAM model for column {col}: {e}")
-    # Combine gam and effect size results into a single DataFrame
-    gam_results = [(col, pval, e_size) for (col, pval), (_, e_size) in zip(gam_results, e_size_results)]
-    results_df = pd.DataFrame(gam_results, columns=["mri_feature", "p_value", "effect_size"])
+    # Combine GAM p-values, effect sizes, and effect size standard deviations into a single DataFrame
+    results_df = pd.DataFrame(gam_results, columns=["mri_feature", "p_value", "effect_size", "effect_size_std"])
     results_df = results_df.sort_values("p_value")
 
     # Perform FDR correction for multiple comparisons
@@ -224,7 +241,7 @@ def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, overwrite = True, 
     # Return the list of MRI ROIs and the results dataframe
     return mri_rois_sig, results_df
 
-def mri_clustering(data, output_path = Path("output"), clustering_output = None, bootstrapping = True, overwrite = True):
+def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_params=None, mri_meta_df=None, output_path = Path("output"), clustering_output = None, bootstrapping = True, overwrite = True):
     '''
     This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data.
     It uses several different clustering algorithms (HBDSCAN and Bayesian Gaussian Mixture Models).
@@ -232,7 +249,8 @@ def mri_clustering(data, output_path = Path("output"), clustering_output = None,
     Algorithms are compared based on their Silhouette coefficient, Density-Based Clustering Validation (DBCV) score, and Davies-Bouldin Index (DBI).
 
     Parameters:
-        selected_subjects (DataFrame): DataFrame containing the selected subjects and their MRI ROI z-scores
+        data (DataFrame): DataFrame containing the data to cluster
+        n_clusters (int): Number of clusters to form
         output_path (str or Path): Path to save clustering results and visualizations
         clustering_output (str or Path): Path to save clustering output
         bootstrapping (bool): Whether to perform bootstrapping for cluster stability assessment
@@ -251,7 +269,7 @@ def mri_clustering(data, output_path = Path("output"), clustering_output = None,
 
     # Load existing clustering results if overwrite is set to False
     if overwrite == False:
-        existing_results_path = os.path.join(clustering_output_path, "subject_subtypes.csv")
+        existing_results_path = os.path.join(clustering_output_path, "subject_labels.csv")
         if os.path.exists(existing_results_path):
             print(f"Overwrite set to False. Loading existing results.")
             results_df = pd.read_csv(existing_results_path)
@@ -259,14 +277,27 @@ def mri_clustering(data, output_path = Path("output"), clustering_output = None,
         else:
             print(f"No existing clustering results found at {existing_results_path}. Running clustering analysis.")
 
+    subject_id_col = None
+    for candidate in ["subject_ids", "subject"]:
+        if candidate in data.columns:
+            subject_id_col = candidate
+            break
+
+    if subject_id_col is not None:
+        subject_ids = data[subject_id_col].reset_index(drop=True).copy()
+    else:
+        subject_ids = pd.Series(data.index.astype(str), name="subject_ids")
+
     # Drop columns that are not needed for clustering
     columns_to_drop = ["subject_ids", "observations", "composite_z", "rank", "subject", "timepoint", "scan_site", "sex", "age", "mr_y_smri__vol__aseg__icv_sum"]
     for col in columns_to_drop:
         if col in data.columns:
             data = data.drop(columns=[col])
 
-    # Drop nas's
-    data = data.dropna().reset_index(drop=True)
+    # Drop rows with missing values and keep subject identifiers aligned with the remaining rows
+    valid_rows = data.notna().all(axis=1)
+    data = data.loc[valid_rows].reset_index(drop=True)
+    subject_ids = subject_ids.loc[valid_rows].reset_index(drop=True)
 
     def _align_labels(reference, target):
         '''Aligns cluster labels of the target clustering to the reference clustering using the Hungarian algorithm.'''
@@ -300,7 +331,7 @@ def mri_clustering(data, output_path = Path("output"), clustering_output = None,
 
     pacmac_grid = list(ParameterGrid({
         "n_components": [2],
-        "random_state": [42],
+        #"random_state": [42],
         "n_neighbors": [5, 10, 15, 20],
         "MN_ratio": [0.5, 1.0, 2.0],
         "FP_ratio": [0.5, 1.0, 2.0]
@@ -308,13 +339,13 @@ def mri_clustering(data, output_path = Path("output"), clustering_output = None,
     
     pca_grid = list(ParameterGrid({
         "n_components": [0.1, 0.25, 0.5, 0.75, 0.9], 
-        "random_state": [42], 
+        #"random_state": [42], 
         "whiten": [True, False]
         }))
     
     umap_grid = list(ParameterGrid({
         "n_components": [2], 
-        "random_state": [42],
+        #"random_state": [42],
         "n_jobs": [1],
         "n_neighbors": [5, 10, 15, 20],
         "min_dist": [0.0, 0.05, 0.1, 0.2],
@@ -327,99 +358,172 @@ def mri_clustering(data, output_path = Path("output"), clustering_output = None,
         [("UMAP", umap.UMAP, p) for p in umap_grid]
     )
 
-    hdbscan_params = list(ParameterGrid({
+    # Drop dr_models from analysis that are not in dr if dr is not None
+    if dr is not None:
+        invalid_dr = [model for model in dr if model not in ["PaCMAP", "PCA", "UMAP"]]
+        if invalid_dr:
+            raise ValueError(f"Invalid dimensionality reduction model(s): {invalid_dr}. Must be one of ['PaCMAP', 'PCA', 'UMAP'].")
+        dr_models = [model for model in dr_models if model[0] in dr]
+
+    if dr_params is not None:
+        dr_models = [(name, model, {**params, **dr_params}) for name, model, params in dr_models]
+
+    if n_clusters is not None:
+        kmeans_params = list(ParameterGrid({
+            "n_clusters": [n_clusters],
+            #"random_state": [42]
+        }))
+
+        agglomerative_params = list(ParameterGrid({
+            "n_clusters": [n_clusters],
+            "linkage": ["ward", "complete", "average"]
+        }))
+
+        bayesian_gmm_params = list(ParameterGrid({
+            "n_components": [n_clusters],
+            #"random_state": [42]
+        }))
+
+        hdbscan_params = list(ParameterGrid({
         "min_cluster_size": [5, 10, 15, 20],
         "min_samples": [5, 10, 20]
-    }))
+        }))
 
-    bayesian_gmm_params = list(ParameterGrid({
-        "n_components": [5, 10, 15, 20],
-        "random_state": [42]
-    }))
+        cl_models = (
+            [("KMeans", KMeans, p) for p in kmeans_params] +
+            [("AgglomerativeClustering", AgglomerativeClustering, p) for p in agglomerative_params] +
+            [("BayesianGMM", BayesianGaussianMixture, p) for p in bayesian_gmm_params] +
+            [("HDBSCAN", hdbscan.HDBSCAN, p) for p in hdbscan_params]
+        )
+    else:
 
-    kmeans_params = list(ParameterGrid({
-        "n_clusters": [5, 10, 15, 20],
-        "random_state": [42]
-    }))
+        hdbscan_params = list(ParameterGrid({
+            "min_cluster_size": [5, 10, 15, 20],
+            "min_samples": [5, 10, 20]
+        }))
 
-    agglomerative_params = list(ParameterGrid({
-        "n_clusters": [5, 10, 15, 20],
-        "linkage": ["ward", "complete", "average"]
-    }))
+        bayesian_gmm_params = list(ParameterGrid({
+            "n_components": [5, 10, 15, 20],
+            #"random_state": [42]
+        }))
 
-    cl_models = (
-        [("HDBSCAN", hdbscan.HDBSCAN, p) for p in hdbscan_params] +
-        [("BayesianGMM", BayesianGaussianMixture, p) for p in bayesian_gmm_params] +
-        [("KMeans", KMeans, p) for p in kmeans_params] +
-        [("AgglomerativeClustering", AgglomerativeClustering, p) for p in agglomerative_params]
-    )
+        kmeans_params = list(ParameterGrid({
+            "n_clusters": [5, 10, 15, 20],
+            #"random_state": [42]
+        }))
+
+        agglomerative_params = list(ParameterGrid({
+            "n_clusters": [5, 10, 15, 20],
+            "linkage": ["ward", "complete", "average"]
+        }))
+
+        cl_models = (
+            [("HDBSCAN", hdbscan.HDBSCAN, p) for p in hdbscan_params] +
+            [("BayesianGMM", BayesianGaussianMixture, p) for p in bayesian_gmm_params] +
+            [("KMeans", KMeans, p) for p in kmeans_params] +
+            [("AgglomerativeClustering", AgglomerativeClustering, p) for p in agglomerative_params]
+        )
     
+    # Drop cl_models from analysis that are not in cl if cl is not None
+    if cl is not None:
+        invalid_cl = [model for model in cl if model not in ["HDBSCAN", "BayesianGMM", "KMeans", "AgglomerativeClustering"]]
+        if invalid_cl:
+            raise ValueError(f"Invalid clustering model(s): {invalid_cl}. Must be one of ['HDBSCAN', 'BayesianGMM', 'KMeans', 'AgglomerativeClustering'].")
+        cl_models = [model for model in cl_models if model[0] in cl]
+    
+    if cl_params is not None:
+        cl_models = [(name, model, {**params, **cl_params}) for name, model, params in cl_models]
+
     results = []
 
-    for (dr_name, DR, dr_params), (cl_name, CL, cl_params) in tqdm(product(dr_models, cl_models), total=len(dr_models)*len(cl_models), desc="Tuning parameters"):
+    for dr_name, DR, dr_params in tqdm(dr_models, desc="Fitting DR models", position=0):
         dr_model = DR(**dr_params)
-        cl_model = CL(**cl_params)
-
         X_dr   = dr_model.fit_transform(data)
-        labels = cl_model.fit_predict(X_dr)
-        n_dimensions = X_dr.shape[1]
-
-        # Skip degenerate solutions
-        n_clusters = len(np.unique(labels[labels != -1]))
-        noise_pct  = (labels == -1).sum() / len(labels)
-        if n_clusters < 2 or noise_pct > 0.20:
-            continue
 
         # Evaluate dimensionality reduction
         knn_overlap_score = knn_overlap(data, X_dr)
         trustworthiness_score = trustworthiness(data, X_dr, n_neighbors=10)
         pairwise_distance = pairwise_distance_correlation(data, X_dr)
 
-        # Evaluate clusters in original space without noise points
-        mask = labels != -1
-        sil = silhouette_score(data[mask], labels[mask])  
-        db  = davies_bouldin_score(data[mask], labels[mask])
-        ch  = calinski_harabasz_score(data[mask], labels[mask])
+        for cl_name, CL, cl_params in tqdm(cl_models, desc=f"Fitting CL models for DR model {dr_name}", position=1):
+            cl_model = CL(**cl_params)
+            labels = cl_model.fit_predict(X_dr)
+            n_dimensions = X_dr.shape[1]
 
-        # Evaluate bootstrap stability with Jaccard index and ari score
-        if bootstrapping:
-            jaccard_scores = []
-            ari_scores = []
-            for i in range(10):  # Bootstrapping for clustering stability
-                bootstrap_sample = data.sample(frac=1, replace=True, random_state=i)
-                X_bootstrap = dr_model.fit_transform(bootstrap_sample)
-                labels_bootstrap = cl_model.fit_predict(X_bootstrap)
-                # skip degenerate solutions in bootstrap samples
-                if len(np.unique(labels_bootstrap[labels_bootstrap != -1])) < 2 or (labels_bootstrap == -1).sum() / len(labels_bootstrap) > 0.20:
-                    continue
-                aligned_labels = _align_labels(labels[bootstrap_sample.index], labels_bootstrap)
-                jaccard = jaccard_score(labels[bootstrap_sample.index], aligned_labels, average="macro")
-                jaccard_scores.append(jaccard)
-                ari = adjusted_rand_score(labels[bootstrap_sample.index], aligned_labels)
-                ari_scores.append(ari)
-            m_jaccard = np.mean(jaccard_scores)
-            sd_jaccard = np.std(jaccard_scores)
-            m_ari = np.mean(ari_scores)
-            sd_ari = np.std(ari_scores)
+            # Skip degenerate solutions
+            n_clusters = len(np.unique(labels[labels != -1]))
+            noise_pct  = (labels == -1).sum() / len(labels)
+            if n_clusters < 2 or noise_pct > 0.20:
+                continue
 
-        results.append({
-            "dr_model": dr_name, "dr_params": dr_params, "n_dimensions": n_dimensions,
-            "cl_model": cl_name, "cl_params": cl_params,
-            "n_clusters": n_clusters, "noise_pct": noise_pct,
-            "silhouette": sil,
-            "davies_bouldin": db,
-            "calinski_harabasz": ch,
-            "knn_overlap": knn_overlap_score,
-            "trustworthiness": trustworthiness_score,
-            "pairwise_distance_correlation": pairwise_distance,
-        })
-        if bootstrapping:
-            results[-1].update({
-                "mean_jaccard": m_jaccard,
-                "std_jaccard": sd_jaccard,
-                "mean_ari": m_ari,
-                "std_ari": sd_ari
+            # Evaluate clusters in original space without noise points
+            mask = labels != -1
+            sil = silhouette_score(data[mask], labels[mask])  
+            db  = davies_bouldin_score(data[mask], labels[mask])
+            ch  = calinski_harabasz_score(data[mask], labels[mask])
+
+            # If mri_meta_df is provided, evaluate clustering against depression marker using adjusted rand index and Matthews correlation coefficient
+            if mri_meta_df is not None:
+                merged_df = pd.DataFrame({
+                    "subject_ids": subject_ids,
+                    "labels": labels
+                }).merge(mri_meta_df[["subject", "dep_dx"]], left_on="subject_ids", right_on="subject", how="left")
+
+                # Exclude noise points AND subjects with no matched depression_marker
+                merged_df = merged_df[(merged_df["labels"] != -1) & (merged_df["dep_dx"].notna())]
+
+                if merged_df["dep_dx"].nunique() > 1 and merged_df["labels"].nunique() > 1:
+                    ari_dpx = adjusted_rand_score(merged_df["dep_dx"], merged_df["labels"])
+                    mcc = matthews_corrcoef(merged_df["dep_dx"], merged_df["labels"])
+                    contingency = pd.crosstab(merged_df["labels"], merged_df["dep_dx"])
+                    _, fisher_p = fisher_exact(contingency) if contingency.shape == (2, 2) else (None, np.nan)
+                else:
+                    ari_dpx, mcc, fisher_p = np.nan, np.nan, np.nan
+            else:
+                ari_dpx, mcc, fisher_p = np.nan, np.nan, np.nan
+
+            # Evaluate bootstrap stability with Jaccard index and ari score
+            if bootstrapping:
+                jaccard_scores = []
+                ari_scores = []
+                for i in range(10):  # Bootstrapping for clustering stability
+                    bootstrap_sample = data.sample(frac=1, replace=True, random_state=i)
+                    X_bootstrap = dr_model.fit_transform(bootstrap_sample)
+                    labels_bootstrap = cl_model.fit_predict(X_bootstrap)
+                    # skip degenerate solutions in bootstrap samples
+                    if len(np.unique(labels_bootstrap[labels_bootstrap != -1])) < 2 or (labels_bootstrap == -1).sum() / len(labels_bootstrap) > 0.20:
+                        continue
+                    aligned_labels = _align_labels(labels[bootstrap_sample.index], labels_bootstrap)
+                    jaccard = jaccard_score(labels[bootstrap_sample.index], aligned_labels, average="macro")
+                    jaccard_scores.append(jaccard)
+                    ari = adjusted_rand_score(labels[bootstrap_sample.index], aligned_labels)
+                    ari_scores.append(ari)
+                m_jaccard = np.mean(jaccard_scores)
+                sd_jaccard = np.std(jaccard_scores)
+                m_ari = np.mean(ari_scores)
+                sd_ari = np.std(ari_scores)
+
+            results.append({
+                "dr_model": dr_name, "dr_params": dr_params, "n_dimensions": n_dimensions,
+                "cl_model": cl_name, "cl_params": cl_params,
+                "n_clusters": n_clusters, "noise_pct": noise_pct,
+                "silhouette": sil,
+                "davies_bouldin": db,
+                "calinski_harabasz": ch,
+                "knn_overlap": knn_overlap_score,
+                "trustworthiness": trustworthiness_score,
+                "pairwise_distance_correlation": pairwise_distance,
+                "ari_depression_marker": ari_dpx,
+                "mcc_depression_marker": mcc,
+                "fisher_p_depression_marker": fisher_p
             })
+            if bootstrapping:
+                results[-1].update({
+                    "mean_jaccard": m_jaccard,
+                    "std_jaccard": sd_jaccard,
+                    "mean_ari": m_ari,
+                    "std_ari": sd_ari
+                })
 
     results_df = pd.DataFrame(results).sort_values(by="silhouette", ascending=False)
     results_df.to_csv(os.path.join(clustering_output_path, "clustering_results.csv"), index=False)
@@ -449,10 +553,12 @@ def mri_clustering(data, output_path = Path("output"), clustering_output = None,
     dr_model = next(DR(**params) for name, DR, params in dr_models if name == best_dr)
     cl_model = next(CL(**params) for name, CL, params in cl_models if name == best_cl)
     X_dr = dr_model.fit_transform(data)
-    data["subtype"] = cl_model.fit_predict(X_dr) 
+    data["label"] = cl_model.fit_predict(X_dr)
+    data["labels"] = data["label"]
+    data["subject_ids"] = subject_ids
 
     # Save cluster labels to CSV
-    data[["subject_ids", "subtype"]].to_csv(os.path.join(clustering_output_path, "subject_subtypes.csv"), index=False)
+    data[["subject_ids", "label"]].to_csv(os.path.join(clustering_output_path, "subject_labels.csv"), index=False)
 
     # TODO: Fix visualization
 

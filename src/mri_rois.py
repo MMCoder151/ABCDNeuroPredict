@@ -4,6 +4,7 @@ def mri_rois():
     mri_files = ["mr_y_smri__vol__dst.tsv", # Structural MRI - Volumes (Destrieux) [Youth]
                 "mr_y_smri__thk__dst.tsv", # Structural MRI - Cortical Thickness (Destrieux) [Youth]
                 "mr_y_dti__fs__fa__at.tsv", # DTI (Full shell) - Fractional Anisotropy (AtlasTrack) [Youth]
+                "mr_y_dti__fs__fa__wm__dst.tsv", # DTI (Full shell) - Fractional Anisotropy White Matter (Destrieux) [Youth]
                 "mr_y_rsfmri__corr__gpnet.tsv", # Resting State fMRI - Correlations (Gordon network) [Youth] 
                 "mr_y_rsfmri__corr__gpnet__aseg.tsv" # Resting State fMRI - Correlations (Gordon network to Subcortical) [Youth]
                 ] # Add more files as needed

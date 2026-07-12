@@ -1,5 +1,5 @@
 from sklearn.base import clone
-from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, cross_val_score, StratifiedKFold
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, cross_val_score, StratifiedKFold, KFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 #from xgboost import XGBClassifier --- Issues with xgboost installation
@@ -400,10 +400,24 @@ def train_and_evaluate_regression_models(
           done on individual rows, which may lead to data leakage or incomplete data within
           the cv splits. Same caveat as part 1.
     """
- 
+
+    if "subtype" in X.columns:
+        strat = X["subtype"]
+        X = X.drop(columns=["subtype"])
+        outer_splitter_cls = StratifiedKFold
+        inner_splitter_cls = StratifiedKFold
+    else:
+        print(
+            "Expected 'subtype' column in features for stratification during CV. "
+            "No categorical variable available - falling back to unstratified KFold."
+        )
+        strat = None  # KFold ignores y/strat entirely
+        outer_splitter_cls = KFold
+        inner_splitter_cls = KFold
+
     cv_struct = {
-        "outer_cv": StratifiedKFold(n_splits=outer_splits, shuffle=True, random_state=42),
-        "inner_cv": StratifiedKFold(n_splits=inner_splits, shuffle=True, random_state=42)
+        "outer_cv": outer_splitter_cls(n_splits=outer_splits, shuffle=True, random_state=42),
+        "inner_cv": inner_splitter_cls(n_splits=inner_splits, shuffle=True, random_state=42)
     }
  
     models = define_regression_models()
@@ -476,13 +490,6 @@ def train_and_evaluate_regression_models(
         outer_best_params = []
         outer_inner_best_scores = []
  
-        if "subtype" in X.columns:
-            strat = X["subtype"]
-            X = X.drop(columns=["subtype"])
-        else:
-            print("Expected 'subtype' column in features for stratification during CV. Stratifying according to labels instead.")
-            strat = y
- 
         for train_idx, test_idx in tqdm(cv_struct["outer_cv"].split(X, y=strat), desc=f"Running nested CV for {name}"):
             X_train = _safe_index(X, train_idx)
             y_train = _safe_index(y, train_idx)
@@ -492,7 +499,11 @@ def train_and_evaluate_regression_models(
             # Subtype slice for THIS outer training fold only - used to stratify the
             # inner CV splits below. Indices are positional (iloc-style), matching
             # train_idx/test_idx coming from StratifiedKFold.split().
-            strat_train = _safe_index(strat, train_idx)
+            strat_train = _safe_index(strat, train_idx) if strat is not None else None
+
+            inner_splits_precomputed = list(
+                cv_struct["inner_cv"].split(X_train, y=strat_train)
+            )
  
             # Precompute inner splits against strat_train rather than y_train, since
             # y_train is the continuous z-score and StratifiedKFold can't split on it.
