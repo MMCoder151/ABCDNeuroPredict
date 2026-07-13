@@ -601,13 +601,22 @@ for subtype in subject_labels_weighted["label"].unique():
 
 
 # UNSUPERVISED SUBTPYING
-# Filter raw_mri_data_norm to only include subjects with depression diagnosis
+# Filter raw_mri_data_res to only include subjects with depression diagnosis
 depression_diagnosis_df = mri_meta_df[mri_meta_df["dep_dx"] == 1].drop_duplicates(subset=["subject"])
-raw_mri_data_norm_dep = raw_mri_data_norm[raw_mri_data_norm["subject"].isin(depression_diagnosis_df["subject"])]
+raw_mri_data_res_dep = raw_mri_data_res[raw_mri_data_res["subject"].isin(depression_diagnosis_df["subject"])]
+
+# z-score the mri data for subjects with depression diagnosis
+scaler_mri_dep = StandardScaler()
+raw_mri_data_dep_norm = pd.DataFrame(
+    scaler_mri_dep.fit_transform(raw_mri_data_res_dep.drop(columns=["subject"])),
+    columns=raw_mri_data_res_dep.drop(columns=["subject"]).columns,
+    index=raw_mri_data_res_dep.index,
+)
+raw_mri_data_dep_norm["subject"] = raw_mri_data_res_dep["subject"]
 
 # visualise the data in 2D PaCMAP space for the normalized depressed subjects
 pacmap_model = pacmap.PaCMAP(n_neighbors=15, MN_ratio=0.5, FP_ratio=2.0, random_state=42)
-pacmap_embedding = pacmap_model.fit_transform(raw_mri_data_norm_dep.drop(columns=["subject"]))
+pacmap_embedding = pacmap_model.fit_transform(raw_mri_data_dep_norm.drop(columns=["subject"]))
 plt.figure(figsize=(8, 6))
 plt.scatter(pacmap_embedding[:, 0], pacmap_embedding[:, 1], alpha=0.7)
 plt.title('PaCMAP Embedding of Normalized Depressed Subjects')
@@ -617,8 +626,10 @@ plt.savefig(os.path.join(output_path, "pacmap_embedding_norm_dep_subjects.png"))
 plt.close()
 
 # Conduct unsupervised clustering of normalized depressed subjects for subtyping
-subject_labels_norm_dep = mri_clustering(raw_mri_data_norm_dep,
+subject_labels_norm_dep = mri_clustering(raw_mri_data_dep_norm,
                                          clustering_output="label_assignment_norm_dep",
+                                         dr=["PCA"],
+                                         cl=["AgglomerativeClustering"],
                                          max_clusters=10,
                                          bootstrapping=False,
                                          overwrite=True)
@@ -631,7 +642,7 @@ for subtype in subject_labels_norm_dep["label"].unique():
 
 # Visualize the discovered subtypes in a radar chart for each significant MRI ROI
 radar_data = subject_labels_norm_dep
-mri_cols = [col for col in raw_mri_data_norm_dep.columns if col not in ["subject", "subject_ids", "label", "labels"]]
+mri_cols = [col for col in raw_mri_data_dep_norm.columns if col not in ["subject", "subject_ids", "label", "labels"]]
 radar_data = radar_data.groupby("label", as_index=False)[mri_cols].mean()
 
 categories = mri_cols
@@ -671,9 +682,9 @@ plt.close()
 
 
 
-# Filter raw_mri_data_resampled to only include subjects with depression diagnosis
+# Filter raw_mri_data_norm to only include subjects with depression diagnosis
 depression_diagnosis_df = mri_meta_df[mri_meta_df["dep_dx"] == 1].drop_duplicates(subset=["subject"])
-raw_mri_data_resampled_dep = raw_mri_data_resampled[raw_mri_data_resampled["subject_ids"].isin(depression_diagnosis_df["subject"])]
+raw_mri_data_norm_dep = raw_mri_data_norm[raw_mri_data_norm["subject"].isin(depression_diagnosis_df["subject"])]
 
 # Add over-sampled subjects from raw_mri_data_resampled that don't have subject_ids
 over_sampled_subjects = raw_mri_data_resampled[~raw_mri_data_resampled["subject_ids"].isin(mri_meta_df["subject"])]["subject_ids"].tolist()
