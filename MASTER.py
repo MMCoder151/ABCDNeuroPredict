@@ -13,7 +13,7 @@ from sklearn.decomposition import PCA
 from scipy.linalg import eigh
 from sklearn.covariance import LedoitWolf
 from sklearn.ensemble import IsolationForest
-from sklearn.impute import IterativeImputer, KNNImputer
+from sklearn.impute import IterativeImputer
 from neuroHarmonize import harmonizationLearn
 
 # Set raw data directory 
@@ -67,11 +67,16 @@ print("Missingness association with diagnosis group:", pd.Series(model_missingne
 fitbit_features_df = extr_fitbit_features(con, dem_df, overwrite=False)
 
 # Analyse feature colinearity using Variance Inflation Factor (VIF) and create composite scores to account for multicollinearity
-fitbit_features_with_composites, composite_dict = create_composites(fitbit_features_df, overwrite=True, composite_output = "fitbit_composites")
+fitbit_features_with_composites, composite_dict = create_composites(fitbit_features_df, overwrite=False, composite_output = "fitbit_composites")
+
+# Reappend subject column to fitbit_features_with_composites 
+fitbit_features_with_composites = fitbit_features_with_composites.merge(fitbit_features_df[["subject"]], left_index=True, right_index=True, how="left")
 
 # ADD SMARTPHONE FEATURES
 # Read in precomputed smartphone features and merge with fitbit features
 earsapp_features = pd.read_csv(os.path.join(dta_path_tabular, "nt_y_earsapp.tsv"), sep="\t")
+
+earsapp_features.shape
 
 # Filter to only include subjects and timepoints that are present in fit_meta_df and mri_meta_df
 earsapp_features_filtered = earsapp_features[
@@ -79,88 +84,13 @@ earsapp_features_filtered = earsapp_features[
     (earsapp_features["session_id"].isin(fit_meta_df["timepoint"]))
 ]
 
-# Filter to only include feature columns
-earsapp_columns_to_exclude = ["session_id", "nt_y_earsapp__start_dtt", "nt_y_earsapp__end_dtt"]
-earsapp_feature_cols = [col for col in earsapp_features_filtered.columns if col not in earsapp_columns_to_exclude]
-earsapp_features_filtered = earsapp_features_filtered[["participant_id"] + earsapp_feature_cols]
+earsapp_features_filtered.shape
 
-# Analyse feature colinearity using Variance Inflation Factor (VIF) and create composite scores to account for multicollinearity
-earsapp_features_with_composites, earsapp_composite_dict = create_composites(earsapp_features_filtered, overwrite=True, composite_output = "earsapp_composites")
+# Get number of depressed subjects in earsapp_features_filtered
+num_depressed_subjects = earsapp_features_filtered["participant_id"].isin(mri_subject_labels[mri_subject_labels["dep_dx"] == 1]["subject"]).sum()
+print(f"Number of depressed subjects in earsapp_features_filtered: {num_depressed_subjects}")
 
-# Combine fitbit and smartphone features into a single dataframe for modeling
-combined_features = fitbit_features_with_composites.merge(earsapp_features_with_composites, 
-                                                          left_on="subject", right_on="participant_id", 
-                                                          how="outer", 
-                                                          suffixes = ("_fitbit", "_earsapp")) 
-combined_features = combined_features.drop(columns=["participant_id"])
-
-# Conduct outlier detection on combined_features using IsolationForest and remove outliers
-iso_forest = IsolationForest(contamination=0.1, random_state=42)
-outlier_mask = iso_forest.fit_predict(combined_features)
-print(f"Number of outliers detected in combined features: {np.sum(outlier_mask == -1)}")
-combined_features = combined_features[outlier_mask == 1]
-
-# Impute missing values in combined_features using IterativeImputer
-imputer = IterativeImputer(random_state=42, max_iter=20)
-combined_features = imputer.fit_transform(combined_features)
-
-# GROUP DIFFERENCE ANALYSIS
-# TODO: Implement group difference analysis for fitbit and smartphone features
-features_diff_sig, features_diff_results = extract_mri_rois()
-
-# PREPARATION FOR MODELING
-# Add sex and age to selected_subjects_with_composites for modeling
-features = combined_features.merge(dem_df[["subject", "sex", "age_at_first_mri"]], left_on="subject", right_on="subject", how="left")
-features["sex"] = features["sex"].map({"M": 0, "F": 1})
-features["sex"] = features["sex"].astype(np.float64)
-features["age_at_first_mri"] = features["age_at_first_mri"].astype(np.float64)
-
-# Attach subject-level labels before splitting so features, and diagnosis stay aligned.
-subject_labels = (
-    dem_df[["subject"]]
-    .drop_duplicates(subset=["subject"])
-    .merge(
-        mri_meta_df[["subject", "dep_dx"]].drop_duplicates(subset=["subject"]),
-        on="subject",
-        how="left",
-    )
-)
-
-# Train-Test Split
-train_X, test_X, train_labels, test_labels = train_test_split(
-    features,
-    subject_labels,
-    test_size=0.2,
-    stratify=subject_labels["dep_dx"],
-    random_state=42,
-)
-
-# Create labels for train and test sets based on depression diagnosis in mri_meta_df
-train_y_dx = train_labels[["subject", "dep_dx"]].reset_index(drop=True)
-test_y_dx = test_labels[["subject", "dep_dx"]].reset_index(drop=True)
-
-# Save features to CSV
-train_X.to_csv(os.path.join(output_path, "train_features.csv"), index=False)
-test_X.to_csv(os.path.join(output_path, "test_features.csv"), index=False)
-train_y_dx.to_csv(os.path.join(output_path, "train_labels_dx.csv"), index=False)
-test_y_dx.to_csv(os.path.join(output_path, "test_labels_dx.csv"), index=False)
-
-# OPTIONAL: Reimport features and labels from CSV for modeling
-train_X = pd.read_csv(os.path.join(output_path, "train_features.csv"))
-test_X = pd.read_csv(os.path.join(output_path, "test_features.csv"))
-train_y_dx = pd.read_csv(os.path.join(output_path, "train_labels_dx.csv"))
-test_y_dx = pd.read_csv(os.path.join(output_path, "test_labels_dx.csv"))
-
-# RESAMPLE TRAINING DATA FOR BALANCED CLASS DISTRIBUTION
-train_X_resampled, train_y_dx_resampled = resample(train_X, train_y_dx["dep_dx"])
-
-# Save resampled training data to CSV
-train_X_resampled.to_csv(os.path.join(output_path, "train_features_resampled.csv"), index=False)
-train_y_dx_resampled.to_csv(os.path.join(output_path, "train_labels_dx_resampled.csv"), index=False)
-
-# OPTIONAL: Reimport resampled training data from CSV for modeling
-train_X_resampled = pd.read_csv(os.path.join(output_path, "train_features_resampled.csv"))
-train_y_dx_resampled = pd.read_csv(os.path.join(output_path, "train_labels_dx_resampled.csv"))
+# NOTE: No sufficient overlap with fitbit data nor with depressed subjects to include
 
 ######################
 # EXTRACT MRI FEATURES
@@ -206,94 +136,123 @@ for i in range(len(correlation_matrix.columns)):
 
 print(f"Highly correlated features (correlation > 0.8): {highly_correlated_features}")
 
-# Drop one of the highly correlated features each from raw mri data to reduce multicollinearity
-for feature in highly_correlated_features:
-    if feature in raw_mri_data.columns:
-        raw_mri_data = raw_mri_data.drop(columns=[feature])
-        print(f"Dropped highly correlated feature: {feature}")
-
 # Drop highly correlated MRI feature 
 raw_mri_data = raw_mri_data.drop(columns=["mr_y_rsfmri__corr__gpnet__smh__smm_mean"])
 
-# Impute missing values in raw mri data using IterativeImputer
-imputer = IterativeImputer(random_state=42)
-raw_mri_feature_cols = raw_mri_data.drop(columns=["subject"]).columns
-raw_mri_data_features = pd.DataFrame(
-    imputer.fit_transform(raw_mri_data.drop(columns=["subject"])),
-    columns=raw_mri_feature_cols,
-    index=raw_mri_data.index,
-)
-raw_mri_data = raw_mri_data[["subject"]].reset_index(drop=True).join(raw_mri_data_features)
+#########################
+# ---- PREPROCESSING ----
+#########################
 
-# Create scatter plot of raw mri data in 2D PCA space with depressed and non-depressed subjects highlighted
-pca = PCA(n_components=2, random_state=42)
-pca_data = pca.fit_transform(raw_mri_data.drop(columns=["subject"]))
+# Check if there are duplicate subjects in fitbit_features_with_composites
+duplicate_subjects_fitbit = fitbit_features_with_composites[fitbit_features_with_composites.duplicated(subset=["subject"], keep=False)]
+print(f"Number of duplicate subjects in fitbit features: {len(duplicate_subjects_fitbit)}")
 
-# Map depression status to each sample in raw_mri_data
-dep_status = raw_mri_data[["subject"]].merge(mri_subject_labels, on="subject", how="left")["dep_dx"].values
+# Check subject overlap between fitbit features and raw mri data
+fitbit_subjects = set(fitbit_features_with_composites["subject"])
+mri_subjects = set(raw_mri_data["subject"])
+overlap_subjects = fitbit_subjects.intersection(mri_subjects)
+print(f"Number of subjects in fitbit features: {len(fitbit_subjects)}")
+print(f"Number of subjects in raw mri data: {len(mri_subjects)}")
+print(f"Number of overlapping subjects between fitbit features and raw mri data: {len(overlap_subjects)}")
 
-plt.figure(figsize=(8, 6))
-plt.scatter(pca_data[:, 0], pca_data[:, 1], c=dep_status, cmap='coolwarm', edgecolors='black')
-plt.title('Scatter Plot of Raw MRI Data in 2D PCA Space')
+# Drop subjects that aren't in both fitbit features and raw mri data
+fitbit_features_with_composites = fitbit_features_with_composites[fitbit_features_with_composites["subject"].isin(overlap_subjects)]
+raw_mri_data = raw_mri_data[raw_mri_data["subject"].isin(overlap_subjects)]
+
+# NOTE: I am not sure why the number of subjects isn't even despite the rigurous filtering during data wrangling.
+
+# OUTLIER DETECTION AND REMOVAL
+# Conduct outlier detection using IsolationForest on fitbit features of subjects without depression diagnosis and remove outliers
+iso_forest_fit = IsolationForest(contamination=0.005, random_state=42)
+fitbit_features_with_composites_no_dep = fitbit_features_with_composites[fitbit_features_with_composites["subject"].isin(mri_subject_labels[mri_subject_labels["dep_dx"] == 0]["subject"])]
+outlier_mask_fit = iso_forest_fit.fit_predict(fitbit_features_with_composites_no_dep.drop(columns=["subject"]))
+fitbit_outliers = set(fitbit_features_with_composites_no_dep.loc[outlier_mask_fit == -1, "subject"])
+print(f"Number of outliers detected in fitbit features: {np.sum(outlier_mask_fit == -1)}")
+
+# Conduct outlier detection using IsolationForest on raw mri data of subjects without depression diagnosis and remove outliers
+iso_forest_mri = IsolationForest(contamination=0.005, random_state=42)
+raw_mri_data_no_dep = raw_mri_data[raw_mri_data["subject"].isin(mri_subject_labels[mri_subject_labels["dep_dx"] == 0]["subject"])]
+outlier_mask_mri = iso_forest_mri.fit_predict(raw_mri_data_no_dep.drop(columns=["subject"]))
+mri_outliers = set(raw_mri_data_no_dep.loc[outlier_mask_mri == -1, "subject"])
+print(f"Number of outliers detected in raw mri data: {np.sum(outlier_mask_mri == -1)}")
+
+# Check overlap between outliers detected in fitbit features and raw mri data
+outlier_subjects_fit = fitbit_features_with_composites_no_dep.loc[outlier_mask_fit == -1, "subject"]
+outlier_subjects_mri = raw_mri_data_no_dep.loc[outlier_mask_mri == -1, "subject"]
+overlap_outliers = set(outlier_subjects_fit).intersection(set(outlier_subjects_mri))
+print(f"Number of overlapping outliers detected in both fitbit features and raw mri data: {len(overlap_outliers)}")
+
+# Create scatter plot in 2D PCA space of outliers detected in fitbit features and raw mri data
+pca = PCA(n_components=2)
+fitbit_pca = pca.fit_transform(fitbit_features_with_composites_no_dep.drop(columns=["subject"]))
+mri_pca = pca.transform(raw_mri_data_no_dep.drop(columns=["subject"]))
+
+plt.figure(figsize=(10, 8))
+plt.scatter(fitbit_pca[:, 0], fitbit_pca[:, 1], c='blue', label='Fitbit Outliers')
 plt.xlabel('PC1')
 plt.ylabel('PC2')
-plt.colorbar(label='Depression Status')
-plt.savefig(os.path.join(output_path, "scatter_plot_raw_mri_pca.png"))
+plt.title('Fitbit Outliers in 2D PCA Space')
+plt.legend()
+plt.savefig(os.path.join(output_path, "fitbit_outliers_pca_scatter.png"))
 plt.close()
 
-# Do outlier detection on raw mri data of subjects without depression diagnosis using IsolationForest and remove outliers
-iso_forest_non_dep = IsolationForest(contamination=0.005, random_state=42)
-non_depressed_subjects = mri_subject_labels.loc[mri_subject_labels["dep_dx"] == 0, "subject"]
-imputer = KNNImputer(n_neighbors=5)
-raw_mri_data_non_dep = raw_mri_data[raw_mri_data["subject"].isin(non_depressed_subjects)].copy()
-raw_mri_data_non_dep_subjects = raw_mri_data_non_dep["subject"].reset_index(drop=True)
-raw_mri_data_non_dep = pd.DataFrame(
-    imputer.fit_transform(raw_mri_data_non_dep.drop(columns=["subject"])),
-    columns=raw_mri_data_non_dep.drop(columns=["subject"]).columns,
-    index=raw_mri_data_non_dep.index,
+plt.figure(figsize=(10, 8))
+plt.scatter(mri_pca[:, 0], mri_pca[:, 1], c='red', label='MRI Outliers')
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.title('MRI Outliers in 2D PCA Space')
+plt.legend()
+plt.savefig(os.path.join(output_path, "mri_outliers_pca_scatter.png"))
+plt.close()
+
+# Remove outliers in either fitbit or raw mri data
+outlier_subjects = fitbit_outliers | mri_outliers
+print(f"Total unique outlier subjects: {len(outlier_subjects)}")
+fitbit_features_with_composites = fitbit_features_with_composites[~fitbit_features_with_composites["subject"].isin(outlier_subjects)]
+raw_mri_data = raw_mri_data[~raw_mri_data["subject"].isin(outlier_subjects)]
+
+# IMPUTATION OF MISSING VALUES
+# Impute missing values in fitbit features using IterativeImputer
+imputer = IterativeImputer(random_state=42)
+fitbit_features_with_composites_imputed = imputer.fit_transform(fitbit_features_with_composites.drop(columns=["subject"]))
+# Get amount of imputed data in fitbit features
+imputed_count_fitbit = np.sum(np.isnan(fitbit_features_with_composites.drop(columns=["subject"]).values), axis=0)
+print(f"Number of imputed values in fitbit features: {imputed_count_fitbit}")
+
+fitbit_feature_cols = fitbit_features_with_composites.drop(columns=["subject"]).columns
+
+fitbit_features_with_composites_imputed = pd.DataFrame(
+    fitbit_features_with_composites_imputed,
+    columns=fitbit_feature_cols,
+    index=fitbit_features_with_composites.index  # preserve original row alignment
 )
-outliers_non_dep = iso_forest_non_dep.fit_predict(raw_mri_data_non_dep)
-print(f"Number of outliers detected in raw mri data (non-depression): {np.sum(outliers_non_dep == -1)}")
 
-# Create scatter plot of non-depressed subjects in 2D UMAP space with outliers highlighted
-umap_non_dep = PCA(n_components=2, random_state=42)
-umap_data_non_dep = umap_non_dep.fit_transform(raw_mri_data_non_dep)
-plt.figure(figsize=(8, 6))
-plt.scatter(umap_data_non_dep[:, 0], umap_data_non_dep[:, 1], c=outliers_non_dep, cmap='coolwarm', edgecolors='black')
-plt.title('Scatter Plot of Non-Depressed Subjects in 2D UMAP Space')
-plt.xlabel('PCA1')
-plt.ylabel('PCA2')
-plt.colorbar(label='Outlier Status')
-plt.savefig(os.path.join(output_path, "scatter_plot_non_depressed_subjects_pca.png"))
-plt.close()
+fitbit_features_with_composites_imputed["subject"] = fitbit_features_with_composites["subject"]
 
-# Remove outliers from raw mri data
-print(f"Removing {np.sum(outliers_non_dep == -1)} outliers from raw mri data.")
-print(f"Shape of raw mri data before outlier removal: {raw_mri_data.shape}")
-outlier_subjects_non_dep = raw_mri_data_non_dep_subjects[outliers_non_dep == -1]
-raw_mri_data = raw_mri_data[~raw_mri_data["subject"].isin(outlier_subjects_non_dep)]
-print(f"Shape of raw mri data after outlier removal: {raw_mri_data.shape}")
+# Impute missing values in raw mri data using IterativeImputer
+imputer = IterativeImputer(random_state=42)
+raw_mri_data_imputed = imputer.fit_transform(raw_mri_data.drop(columns=["subject"]))
+# Get amount of imputed data in raw mri data
+imputed_count_mri = np.sum(np.isnan(raw_mri_data.drop(columns=["subject"]).values), axis=0)
+print(f"Number of imputed values in raw mri data: {imputed_count_mri}")
 
-# Create scatter plot of raw mri data in 2D PCA space after outlier removal with depressed and non-depressed subjects highlighted
-pca = PCA(n_components=2, random_state=42)
-pca_data = pca.fit_transform(raw_mri_data.drop(columns=["subject"]))
-# Recompute labels after removal so the scatter plot stays aligned.
-dep_status = raw_mri_data[["subject"]].merge(mri_subject_labels, on="subject", how="left")["dep_dx"].values
-plt.figure(figsize=(8, 6))
-plt.scatter(pca_data[:, 0], pca_data[:, 1], c=dep_status, cmap='coolwarm', edgecolors='black')
-plt.title('Scatter Plot of Raw MRI Data in 2D PCA Space')
-plt.xlabel('PCA1')
-plt.ylabel('PCA2')
-plt.colorbar(label='Depression Status')
-plt.savefig(os.path.join(output_path, "scatter_plot_raw_mri_pca_cleaned.png"))
-plt.close()
+mri_feature_cols = raw_mri_data.drop(columns=["subject"]).columns
 
+raw_mri_data_imputed = pd.DataFrame(
+    raw_mri_data_imputed,
+    columns=mri_feature_cols,
+    index=raw_mri_data.index  # preserve original row alignment
+)
+
+raw_mri_data_imputed["subject"] = raw_mri_data["subject"]
+
+# SITE HARMONIZATION OF MRI DATA
 # Regress out site effects from the raw mri data using neuroHarmonize
 covars = pd.DataFrame({
-    "SITE": dem_df.loc[raw_mri_data.index, "scan_site"].values,
-    "AGE": dem_df.loc[raw_mri_data.index, "age_at_first_mri"].values,
-    "SEX": dem_df.loc[raw_mri_data.index, "sex"].values,
-    "TIV": mri_meta_df.loc[raw_mri_data.index, "mr_y_smri__vol__aseg__icv_sum"].values,
+    "SITE": dem_df.loc[raw_mri_data_imputed.index, "scan_site"].values,
+    "AGE": dem_df.loc[raw_mri_data_imputed.index, "age_at_first_mri"].values,
+    "SEX": dem_df.loc[raw_mri_data_imputed.index, "sex"].values,
+    "TIV": mri_meta_df.loc[raw_mri_data_imputed.index, "mr_y_smri__vol__aseg__icv_sum"].values,
 })
 
 covars["SEX"] = covars["SEX"].map({"M": 0, "F": 1})
@@ -307,12 +266,12 @@ covars = pd.DataFrame(
 
 covars["SITE"] = covars["SITE"].astype(str)
 
-model, raw_mri_data_res = harmonizationLearn(raw_mri_data.drop(columns=["subject"]).to_numpy(dtype=float), covars, smooth_terms=["AGE"])
-raw_mri_res = pd.DataFrame(raw_mri_data_res, columns=raw_mri_data.drop(columns=["subject"]).columns, index=raw_mri_data.index)
-raw_mri_res["subject"] = raw_mri_data["subject"]
+model, raw_mri_data_res = harmonizationLearn(raw_mri_data_imputed.drop(columns=["subject"]).to_numpy(dtype=float), covars, smooth_terms=["AGE"])
+raw_mri_data_res = pd.DataFrame(raw_mri_data_res, columns=raw_mri_data_imputed.drop(columns=["subject"]).columns, index=raw_mri_data_imputed.index)
+raw_mri_data_res["subject"] = raw_mri_data_imputed["subject"]
 
 # Conduct confound analysis of raw mri data pre and post residualization
-confound_effects_mri_df = analyse_confounds(dem_df, mri_meta_df, transformed_data=raw_mri_res, raw_data=raw_mri_data)
+confound_effects_mri_df = analyse_confounds(dem_df, mri_meta_df, transformed_data=raw_mri_data_res, raw_data=raw_mri_data_imputed)
 confound_effects_mri_df.to_csv(os.path.join(output_path, "confound_effects_mri.csv"), index=False)
 
 print(model['gamma_hat'].shape)
@@ -320,23 +279,95 @@ print(pd.Series(model['gamma_hat'].flatten()).describe())
 print(model['delta_hat'].shape)
 print(pd.Series(model['delta_hat'].flatten()).describe())
 
-# z-score normalize the raw mri data
-raw_mri_data_norm = raw_mri_res.drop(columns=["subject"])
-for col in raw_mri_data_norm.columns:
-    raw_mri_data_norm[col] = (raw_mri_data_norm[col] - raw_mri_data_norm[col].mean()) / raw_mri_data_norm[col].std() if raw_mri_data_norm[col].std() != 0 else 0
+# PREPARE FITBIT FEATURES FOR MODELING
+# Add sex and age to selected_subjects_with_composites for modeling
+features = fitbit_features_with_composites.merge(dem_df[["subject", "sex", "age_at_first_mri"]], left_on="subject", right_on="subject", how="left")
+features["sex"] = features["sex"].map({"M": 0, "F": 1})
+features["sex"] = features["sex"].astype(np.float64)
+features["age_at_first_mri"] = features["age_at_first_mri"].astype(np.float64)
+
+# Attach subject-level labels before splitting so features, and diagnosis stay aligned.
+subject_labels = (
+    dem_df[["subject"]]
+    .drop_duplicates(subset=["subject"])
+    .merge(
+        mri_meta_df[["subject", "dep_dx"]].drop_duplicates(subset=["subject"]),
+        on="subject",
+        how="left",
+    )
+)
+
+# Train-Test Split
+train_X, test_X, train_labels, test_labels = train_test_split(
+    features,
+    subject_labels,
+    test_size=0.2,
+    stratify=subject_labels["dep_dx"],
+    random_state=42,
+)
+
+# Create labels for train and test sets based on depression diagnosis in mri_meta_df
+train_y_dx = train_labels[["subject", "dep_dx"]].reset_index(drop=True)
+test_y_dx = test_labels[["subject", "dep_dx"]].reset_index(drop=True)
+
+# Save features to CSV
+train_X.to_csv(os.path.join(output_path, "train_features.csv"), index=False)
+test_X.to_csv(os.path.join(output_path, "test_features.csv"), index=False)
+train_y_dx.to_csv(os.path.join(output_path, "train_labels_dx.csv"), index=False)
+test_y_dx.to_csv(os.path.join(output_path, "test_labels_dx.csv"), index=False)
+
+# OPTIONAL: Reimport features and labels from CSV for modeling
+train_X = pd.read_csv(os.path.join(output_path, "train_features.csv"))
+test_X = pd.read_csv(os.path.join(output_path, "test_features.csv"))
+train_y_dx = pd.read_csv(os.path.join(output_path, "train_labels_dx.csv"))
+test_y_dx = pd.read_csv(os.path.join(output_path, "test_labels_dx.csv"))
+
+# Z-SCORE NORMALIZE DATA
+# z-score the mri data
+scaler_mri = StandardScaler()
+raw_mri_data_norm = pd.DataFrame(
+    scaler_mri.fit_transform(raw_mri_data_res.drop(columns=["subject"])),
+    columns=raw_mri_data_res.drop(columns=["subject"]).columns,
+    index=raw_mri_data_res.index,
+)
 raw_mri_data_norm["subject"] = raw_mri_data["subject"]
 
-# RESAMPLE MRI FEATURES FOR BALANCED CLASS DISTRIBUTION
-raw_mri_subject_labels = raw_mri_data_norm[["subject"]].drop_duplicates().merge(mri_subject_labels, on="subject", how="left")
+# z-score the fitbit features
+scaler_fitbit = StandardScaler()
+fitbit_features_with_composites_norm = pd.DataFrame(
+    scaler_fitbit.fit_transform(train_X.drop(columns=["subject"])),
+    columns=train_X.drop(columns=["subject"]).columns,
+    index=train_X.index,
+)
+fitbit_features_with_composites_norm["subject"] = train_X["subject"]
+
+# RESAMPLE FOR BALANCED CLASS DISTRIBUTION
+# Resample raw mri data for balanced class distribution
+raw_mri_subject_labels = raw_mri_data[["subject"]].drop_duplicates().merge(mri_subject_labels, on="subject", how="left")
 raw_mri_data_resampled, _ = resample(raw_mri_data_norm, raw_mri_subject_labels["dep_dx"])
+
+# Resample fitbit features for balanced class distribution
+fitbit_features_labels = fitbit_features_with_composites_norm[["subject"]].drop_duplicates().merge(mri_subject_labels, on="subject", how="left")
+fitbit_features_with_composites_resampled, _ = resample(fitbit_features_with_composites_norm, train_y_dx["dep_dx"])
+
+# Resample fitbit training data
+train_X_resampled, train_y_dx_resampled = resample(train_X, train_y_dx["dep_dx"])
+
+# Save resampled training data to CSV
+train_X_resampled.to_csv(os.path.join(output_path, "train_features_resampled.csv"), index=False)
+train_y_dx_resampled.to_csv(os.path.join(output_path, "train_labels_dx_resampled.csv"), index=False)
+
+# OPTIONAL: Reimport resampled training data from CSV for modeling
+train_X_resampled = pd.read_csv(os.path.join(output_path, "train_features_resampled.csv"))
+train_y_dx_resampled = pd.read_csv(os.path.join(output_path, "train_labels_dx_resampled.csv"))
 
 # WHITEN AND WEIGH MRI FEATURES
 # Calculate covariance matrix for whitening using Mahalanobis distance
 mri_identifier_cols = [col for col in raw_mri_data_resampled.columns if col in {"subject", "subject_ids"}]
 mri_feature_cols = [col for col in raw_mri_data_resampled.columns if col not in mri_identifier_cols]
-mri_feature_matrix = raw_mri_data_norm[mri_feature_cols].to_numpy(dtype=float)
+mri_feature_matrix = raw_mri_data_resampled[mri_feature_cols].to_numpy(dtype=float)
 Sigma = np.cov(mri_feature_matrix, rowvar=False)
-lw = LedoitWolf().fit(raw_mri_data_norm[mri_feature_cols].to_numpy(dtype=float))
+lw = LedoitWolf().fit(raw_mri_data_resampled[mri_feature_cols].to_numpy(dtype=float))
 Sigma = lw.covariance_
 
 # Compute whitening matrix
@@ -358,12 +389,13 @@ mri_data_whitened = pd.DataFrame(
 print(np.cov(mri_data_whitened.to_numpy(dtype=float), rowvar=False))
 
 # Apply weighing to the normalised mri data based on the absolute effect sizes of the significant ROIs by multiplying each ROI with its absolute effect size
-for col in mri_data_whitened.columns:
+mri_data_weighted = mri_data_whitened.copy()  
+for col in mri_data_weighted.columns:
     effect_size = mri_rois_results.loc[mri_rois_results["mri_feature"] == col, "effect_size"].values[0]
-    mri_data_whitened[col] *= abs(effect_size)
+    mri_data_weighted[col] *= abs(effect_size)
 
 # Reattach subject labels to wighted mri data
-mri_data_whitened["subject"] = subject_labels
+mri_data_weighted["subject"] = subject_labels
 
 # ---- BASELINE CLASSIFICATION MODEL ----
 
@@ -405,30 +437,11 @@ f1 = f1_score(test_y_dx["dep_dx"], test_predictions)
 print(f"Final model F1 score on test set: {f1:.4f}")
 
 # RESAMPLED CLASSIFICATION MODEL
-# Train and evaluate classification models on resampled training data using nested cross-validation
-resampled_cv_scores = train_and_evaluate_models(
-    train_X_resampled.drop(columns=["subject"]),
-    (train_y_dx_resampled.drop(columns=["subject"])).squeeze(),
-    search="random",
-    outer_splits=10,
-    inner_splits=10,
-    models_to_train=["SVM"]
-)
-
-print("Resampled model cross-validation scores:")
-for model_name, scores in resampled_cv_scores.items():
-    print(f"  {model_name}: {scores}")
-
-# Save resampled model cross-validation scores to CSV
-resampled_cv_scores_df = pd.DataFrame.from_dict(resampled_cv_scores, orient="index")
-resampled_cv_scores_df.to_csv(os.path.join(baseline_output_path, "resampled_model_cv_scores.csv"))
-
 # Train final model using the best model based on resampled cross-validation scores
-best_resampled_model_name = max(resampled_cv_scores, key=lambda m: resampled_cv_scores[m]["mean"])
 final_resampled_model, best_resampled_hyperparams, train_resampled_predictions = train_final_model(
     train_X_resampled.drop(columns=["subject"]),
     (train_y_dx_resampled.drop(columns=["subject"])).squeeze(),
-    model=best_resampled_model_name
+    model="SVM"
 )
 
 # Save final resampled model, hyperparameters, and predictions to CSV
@@ -499,7 +512,7 @@ describe_subjects(non_selected_fit_meta_df, non_selected_mri_meta_df)
 subject_labels_resampled = mri_clustering(raw_mri_data_resampled, 
                                           n_clusters=2, 
                                           cl=["HDBSCAN", "AgglomerativeClustering"],
-                                          dr=["PCA"],
+                                          dr=["PCA", "PaCMAP"],
                                           mri_meta_df=mri_meta_df,
                                           clustering_output="label_assignment_resampled", 
                                           bootstrapping=False, 
@@ -563,7 +576,7 @@ print(results)
 # Conduct unsupervised clustering of WHITENED & WEIGHTED mri data for label assignment
 subject_labels_weighted = mri_clustering(mri_data_whitened, 
                                          n_clusters=2, 
-                                         dr=["PCA"],
+                                         dr=["PCA", "PaCMAP"],
                                          cl=["HDBSCAN", "AgglomerativeClustering"],
                                          mri_meta_df=mri_meta_df,
                                          clustering_output="label_assignment_weighted", 
@@ -587,6 +600,172 @@ for subtype in subject_labels_weighted["label"].unique():
 
 
 
+# UNSUPERVISED SUBTPYING
+# Filter raw_mri_data_norm to only include subjects with depression diagnosis
+depression_diagnosis_df = mri_meta_df[mri_meta_df["dep_dx"] == 1].drop_duplicates(subset=["subject"])
+raw_mri_data_norm_dep = raw_mri_data_norm[raw_mri_data_norm["subject"].isin(depression_diagnosis_df["subject"])]
+
+# visualise the data in 2D PaCMAP space for the normalized depressed subjects
+pacmap_model = pacmap.PaCMAP(n_neighbors=15, MN_ratio=0.5, FP_ratio=2.0, random_state=42)
+pacmap_embedding = pacmap_model.fit_transform(raw_mri_data_norm_dep.drop(columns=["subject"]))
+plt.figure(figsize=(8, 6))
+plt.scatter(pacmap_embedding[:, 0], pacmap_embedding[:, 1], alpha=0.7)
+plt.title('PaCMAP Embedding of Normalized Depressed Subjects')
+plt.xlabel('PaCMAP1')
+plt.ylabel('PaCMAP2')
+plt.savefig(os.path.join(output_path, "pacmap_embedding_norm_dep_subjects.png"))
+plt.close()
+
+# Conduct unsupervised clustering of normalized depressed subjects for subtyping
+subject_labels_norm_dep = mri_clustering(raw_mri_data_norm_dep,
+                                         clustering_output="label_assignment_norm_dep",
+                                         max_clusters=10,
+                                         bootstrapping=False,
+                                         overwrite=True)
+
+# per discovered subtype, get size
+for subtype in subject_labels_norm_dep["label"].unique():
+    subtype_subjects = subject_labels_norm_dep[subject_labels_norm_dep["label"] == subtype]["subject_ids"].tolist()
+    print(f"\nNormalized Label {subtype}:")
+    print(f"Number of subjects in normalized label: {len(subtype_subjects)}")
+
+# Visualize the discovered subtypes in a radar chart for each significant MRI ROI
+radar_data = subject_labels_norm_dep
+mri_cols = [col for col in raw_mri_data_norm_dep.columns if col not in ["subject", "subject_ids", "label", "labels"]]
+radar_data = radar_data.groupby("label", as_index=False)[mri_cols].mean()
+
+categories = mri_cols
+value_matrix = radar_data[categories].to_numpy(dtype=float)
+min_value = np.nanmin(value_matrix)
+max_value = np.nanmax(value_matrix)
+radius_offset = min(0.0, min_value)
+if radius_offset < 0:
+    radius_offset -= 0.1 * (max_value - min_value if max_value > min_value else 1.0)
+
+angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+angles += angles[:1]
+
+fig, ax = plt.subplots(figsize=(10, 8), subplot_kw={"polar": True})
+
+for subtype in sorted(radar_data["label"].unique()):
+    subtype_values = radar_data.loc[radar_data["label"] == subtype, categories].iloc[0].tolist()
+    subtype_values = [value - radius_offset for value in subtype_values]
+    subtype_values += subtype_values[:1]
+    ax.plot(angles, subtype_values, linewidth=2, label=f"Subtype {subtype}")
+    ax.fill(angles, subtype_values, alpha=0.15)
+
+ax.set_xticks(angles[:-1])
+ax.set_xticklabels(categories, fontsize=8)
+ax.set_title("Mean MRI ROI Z-scores by subtype", pad=20)
+tick_values = np.linspace(min_value, max_value, num=5)
+ax.set_yticks((tick_values - radius_offset).tolist())
+ax.set_yticklabels([f"{tick_value:.2f}" for tick_value in tick_values])
+ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.1))
+plt.tight_layout()
+plt.savefig(os.path.join(output_path, "radar_chart_mean_z_scores_by_subtype_norm.png"))
+plt.close()
+
+
+
+
+
+
+
+# Filter raw_mri_data_resampled to only include subjects with depression diagnosis
+depression_diagnosis_df = mri_meta_df[mri_meta_df["dep_dx"] == 1].drop_duplicates(subset=["subject"])
+raw_mri_data_resampled_dep = raw_mri_data_resampled[raw_mri_data_resampled["subject_ids"].isin(depression_diagnosis_df["subject"])]
+
+# Add over-sampled subjects from raw_mri_data_resampled that don't have subject_ids
+over_sampled_subjects = raw_mri_data_resampled[~raw_mri_data_resampled["subject_ids"].isin(mri_meta_df["subject"])]["subject_ids"].tolist()
+raw_mri_data_resampled_dep = pd.concat([raw_mri_data_resampled_dep, raw_mri_data_resampled[raw_mri_data_resampled["subject_ids"].isin(over_sampled_subjects)]])
+
+# Visualise the data in 2D PaCMAP space for the resampled depressed subjects
+pacmap_model = pacmap.PaCMAP(n_neighbors=15, MN_ratio=0.5, FP_ratio=2.0, random_state=42)
+pacmap_embedding = pacmap_model.fit_transform(raw_mri_data_resampled_dep.drop(columns=["subject_ids"]))
+plt.figure(figsize=(8, 6))
+plt.scatter(pacmap_embedding[:, 0], pacmap_embedding[:, 1], alpha=0.7)
+plt.title('PaCMAP Embedding of Resampled Depressed Subjects')
+plt.xlabel('PaCMAP1')
+plt.ylabel('PaCMAP2')
+plt.savefig(os.path.join(output_path, "pacmap_embedding_resampled_dep_subjects.png"))
+plt.close()
+
+# Conduct unsupervised clustering of resampled depressed subjects for subtyping
+subject_labels_resampled_dep = mri_clustering(raw_mri_data_resampled_dep,
+                                             clustering_output="label_assignment_resampled_dep",
+                                             max_clusters=10,
+                                             bootstrapping=False,
+                                             overwrite=True)
+
+# Per discovered subtype, get overlap with subjects that exist in mri_meta_df
+for subtype in subject_labels_resampled_dep["label"].unique():
+    subtype_subjects = subject_labels_resampled_dep[subject_labels_resampled_dep["label"] == subtype]["subject_ids"].tolist()
+    overlap_subjects = set(subtype_subjects).intersection(set(mri_meta_df["subject"]))
+    print(f"\nLabel {subtype}:")
+    print(f"Number of subjects in subtype: {len(subtype_subjects)}")
+    print(f"Number of subjects in subtype that exist in mri_meta_df: {len(overlap_subjects)}")
+    print(f"Percentage of all subjects in mri_meta_df in subtype: {len(overlap_subjects) / len(mri_meta_df) * 100:.2f}%")
+
+# Visualize the discovered subtypes in 2D UMAP space
+raw_mri_data_resampled_dep = raw_mri_data_resampled_dep.reset_index(drop=True)
+subject_labels_resampled_dep = subject_labels_resampled_dep.reset_index(drop=True)
+
+reducer = umap.UMAP(n_components=2, random_state=42)
+embedding = reducer.fit_transform(raw_mri_data_resampled_dep.drop(columns="subject_ids"))
+
+plt.figure(figsize=(8, 6))
+for subtype in sorted(subject_labels_resampled_dep["label"].unique()):
+    mask = subject_labels_resampled_dep["label"] == subtype
+    plt.scatter(
+        embedding[mask.to_numpy(), 0],
+        embedding[mask.to_numpy(), 1],
+        label=f"Label {subtype}",
+        alpha=0.7,
+    )
+plt.title("Scatter Plot of Resampled Depressed Subjects in 2D UMAP Space")
+plt.xlabel("UMAP1")
+plt.ylabel("UMAP2")
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(output_path, "scatter_plot_resampled_dep_subjects_umap.png"))
+plt.close()
+
+# Visualize the discovered subtypes in a radar chart for each significant MRI ROI
+radar_data = subject_labels_resampled_dep
+radar_data = radar_data.dropna(subset=["label"])
+mri_cols = [col for col in raw_mri_data_resampled_dep.columns if col not in ["subject_ids", "label", "labels"]]
+radar_data = radar_data.groupby("label", as_index=False)[mri_cols].mean()
+
+categories = mri_cols
+value_matrix = radar_data[categories].to_numpy(dtype=float)
+min_value = np.nanmin(value_matrix)
+max_value = np.nanmax(value_matrix)
+radius_offset = min(0.0, min_value)
+if radius_offset < 0:
+    radius_offset -= 0.1 * (max_value - min_value if max_value > min_value else 1.0)
+
+angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+angles += angles[:1]
+
+fig, ax = plt.subplots(figsize=(10, 8), subplot_kw={"polar": True})
+
+for subtype in sorted(radar_data["label"].unique()):
+    subtype_values = radar_data.loc[radar_data["label"] == subtype, categories].iloc[0].tolist()
+    subtype_values = [value - radius_offset for value in subtype_values]
+    subtype_values += subtype_values[:1]
+    ax.plot(angles, subtype_values, linewidth=2, label=f"Subtype {subtype}")
+    ax.fill(angles, subtype_values, alpha=0.15)
+
+ax.set_xticks(angles[:-1])
+ax.set_xticklabels(categories, fontsize=8)
+ax.set_title("Mean MRI ROI Z-scores by subtype", pad=20)
+tick_values = np.linspace(min_value, max_value, num=5)
+ax.set_yticks((tick_values - radius_offset).tolist())
+ax.set_yticklabels([f"{tick_value:.2f}" for tick_value in tick_values])
+ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.1))
+plt.tight_layout()
+plt.savefig(os.path.join(output_path, "radar_chart_mean_z_scores_by_subtype.png"))
+plt.close()
 
 
 

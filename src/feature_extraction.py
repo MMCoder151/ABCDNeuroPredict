@@ -671,8 +671,16 @@ def create_composites(selected_subjects, vif_threshold=10, overwrite=True, outpu
     if overwrite == False:
         print("Overwrite set to False. Reimporting composites.")
         try:
-            features_with_composites = pd.read_csv(Path(output_path / "fitbit_features_with_composites.csv"))
-            composite_df = pd.read_csv(Path(output_path / "composite_dictionary.csv"))
+            if composite_output is not None:
+                composite_output_path = Path(output_path) / composite_output
+                features_path = composite_output_path / "features_with_composites.csv"
+                composite_dict_path = composite_output_path / "composite_dictionary.csv"
+            else:
+                features_path = Path(output_path) / "fitbit_features_with_composites.csv"
+                composite_dict_path = Path(output_path) / "composite_dictionary.csv"
+
+            features_with_composites = pd.read_csv(features_path)
+            composite_df = pd.read_csv(composite_dict_path)
             return features_with_composites, composite_df
         except Exception as e:
             print(f"An error occured: {e}")
@@ -706,14 +714,24 @@ def create_composites(selected_subjects, vif_threshold=10, overwrite=True, outpu
     composite_counter = 0
  
     def vif_table(df):
-        return pd.DataFrame({
-            "variable": df.columns,
-            "vif": [variance_inflation_factor(df.values, i) for i in range(df.shape[1])]
-        }).sort_values("vif", ascending=False)
+        if df.shape[1] == 0:
+            return pd.DataFrame(columns=["variable", "vif"])
+        if df.shape[1] == 1:
+            return pd.DataFrame({"variable": df.columns, "vif": [np.inf]})
+
+        df_with_const = sm.add_constant(df)
+        vifs = [
+            variance_inflation_factor(df_with_const.values, i)
+            for i in range(1, df_with_const.shape[1])  # skip the constant column (index 0)
+        ]
+        return pd.DataFrame({"variable": df.columns, "vif": vifs}).sort_values("vif", ascending=False)
  
     vif_df = vif_table(vif_data)
  
-    while vif_df["vif"].max() > vif_threshold:
+    while not vif_df.empty and vif_df["vif"].max() > vif_threshold:
+        if vif_data.shape[1] < 2:
+            print("Stopping composite creation because fewer than two VIF columns remain.")
+            break
  
         high_vif_col = vif_df.iloc[0]["variable"]
  

@@ -241,7 +241,7 @@ def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, overwrite = True, 
     # Return the list of MRI ROIs and the results dataframe
     return mri_rois_sig, results_df
 
-def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_params=None, mri_meta_df=None, output_path = Path("output"), clustering_output = None, bootstrapping = True, overwrite = True):
+def mri_clustering(data, n_clusters=None, max_clusters=None,dr=None, dr_params=None, cl=None, cl_params=None, mri_meta_df=None, output_path = Path("output"), clustering_output = None, bootstrapping = True, overwrite = True):
     '''
     This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data.
     It uses several different clustering algorithms (HBDSCAN and Bayesian Gaussian Mixture Models).
@@ -288,6 +288,8 @@ def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_p
     else:
         subject_ids = pd.Series(data.index.astype(str), name="subject_ids")
 
+    data = data.reset_index(drop=True)
+
     # Drop columns that are not needed for clustering
     columns_to_drop = ["subject_ids", "observations", "composite_z", "rank", "subject", "timepoint", "scan_site", "sex", "age", "mr_y_smri__vol__aseg__icv_sum"]
     for col in columns_to_drop:
@@ -328,10 +330,15 @@ def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_p
         dist_emb = squareform(pdist(X_emb))
         corr = np.corrcoef(dist_orig.flatten(), dist_emb.flatten())[0, 1]
         return corr
+    
+    # Create a list of percentage values of max dimensions with the minimum of 2 dimensions for dimensionality reduction
+    max_dims = data.shape[1] - 1  # Maximum number of dimensions for dimensionality reduction
+    dim_percentages = [0.1, 0.25, 0.5, 0.75, 0.9]
+    dr_components = [max(2, int(round(max_dims * pct, 0))) for pct in dim_percentages]
 
     pacmac_grid = list(ParameterGrid({
         "n_components": [2],
-        #"random_state": [42],
+        "random_state": [42],
         "n_neighbors": [5, 10, 15, 20],
         "MN_ratio": [0.5, 1.0, 2.0],
         "FP_ratio": [0.5, 1.0, 2.0]
@@ -339,13 +346,13 @@ def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_p
     
     pca_grid = list(ParameterGrid({
         "n_components": [0.1, 0.25, 0.5, 0.75, 0.9], 
-        #"random_state": [42], 
+        "random_state": [42], 
         "whiten": [True, False]
         }))
     
     umap_grid = list(ParameterGrid({
-        "n_components": [2], 
-        #"random_state": [42],
+        "n_components": dr_components, 
+        "random_state": [42],
         "n_jobs": [1],
         "n_neighbors": [5, 10, 15, 20],
         "min_dist": [0.0, 0.05, 0.1, 0.2],
@@ -385,8 +392,9 @@ def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_p
         }))
 
         hdbscan_params = list(ParameterGrid({
-        "min_cluster_size": [5, 10, 15, 20],
-        "min_samples": [5, 10, 20]
+        "min_cluster_size": [10, 15, 20],
+        "min_samples": [10, 15, 20],
+        "cluster_selection_epsilon": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
         }))
 
         cl_models = (
@@ -398,8 +406,9 @@ def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_p
     else:
 
         hdbscan_params = list(ParameterGrid({
-            "min_cluster_size": [5, 10, 15, 20],
-            "min_samples": [5, 10, 20]
+            "min_cluster_size": [10, 15, 20],
+            "min_samples": [10, 15, 20],
+            "cluster_selection_epsilon": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
         }))
 
         bayesian_gmm_params = list(ParameterGrid({
@@ -413,7 +422,7 @@ def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_p
         }))
 
         agglomerative_params = list(ParameterGrid({
-            "n_clusters": [5, 10, 15, 20],
+            "n_clusters": [2, 3, 4, 5, 6, 7, 8, 9, 10],
             "linkage": ["ward", "complete", "average"]
         }))
 
@@ -436,7 +445,7 @@ def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_p
 
     results = []
 
-    for dr_name, DR, dr_params in tqdm(dr_models, desc="Fitting DR models", position=0):
+    for dr_name, DR, dr_params in tqdm(dr_models, desc="Analysing cluster solutions", position=0):
         dr_model = DR(**dr_params)
         X_dr   = dr_model.fit_transform(data)
 
@@ -445,7 +454,7 @@ def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_p
         trustworthiness_score = trustworthiness(data, X_dr, n_neighbors=10)
         pairwise_distance = pairwise_distance_correlation(data, X_dr)
 
-        for cl_name, CL, cl_params in tqdm(cl_models, desc=f"Fitting CL models for DR model {dr_name}", position=1):
+        for cl_name, CL, cl_params in tqdm(cl_models, desc=f"Fitting CL models with {dr_name}", position=1, leave=False):
             cl_model = CL(**cl_params)
             labels = cl_model.fit_predict(X_dr)
             n_dimensions = X_dr.shape[1]
@@ -531,11 +540,13 @@ def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_p
     results_df_filtered = results_df[
         (results_df["silhouette"] > 0.25) &
         (results_df["davies_bouldin"] < 1.0) &
-        (results_df["trustworthiness"] > 0.8) &
-        (results_df["pairwise_distance_correlation"] > 0.75) &
-        (results_df["knn_overlap"] > 0.5)
+        (results_df["trustworthiness"] > 0.8)
+        #(results_df["pairwise_distance_correlation"] > 0.75) &
+        #(results_df["knn_overlap"] > 0.5)
     ].sort_values(by="silhouette", ascending=False)
-    if bootstrapping:
+    if max_clusters is not None:
+        results_df_filtered = results_df_filtered[(results_df_filtered["n_clusters"] <= max_clusters)]
+    elif bootstrapping:
         results_df_filtered = results_df_filtered[(results_df_filtered["mean_jaccard"] > 0.5)]
     results_df_filtered.to_csv(os.path.join(clustering_output_path, "filtered_clustering_results.csv"), index=False)
 
@@ -554,7 +565,6 @@ def mri_clustering(data, n_clusters=None, dr=None, dr_params=None, cl=None, cl_p
     cl_model = next(CL(**params) for name, CL, params in cl_models if name == best_cl)
     X_dr = dr_model.fit_transform(data)
     data["label"] = cl_model.fit_predict(X_dr)
-    data["labels"] = data["label"]
     data["subject_ids"] = subject_ids
 
     # Save cluster labels to CSV
