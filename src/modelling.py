@@ -114,13 +114,13 @@ def define_models():
                 ]),
                 {
                     "selector__fraction": [0.3, 0.5, 0.7],
-                    "clf__n_estimators": [200, 500, 800],
+                    "clf__n_estimators": [200, 300, 500, 600, 800],
                     "clf__learning_rate": [0.01, 0.05, 0.1],
-                    "clf__num_leaves": [31, 63, 127],
-                    "clf__subsample": [0.8],
+                    "clf__num_leaves": [15, 31, 63, 127],
+                    "clf__subsample": [0.7, 0.8, 0.9],
                     "clf__colsample_bytree": [0.8],
-                    "clf__min_child_samples": [20, 40],
-                    "clf__is_unbalance": [True]
+                    "clf__min_child_samples": [10, 20, 40],
+                    "clf__is_unbalance": [True, False]
             }),
             "SVM": (
                 Pipeline([
@@ -132,9 +132,9 @@ def define_models():
                     ("clf", SVC(random_state=42, probability=True))
                 ]),
                 {
-                    "selector__fraction": [0.3, 0.5, 0.7],
-                    "clf__kernel": ["rbf", "sigmoid"],
-                    "clf__C": [0.1, 1.0, 10.0],
+                    "selector__fraction": [0.3, 0.5, 0.7, 0.9],
+                    "clf__kernel": ["rbf", "sigmoid", "linear", "poly"],
+                    "clf__C": [0.1, 0.5, 1.0, 5.0, 10.0],
                     "clf__gamma": ["scale", "auto", 0.01, 0.1],
                     "clf__class_weight": [None, "balanced"]
             })
@@ -142,14 +142,17 @@ def define_models():
     return models
 
 def train_and_evaluate_models(X, y, search="random", outer_splits=10, inner_splits=10, models_to_train=None):
-    ''' Trains and evaluates multiple machine learning models using nested cross-validation.
-        
-        Notes: 
-        - Integrate further feature selection???
-        - Extract feature importance where possible 
-        - Description needs to be reworked. Not up-to-date with process optimization and data leakage fixes!!!
-        - Input data needs to already be grouped by subject, otherwise the CV splits will be done on individual rows, 
-        which may lead to data leakage or incomplete data within the cv splits.
+    ''' 
+    Trains and evaluates multiple machine learning models using nested cross-validation.
+    Parameters:
+        - X: Feature matrix (pandas DataFrame)
+        - y: Target vector (pandas Series)
+        - search: Hyperparameter search strategy ("grid" or "random")
+        - outer_splits: Number of splits for outer cross-validation
+        - inner_splits: Number of splits for inner cross-validation
+        - models_to_train: List of model names to train (default: None, trains all models)
+    Returns:
+        - nested_cv_scores: Dictionary containing mean and std of outer CV scores for each model
     '''
 
     # Define nested cross-validation structure

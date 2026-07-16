@@ -19,6 +19,7 @@ from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
 import joblib
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import RandomUnderSampler
+from sklearn.preprocessing import StandardScaler
 
 def _one_hot_encode(df, col="scan_site", prefix="scan_site", categories=None):
     """One-hot encode a scan-site column while keeping a stable category order."""
@@ -894,8 +895,14 @@ def extr_fitbit_features(con, selected_subjects, overwrite=True, output_path=Pat
                     daily_data.set_index("Wear_Time", inplace=True)
                     daily_stats = daily_data.resample("D").agg(['mean', 'std', 'min', 'max'])
                     daily_stats.columns = ['_'.join(col) for col in daily_stats.columns]
+                    # Create afternoon features (mean, std, min, max) for the time range 15:00 to 20:00
+                    afternoon_data = daily_data.between_time("15:00", "20:00")
+                    if not afternoon_data.empty:
+                        afternoon_stats = afternoon_data.resample("D").agg(['mean', 'std', 'min', 'max'])
+                        afternoon_stats.columns = ['_an_'.join(col) for col in afternoon_stats.columns]
+                        daily_stats = pd.concat([daily_stats, afternoon_stats], axis=1)
+
                     # Create datetime index with proper missing days based on the daily resampling range
-                    # TODO: Check if using the first non-NaN date as the start date for reindexing is more appropriate than using the min date of the daily_stats index, which may be affected by outliers or missing data.
                     daily_stats = daily_stats.dropna(how="all")
                     min_date = daily_stats.index.min()
                     max_date = daily_stats.index.max()
@@ -1117,14 +1124,20 @@ def fit_residualiser(X_train, dem_df, mri_meta_df, overwrite=True, residualiser_
     scan_site_train = pd.get_dummies(dem_df.loc[X_train.index, "scan_site"], drop_first=True).values
     tiv_train = mri_meta_df.loc[X_train.index, "mr_y_smri__vol__aseg__icv_sum"].values.reshape(-1, 1)
     tiv_train = np.nan_to_num(tiv_train, nan=np.nanmean(tiv_train))
+    # z-score age and tiv
+    scaler = StandardScaler()
+    age_train = scaler.fit_transform(age_train)
+    tiv_train = scaler.fit_transform(tiv_train)
+
     design_matrix_train = np.hstack([age_train, sex_train, scan_site_train, tiv_train])
 
     n_features = X_train.shape[1]
     models = []
     for i in tqdm(range(n_features), desc="Fitting GPR residualiser"):
         y_train = X_train.iloc[:, i].values
-        kernel = ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=1.0)
-        gpr = GaussianProcessRegressor(kernel=kernel, random_state=0)
+        n_dims = design_matrix_train.shape[1]
+        kernel = ConstantKernel(1.0) * RBF(length_scale=np.ones(n_dims)) + WhiteKernel(noise_level=1.0)
+        gpr = GaussianProcessRegressor(kernel=kernel, random_state=0, n_restarts_optimizer=5)
         gpr.fit(design_matrix_train, y_train)
         models.append(gpr)
         
@@ -1218,14 +1231,16 @@ def resample(X, y):
         raise RuntimeError("RandomUnderSampler did not expose sample_indices_; cannot recover subject IDs safely.")
     undersampled_subject_ids = X.iloc[undersampled_source_indices]["subject"].reset_index(drop=True)
 
-    # Impute missing values in the undersampled data using IterativeImputer
-    print("Imputing missing values in undersampled data using IterativeImputer...")
-    imputer = IterativeImputer(random_state=0, max_iter=20)
-    X_undersampled_imputed = pd.DataFrame(
-        imputer.fit_transform(X_undersampled[feature_cols]),
-        columns=feature_cols,
-        index=X_undersampled.index
-    )
+    
+    # If there are missings in the undersampled data, impute them using IterativeImputer
+    if X_undersampled[feature_cols].isnull().any().any():
+        print("Missing values detected in undersampled data. Imputing missing values using IterativeImputer...")
+        imputer = IterativeImputer(random_state=0, max_iter=20)
+        X_undersampled_imputed = pd.DataFrame(
+            imputer.fit_transform(X_undersampled[feature_cols]),
+            columns=feature_cols,
+            index=X_undersampled.index
+        )
 
     # Over-sample the minority class to 25% of the original majority class size
     target_minority_count = int(original_class_distribution[majority_class] * 0.25)

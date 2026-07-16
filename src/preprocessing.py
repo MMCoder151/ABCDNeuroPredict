@@ -349,6 +349,25 @@ def filter_subjects(dta_path, dta_path_tabular, test=False, overwrite=True, outp
     # Add depression marker to mri_meta_df
     mri_meta_df["dep_dx"] = mri_meta_df["subject"].apply(lambda x: 1 if x in subjects_depr else 0)
 
+    # Add parent and youth depression markers to mri_meta_df
+    mri_meta_df["dep_dx_y"] = mri_meta_df["subject"].apply(lambda x: 1 if x in set(ksads_youth.loc[y_depr, "participant_id"]) else 0)
+    mri_meta_df["dep_dx_p"] = mri_meta_df["subject"].apply(lambda x: 1 if x in set(ksads_parent.loc[p_depr, "participant_id"]) else 0)
+
+    # Add raw diagnosis columns to mri_meta_df for reference
+    mri_meta_df = mri_meta_df.merge(
+        ksads_youth[["participant_id", *diagnosis_youth_cols]],
+        left_on="subject",
+        right_on="participant_id",
+        how="left"
+    ).drop(columns=["participant_id"])
+
+    mri_meta_df = mri_meta_df.merge(
+        ksads_parent[["participant_id", *diagnosis_parent_cols]],
+        left_on="subject",
+        right_on="participant_id",
+        how="left"
+    ).drop(columns=["participant_id"])
+
     # Add total intracranial volume (TIV) to mri_meta_df per subject and time point
     subcortical_vol = pd.read_csv(dta_path / "phenotype" / "mr_y_smri__vol__aseg.tsv", sep="\t")
     mri_meta_df = mri_meta_df.merge(subcortical_vol[["participant_id", "session_id", "mr_y_smri__vol__aseg__icv_sum"]], left_on=["subject", "timepoint"], right_on=["participant_id", "session_id"], how="left")

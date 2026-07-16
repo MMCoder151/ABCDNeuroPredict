@@ -70,8 +70,6 @@ def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, overwrite = True, 
         mri_rois_results (DataFrame): DataFrame containing the regression results for each MRI feature
         mri_rois_results (CSV): CSV file containing the regression results for each MRI feature
     NOTE: This function currently doesn't use DuckDB 
-    TODO: Include scan_site as a covariate in the regression analysis to account for site effects
-    TODO: Include effect size calculations for each MRI feature to quantify the magnitude of group differences
     '''
     if overwrite == False:
         existing_results_path = output_path / "mri_rois_results.csv"
@@ -278,7 +276,7 @@ def mri_clustering(data, n_clusters=None, max_clusters=None,dr=None, dr_params=N
             print(f"No existing clustering results found at {existing_results_path}. Running clustering analysis.")
 
     subject_id_col = None
-    for candidate in ["subject_ids", "subject"]:
+    for candidate in ["subject_ids", "subject", "participant_id", "subject_id"]:
         if candidate in data.columns:
             subject_id_col = candidate
             break
@@ -291,7 +289,8 @@ def mri_clustering(data, n_clusters=None, max_clusters=None,dr=None, dr_params=N
     data = data.reset_index(drop=True)
 
     # Drop columns that are not needed for clustering
-    columns_to_drop = ["subject_ids", "observations", "composite_z", "rank", "subject", "timepoint", "scan_site", "sex", "age", "mr_y_smri__vol__aseg__icv_sum"]
+    columns_to_drop = ["subject_ids", "observations", "composite_z", "rank", "subject", "timepoint", "scan_site", "sex", "age", "mr_y_smri__vol__aseg__icv_sum", 
+                       "participant_id", "session_id", "subject_x", "subject_y", "timepoint_x", "timepoint_y", "acq_time"]
     for col in columns_to_drop:
         if col in data.columns:
             data = data.drop(columns=[col])
@@ -561,8 +560,8 @@ def mri_clustering(data, n_clusters=None, max_clusters=None,dr=None, dr_params=N
     best_cl = results_df_filtered.iloc[0]['cl_model']
     best_dr_params = results_df_filtered.iloc[0]['dr_params']
     best_cl_params = results_df_filtered.iloc[0]['cl_params']
-    dr_model = next(DR(**params) for name, DR, params in dr_models if name == best_dr)
-    cl_model = next(CL(**params) for name, CL, params in cl_models if name == best_cl)
+    dr_model = next(DR(**params) for name, DR, params in dr_models if name == best_dr and params == best_dr_params)
+    cl_model = next(CL(**params) for name, CL, params in cl_models if name == best_cl and params == best_cl_params)
     X_dr = dr_model.fit_transform(data)
     data["label"] = cl_model.fit_predict(X_dr)
     data["subject_ids"] = subject_ids
@@ -771,3 +770,105 @@ def missingness_analysis(con, fit_meta_df, output_path = Path("output")):
     mcar_results_df.to_csv(os.path.join(output_path, "fitbit_missingness_mcar_results.csv"), index=False)
 
     return mcar_results_df
+
+def group_difference_analysis(data, group_col, mri_meta_df, analysis_output = None, output_path = Path("output")):
+    '''
+    This function performs group difference analysis for the selected subjects' data based on the specified group column.
+    It uses a generalized additive model (GAM) to account for non-linear effects of covariates and extracts p-values for group differences.
+    It also calculates the effect size (Cohen's d) for each feature to quantify the magnitude of group differences.
+
+    Parameters:
+        data (DataFrame): DataFrame containing the data to analyze
+        group_col (str): Column name in the DataFrame that defines the groups for comparison
+    Returns:
+        results_df (DataFrame): DataFrame containing the results of the group difference analysis, including p-values, effect sizes, and effect size standard deviations for each feature
+    '''
+
+    def _cohens_d(x, y):
+        """
+        Calculate Cohen's d effect size between two groups.
+        Parameters:
+            x (array-like): Values for group 1
+            y (array-like): Values for group 2
+        Returns:
+            d (float): Cohen's d effect size
+        """
+        nx, ny = len(x), len(y)
+        dof = nx + ny - 2
+        pooled_std = np.sqrt(((nx - 1) * np.var(x, ddof=1) + (ny - 1) * np.var(y, ddof=1)) / dof)
+        return (np.mean(x) - np.mean(y)) / pooled_std
+
+    def _cohens_d_std(x, y, d=None):
+        """
+        Approximate standard deviation (standard error) of Cohen's d.
+        Parameters:
+            x (array-like): Values for group 1
+            y (array-like): Values for group 2
+            d (float, optional): Precomputed Cohen's d
+        Returns:
+            float: Standard deviation (SE) estimate for Cohen's d
+        """
+        nx, ny = len(x), len(y)
+        if nx < 2 or ny < 2:
+            return np.nan
+        if d is None:
+            d = _cohens_d(x, y)
+        var_d = ((nx + ny) / (nx * ny)) + ((d ** 2) / (2 * (nx + ny - 2)))
+        return np.sqrt(var_d)
+    
+    # Add covariates to data from mri_meta_df
+    covariate_cols = ["age_at_mri", "sex", "mr_y_smri__vol__aseg__icv_sum", "scan_site"]
+    for col in covariate_cols:
+        if col in mri_meta_df.columns:
+            data[col] = mri_meta_df[col]
+        else:
+            raise ValueError(f"Covariate column '{col}' not found in mri_meta_df.")
+    
+    # Recode sex to numeric
+    data["sex"] = data["sex"].map({"M": 0, "F": 1})
+
+    # Group difference analysis for each fitbit feature between discovered subtypes using GAM with effect size calculation
+    gam_results = []
+    for col in tqdm(data.columns, desc="Performing GAM regression analysis for MRI features"):
+        if col not in ["participant_id", "session_id", "subject", "subject_x", "subject_y", "acq_time", "depression_marker", "mh_y_ksads__dep_age", "sex", 
+                        "mr_y_smri__vol__aseg__icv_sum", "timepoint", "timepoint_x", "timepoint_y", "scan_site", "subject_ids", "label", "labels", "age_at_first_mri", group_col]:
+            model_cols = ["age_at_mri", "sex", group_col, "mr_y_smri__vol__aseg__icv_sum", "scan_site", col]
+            df_fit = data[model_cols].replace([np.inf, -np.inf], np.nan).dropna()
+            n_dropped = len(data) - len(df_fit)
+            if n_dropped > 0:
+                print(f"{col}: dropped {n_dropped} rows ({(n_dropped/len(data)*100):.2f}%) with missing/invalid data")
+            try:
+                gam = LinearGAM(s(0) + l(1) + l(2) + l(3) + l(4)).fit(df_fit[["age_at_mri", "scan_site", "sex","mr_y_smri__vol__aseg__icv_sum", group_col]], df_fit[col])
+                group_dep = df_fit.loc[df_fit[group_col] == 1, col]
+                group_nondep = df_fit.loc[df_fit[group_col] == 0, col]
+                effect_size = _cohens_d(group_dep, group_nondep)
+                effect_size_std = _cohens_d_std(group_dep, group_nondep, d=effect_size)
+                gam_results.append((col, gam.statistics_['p_values'][4], effect_size, effect_size_std))  # p-value for label
+            except Exception as e:
+                print(f"Error occurred while fitting GAM model for column {col}: {e}")
+    # Combine GAM p-values, effect sizes, and effect size standard deviations into a single DataFrame
+    results_df = pd.DataFrame(gam_results, columns=["feature", "p_value", "effect_size", "effect_size_std"])
+    results_df = results_df.sort_values("p_value")
+
+    # Perform FDR correction for multiple comparisons
+    print("Performing FDR correction for multiple comparisons...")
+    rejected, corrected_p_values, _, _ = multipletests(results_df["p_value"], alpha=0.05, method='fdr_bh')
+    results_df["corrected_p_value"] = corrected_p_values
+    results_df["significant_fdr"] = rejected
+
+    # If analysis_output is provided, save the results to a CSV file
+    if analysis_output is not None:
+        results_df.to_csv(os.path.join(output_path, str(analysis_output)), index=False)
+        print(f"Results saved to: {os.path.join(output_path, str(analysis_output))}")
+
+    # Print the number of significant ROIs after FDR correction
+    num_significant_rois = results_df["significant_fdr"].sum()
+    print(f"Number of significant ROIs after FDR correction: {num_significant_rois}")
+
+    sig_results_df = results_df[results_df["significant_fdr"]]
+    # If analysis_output is provided, save the significant results to a CSV file
+    if analysis_output is not None:
+        sig_results_df.to_csv(os.path.join(output_path, str(analysis_output)), index=False)
+        print(f"Significant ROIs saved to: {os.path.join(output_path, str(analysis_output))}")
+
+    return sig_results_df, results_df
