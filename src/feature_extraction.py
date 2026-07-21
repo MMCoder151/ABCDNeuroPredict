@@ -213,7 +213,7 @@ def analyse_confounds(dem_df, mri_meta_df, transformed_data, output_path=pathlib
     }
 
     # Impute missing TIV values
-    imputer = SimpleImputer(strategy='mean')
+    imputer = SimpleImputer(strategy='median')
     raw_data['mr_y_smri__vol__aseg__icv_sum'] = imputer.fit_transform(raw_data[['mr_y_smri__vol__aseg__icv_sum']])
     transformed_data['mr_y_smri__vol__aseg__icv_sum'] = imputer.fit_transform(transformed_data[['mr_y_smri__vol__aseg__icv_sum']])
 
@@ -689,7 +689,7 @@ def create_composites(selected_subjects, vif_threshold=10, overwrite=True, outpu
 
     vif_cols = [
         col for col in selected_subjects.columns
-        if col not in ["subject", "participant_id", "composite_z", "Wear_Time", "subtype", "group"]
+        if col not in ["subject", "participant_id", "composite_z", "Wear_Time", "subtype", "group", "observations"]
     ]
  
     # Drop zero-variance columns (VIF undefined for these)

@@ -11,8 +11,6 @@ import pickle
 from sklearn.metrics import confusion_matrix, f1_score
 from sklearn.decomposition import PCA
 from pacmap import PaCMAP
-from scipy.linalg import eigh
-from sklearn.covariance import LedoitWolf
 from sklearn.ensemble import IsolationForest
 from sklearn.impute import IterativeImputer
 from neuroCombat import neuroCombat
@@ -21,6 +19,9 @@ from src.mri_rois import *
 from functools import reduce
 from pygam import LinearGAM, s, l, f
 from sklearn.metrics import jaccard_score
+from statsmodels.formula.api import ols
+from scipy.stats import wilcoxon
+from sklearn.preprocessing import StandardScaler
 
 # SETUP WORKSPACE
 # Set raw data directory 
@@ -190,7 +191,7 @@ mri_data_filtered[numeric_cols] = imputer.fit_transform(mri_data_filtered[numeri
 
 # Conduct site harmonization using ComBat for all MRI features in mri_data_filtered
 # Prepare data for ComBat 
-feature_cols = mri_data.columns
+feature_cols = mri_data.columns.difference(["participant_id", "session_id"])
 mri_data_pre_combat = mri_data_filtered.copy()
 mri_data_combat = mri_data_filtered[feature_cols].transpose()  # Transpose to have features as rows and subjects as columns
 
@@ -215,10 +216,143 @@ mri_data_combat = neuroCombat(
                     )
 
 # Transpose back to original shape
-mri_data_filtered[numeric_cols] = mri_data_combat["data"].transpose()
+mri_data_filtered[feature_cols] = mri_data_combat["data"].transpose()
 
 # Conduct confound analysis pre and post harmonization
-# TODO: Implement
+def confound_analysis(data_pre, data_post, feature_cols):
+
+    scaler = StandardScaler()
+
+    data_pre["TIV_z"] = scaler.fit_transform(data_pre[["mr_y_smri__vol__aseg__icv_sum"]])
+    data_post["TIV_z"] = scaler.transform(data_post[["mr_y_smri__vol__aseg__icv_sum"]])
+
+    def partial_r2(full_formula, reduced_formula, data):
+        full = ols(full_formula, data=data).fit()
+        reduced = ols(reduced_formula, data=data).fit()
+
+        ss_full = full.ssr
+        ss_reduced = reduced.ssr
+
+        return (ss_reduced - ss_full) / ss_reduced
+
+    summary = []
+
+    for feature in tqdm(feature_cols, desc="Calculating confounds"):
+
+        full = f'Q("{feature}") ~ bs(visit_age, df=4) + C(sex) + C(scan_site) + TIV_z'
+
+        model_pre = ols(full, data=data_pre).fit()
+        model_post = ols(full, data=data_post).fit()
+
+        age_r2_pre = partial_r2(
+            full,
+            f'Q("{feature}") ~ C(sex) + C(scan_site) + TIV_z',
+            data_pre
+        )
+        age_r2_post = partial_r2(
+            full,
+            f'Q("{feature}") ~ C(sex) + C(scan_site) + TIV_z',
+            data_post
+        )
+
+        sex_r2_pre = partial_r2(
+            full,
+            f'Q("{feature}") ~ bs(visit_age, df=4) + C(scan_site) + TIV_z',
+            data_pre
+        )
+        sex_r2_post = partial_r2(
+            full,
+            f'Q("{feature}") ~ bs(visit_age, df=4) + C(scan_site) + TIV_z',
+            data_post
+        )
+
+        site_r2_pre = partial_r2(
+            full,
+            f'Q("{feature}") ~ bs(visit_age, df=4) + C(sex) + TIV_z',
+            data_pre
+        )
+        site_r2_post = partial_r2(
+            full,
+            f'Q("{feature}") ~ bs(visit_age, df=4) + C(sex) + TIV_z',
+            data_post
+        )
+
+        tiv_r2_pre = partial_r2(
+            full,
+            f'Q("{feature}") ~ bs(visit_age, df=4) + C(sex) + C(scan_site)',
+            data_pre
+        )
+        tiv_r2_post = partial_r2(
+            full,
+            f'Q("{feature}") ~ bs(visit_age, df=4) + C(sex) + C(scan_site)',
+            data_post
+        )
+
+        summary.append({
+            "Feature": feature,
+            "R2_pre": model_pre.rsquared,
+            "R2_post": model_post.rsquared,
+            "Age_partial_R2": age_r2_pre,
+            "Age_partial_R2_post": age_r2_post,
+            "Sex_partial_R2": sex_r2_pre,
+            "Sex_partial_R2_post": sex_r2_post,
+            "Site_partial_R2": site_r2_pre,
+            "Site_partial_R2_post": site_r2_post,
+            "TIV_partial_R2": tiv_r2_pre,
+            "TIV_partial_R2_post": tiv_r2_post,
+        })
+
+    # Conduct Wilcoxon signed-rank test to compare pre and post R2 values for each confound
+    model_stat, model_p = wilcoxon([model_pre.rsquared], [model_post.rsquared])
+    age_stat, age_p = wilcoxon([age_r2_pre], [age_r2_post])
+    sex_stat, sex_p = wilcoxon([sex_r2_pre], [sex_r2_post])
+    site_stat, site_p = wilcoxon([site_r2_pre], [site_r2_post])
+    tiv_stat, tiv_p = wilcoxon([tiv_r2_pre], [tiv_r2_post])
+
+    summary[-1].update({
+        "R2_Wilcoxon_stat": model_stat,
+        "R2_Wilcoxon_p": model_p,
+        "Age_Wilcoxon_stat": age_stat,
+        "Age_Wilcoxon_p": age_p,
+        "Sex_Wilcoxon_stat": sex_stat,
+        "Sex_Wilcoxon_p": sex_p,
+        "Site_Wilcoxon_stat": site_stat,
+        "Site_Wilcoxon_p": site_p,
+        "TIV_Wilcoxon_stat": tiv_stat,
+        "TIV_Wilcoxon_p": tiv_p,
+    })
+
+    # Create cross-feature means
+    summary.append({
+        "Feature": "Mean",
+        "R2_pre": np.mean([s["R2_pre"] for s in summary]),
+        "R2_post": np.mean([s["R2_post"] for s in summary]),
+        "R2_Wilcoxon_stat": np.mean([s["R2_Wilcoxon_stat"] for s in summary]),
+        "R2_Wilcoxon_p": np.mean([s["R2_Wilcoxon_p"] for s in summary]),
+        "Age_partial_R2": np.mean([s["Age_partial_R2"] for s in summary]),
+        "Age_partial_R2_post": np.mean([s["Age_partial_R2_post"] for s in summary]),
+        "Age_Wilcoxon_stat": np.mean([s["Age_Wilcoxon_stat"] for s in summary]),
+        "Age_Wilcoxon_p": np.mean([s["Age_Wilcoxon_p"] for s in summary]),
+        "Sex_partial_R2": np.mean([s["Sex_partial_R2"] for s in summary]),
+        "Sex_partial_R2_post": np.mean([s["Sex_partial_R2_post"] for s in summary]),
+        "Sex_Wilcoxon_stat": np.mean([s["Sex_Wilcoxon_stat"] for s in summary]),
+        "Sex_Wilcoxon_p": np.mean([s["Sex_Wilcoxon_p"] for s in summary]),
+        "Site_partial_R2": np.mean([s["Site_partial_R2"] for s in summary]),
+        "Site_partial_R2_post": np.mean([s["Site_partial_R2_post"] for s in summary]),
+        "Site_Wilcoxon_stat": np.mean([s["Site_Wilcoxon_stat"] for s in summary]),
+        "Site_Wilcoxon_p": np.mean([s["Site_Wilcoxon_p"] for s in summary]),
+        "TIV_partial_R2": np.mean([s["TIV_partial_R2"] for s in summary]),
+        "TIV_partial_R2_post": np.mean([s["TIV_partial_R2_post"] for s in summary]),
+        "TIV_Wilcoxon_stat": np.mean([s["TIV_Wilcoxon_stat"] for s in summary]),
+        "TIV_Wilcoxon_p": np.mean([s["TIV_Wilcoxon_p"] for s in summary])
+    })
+
+    summary = pd.DataFrame(summary)
+
+    return summary
+
+summary_combat = confound_analysis(mri_data_pre_combat, mri_data_filtered, feature_cols)
+summary_combat.to_csv(os.path.join(baseline_output_path, "confound_analysis_combat.csv"), index=False)
 
 # Do group difference analysis
 def _cohens_d(x, y):
@@ -226,7 +360,6 @@ def _cohens_d(x, y):
     dof = nx + ny - 2
     pooled_std = np.sqrt(((nx - 1) * np.var(x, ddof=1) + (ny - 1) * np.var(y, ddof=1)) / dof)
     return (np.mean(x) - np.mean(y)) / pooled_std
- 
  
 def _cohens_d_std(x, y, d=None):
     nx, ny = len(x), len(y)
@@ -236,7 +369,6 @@ def _cohens_d_std(x, y, d=None):
         d = _cohens_d(x, y)
     var_d = ((nx + ny) / (nx * ny)) + ((d ** 2) / (2 * (nx + ny - 2)))
     return np.sqrt(var_d)
- 
  
 def _stratified_bootstrap_indices(group_labels, n_bootstraps, rng):
     """Resample WITHIN each group separately, so every replicate preserves
@@ -378,11 +510,11 @@ def exploratory_group_difference_analysis(
 mri_dep_y_sig, mri_dep_y_all = exploratory_group_difference_analysis(mri_data_filtered, "mh_y_ksads__dep__mdd__pres_dx", 
                                                                      os.path.join(baseline_output_path, "mri_dep_y_results.csv"), 
                                                                      output_path_sig=os.path.join(baseline_output_path, "mri_dep_y_results_sig.csv"),
-                                                                     overwrite=False)
+                                                                     overwrite=True)
 mri_dep_p_sig, mri_dep_p_all = exploratory_group_difference_analysis(mri_data_filtered, "mh_p_ksads__dep__mdd__pres_dx", 
                                                                      os.path.join(baseline_output_path, "mri_dep_p_results.csv"), 
                                                                      output_path_sig=os.path.join(baseline_output_path, "mri_dep_p_results_sig.csv"),
-                                                                     overwrite=False)
+                                                                     overwrite=True)
 
 mri_dep_y_sig.columns
 
@@ -426,13 +558,6 @@ mri_dep_p_sig_corr = mri_data_filtered[mri_dep_p_sig_filtered_rois].corr()
 mri_dep_y_sig_corr.to_csv(os.path.join(baseline_output_path, "mri_dep_y_sig_corr.csv"))
 mri_dep_p_sig_corr.to_csv(os.path.join(baseline_output_path, "mri_dep_p_sig_corr.csv"))
 
-# Create composites of significant ROIs for youth and parent
-mri_dep_y_sig_composites, mri_dep_y_sig_composite_dict = create_composites(mri_data_filtered[mri_dep_y_sig_filtered_rois], overwrite = True, composite_output = os.path.join(baseline_output_path, "mri_dep_y_sig_composites.csv"))
-mri_dep_y_sig_composites["participant_id"] = mri_data_filtered["participant_id"]
-
-mri_dep_p_sig_composites, mri_dep_p_sig_composite_dict = create_composites(mri_data_filtered[mri_dep_p_sig_filtered_rois], overwrite = True, composite_output = os.path.join(baseline_output_path, "mri_dep_p_sig_composites.csv"))
-mri_dep_p_sig_composites["participant_id"] = mri_data_filtered["participant_id"]
-
 # Create scatter plot of data in 2D PCA space for parent significant ROIs and mark depressed subjects
 pca_p = PCA(n_components=2, random_state=42)
 mri_dep_p_sig_pca = pca_p.fit_transform(mri_data_filtered[mri_dep_p_sig_filtered_rois])
@@ -443,114 +568,6 @@ sns.scatterplot(data=mri_dep_p_sig_pca_df, x="PCA_1", y="PCA_2", hue="depressed_
 plt.title("PCA of Parent Significant ROIs (Depressed vs Non-Depressed)")
 plt.savefig(os.path.join(baseline_output_path, "mri_dep_p_sig_pca.png"))
 plt.close()
-
-# Site harmonization using ComBat for all significant ROIs for youth and parent
-# TODO: Implement
-
-# z-score normalization of significant ROIs for youth and parent
-scaler_y = StandardScaler()
-mri_dep_y_sig_scaled = pd.DataFrame(
-    scaler_y.fit_transform(mri_dep_y_sig_composites.drop(columns=["participant_id"])),
-    columns=mri_dep_y_sig_composites.drop(columns=["participant_id"]).columns,
-    index=mri_dep_y_sig_composites.index,
-)
-mri_dep_y_sig_scaled["participant_id"] = mri_dep_y_sig_composites["participant_id"]
-
-scaler_p = StandardScaler()
-mri_dep_p_sig_scaled = pd.DataFrame(
-    scaler_p.fit_transform(mri_dep_p_sig_composites.drop(columns=["participant_id"])),
-    columns=mri_dep_p_sig_composites.drop(columns=["participant_id"]).columns,
-    index=mri_dep_p_sig_composites.index,
-)
-mri_dep_p_sig_scaled["participant_id"] = mri_dep_p_sig_composites["participant_id"]
-
-# WHITEN AND WEIGH MRI FEATURES
-# Calculate covariance matrix for whitening using Mahalanobis distance
-mri_identifier_cols_y = [col for col in mri_dep_y_sig_scaled.columns if col in {"subject", "subject_ids", "participant_id"}]
-mri_identifier_cols_p = [col for col in mri_dep_p_sig_scaled.columns if col in {"subject", "subject_ids", "participant_id"}]
-
-mri_feature_cols_y = [col for col in mri_dep_y_sig_scaled.columns if col not in mri_identifier_cols_y]
-mri_feature_cols_p = [col for col in mri_dep_p_sig_scaled.columns if col not in mri_identifier_cols_p]
-
-mri_feature_matrix_y = mri_dep_y_sig_scaled[mri_feature_cols_y].to_numpy(dtype=float)
-mri_feature_matrix_p = mri_dep_p_sig_scaled[mri_feature_cols_p].to_numpy(dtype=float)
-
-Sigma_y = np.cov(mri_feature_matrix_y, rowvar=False)
-Sigma_p = np.cov(mri_feature_matrix_p, rowvar=False)
-lw_y = LedoitWolf().fit(mri_dep_y_sig_scaled[mri_feature_cols_y].to_numpy(dtype=float))
-lw_p = LedoitWolf().fit(mri_dep_p_sig_scaled[mri_feature_cols_p].to_numpy(dtype=float))
-Sigma_y = lw_y.covariance_
-Sigma_p = lw_p.covariance_
-
-# Compute whitening matrix
-eigvals_y, eigvecs_y = eigh(Sigma_y)
-eigvals_p, eigvecs_p = eigh(Sigma_p)
-eigvals_y = np.clip(eigvals_y, a_min=1e-10, a_max=None)
-eigvals_p = np.clip(eigvals_p, a_min=1e-10, a_max=None)
-W_pca_y = eigvecs_y @ np.diag(1.0 / np.sqrt(eigvals_y)) @ eigvecs_y.T
-W_pca_p = eigvecs_p @ np.diag(1.0 / np.sqrt(eigvals_p)) @ eigvecs_p.T
-
-# Get subject labels for resampled mri data to ensure alignment with whitened data
-subject_labels_y = mri_dep_y_sig_scaled["participant_id"].reset_index(drop=True)
-subject_labels_p = mri_dep_p_sig_scaled["participant_id"].reset_index(drop=True)
-
-# Apply whitening to the normalised mri data
-mri_dep_y_whitened = pd.DataFrame(
-    mri_dep_y_sig_scaled[mri_feature_cols_y].to_numpy(dtype=float) @ W_pca_y,
-    columns=mri_feature_cols_y,
-    index=mri_dep_y_sig_scaled.index,
-)
-mri_dep_p_whitened = pd.DataFrame(
-    mri_dep_p_sig_scaled[mri_feature_cols_p].to_numpy(dtype=float) @ W_pca_p,
-    columns=mri_feature_cols_p,
-    index=mri_dep_p_sig_scaled.index,
-)
-
-# Sanity check
-print(np.cov(mri_dep_y_whitened.to_numpy(dtype=float), rowvar=False))
-print(np.cov(mri_dep_p_whitened.to_numpy(dtype=float), rowvar=False))
-
-def _apply_effect_size_weights(whitened_df, sig_df, composite_dict, label):
-    weighted_df = whitened_df.copy()
-    for col in weighted_df.columns:
-        if col in sig_df["feature"].values:
-            effect_size = sig_df.loc[sig_df["feature"] == col, "effect_size"].values[0]
-            weight = abs(effect_size)
-        elif col in composite_dict:
-            individual_rois = composite_dict[col]
-            effect_sizes = sig_df[sig_df["feature"].isin(individual_rois)]["effect_size"].values
-            if effect_sizes.size == 0:
-                print(f"Warning: No significant ROIs found for composite {col} in {label}. Skipping weighing for this column.")
-                continue
-            weight = np.mean(np.abs(effect_sizes))
-        else:
-            print(f"Warning: Column {col} not found in significant features or composite dictionary for {label}. Skipping weighing for this column.")
-            continue
-
-        weighted_df[col] *= weight
-
-    return weighted_df
-
-# Apply weighing to the normalised mri data based on the absolute effect sizes of the significant ROIs by multiplying each ROI with its absolute effect size
-mri_dep_y_weighted = _apply_effect_size_weights(mri_dep_y_whitened, mri_dep_y_sig, mri_dep_y_sig_composite_dict, "youth")
-# Reattach subject labels to wighted mri data
-mri_dep_y_weighted["subject"] = subject_labels_y
-
-mri_dep_p_weighted = _apply_effect_size_weights(mri_dep_p_whitened, mri_dep_p_sig, mri_dep_p_sig_composite_dict, "parent")
-# Reattach subject labels to wighted mri data
-mri_dep_p_weighted["subject"] = subject_labels_p
-
-# Create scatter plot for weighted and whitened mri data in 2D PCA space for parent significant ROIs and mark depressed subjects
-pca_p = PCA(n_components=2, random_state=42)
-mri_dep_p_weighted_pca = pca_p.fit_transform(mri_dep_p_weighted.drop(columns=["subject"]))
-mri_dep_p_weighted_pca_df = pd.DataFrame(mri_dep_p_weighted_pca, columns=["PCA_1", "PCA_2"])
-mri_dep_p_weighted_pca_df["depressed_parent"] = mri_data_filtered["mh_p_ksads__dep__mdd__pres_dx"].reset_index(drop=True)
-plt.figure(figsize=(10, 8))
-sns.scatterplot(data=mri_dep_p_weighted_pca_df, x="PCA_1", y="PCA_2", hue="depressed_parent", palette={0: "blue", 1: "red"}, alpha=0.7)
-plt.title("PCA of Weighted and Whitened Parent Significant ROIs (Depressed vs Non-Depressed)")
-plt.savefig(os.path.join(baseline_output_path, "mri_dep_p_weighted_pca.png"))
-plt.close()
-
 
 # NORMATIVE MODELING
 # Prepare data for normative modeling
@@ -648,87 +665,195 @@ model_p.predict(data_full_p)
 # Read in z-scores for the full dataset for youth and parent
 z_scores_y = pd.read_csv(os.path.join(normative_output_dir_str_y, "results", "Z_mri_norm_full_y.csv"))
 z_scores_p = pd.read_csv(os.path.join(normative_output_dir_str_p, "results", "Z_mri_norm_full_p.csv"))
+z_scores_y.shape, z_scores_p.shape
+mri_data_filtered.shape
 
-# Create z-score composites for youth and parent
-z_scores_y_composites, z_scores_y_composite_dict = create_composites(z_scores_y[roi_cols_y], overwrite = True, composite_output = os.path.join(normative_output_dir_str_y, "z_scores_y_composites.csv"))
-z_scores_y_composites["participant_id"] = z_scores_y["subject_ids"]
-z_scores_p_composites, z_scores_p_composite_dict = create_composites(z_scores_p[roi_cols_p], overwrite = True, composite_output = os.path.join(normative_output_dir_str_p, "z_scores_p_composites.csv"))
-z_scores_p_composites["participant_id"] = z_scores_p["subject_ids"]
+# z-score normalization of significant ROIs for youth and parent
+scaler_y = StandardScaler()
+mri_y_scaled = pd.DataFrame(
+    scaler_y.fit_transform(mri_data_filtered[roi_cols_y]),
+    columns=roi_cols_y
+)
+mri_y_scaled["participant_id"] = mri_data_filtered["participant_id"]
 
-# Plot z-score distributions in 2D PaCMAP space for youth significant ROIs and mark depressed subjects according to youth KSADS questionnaire
-pacmap_y = PaCMAP(n_components=2, n_neighbors=10, MN_ratio=0.5, FP_ratio=2.0, random_state=42)
-z_scores_y_pacmap = pacmap_y.fit_transform(z_scores_y[roi_cols_y])
-z_scores_y_pacmap_df = pd.DataFrame(z_scores_y_pacmap, columns=["PaCMAP_1", "PaCMAP_2"])
-z_scores_y_pacmap_df["depressed_youth"] = mri_data_filtered["mh_y_ksads__dep__mdd__pres_dx"].reset_index(drop=True)
-plt.figure(figsize=(10, 8))
-sns.scatterplot(data=z_scores_y_pacmap_df, x="PaCMAP_1", y="PaCMAP_2", hue="depressed_youth", palette={0: "blue", 1: "red"}, alpha=0.7)
-plt.title("PaCMAP of Z-scores for Youth Significant ROIs (Depressed vs Non-Depressed)")
-plt.savefig(os.path.join(normative_output_dir_str_y, "z_scores_y_pacmap.png"))
-plt.close()
+scaler_p = StandardScaler()
+mri_p_scaled = pd.DataFrame(
+    scaler_p.fit_transform(mri_data_filtered[roi_cols_p]),
+    columns=roi_cols_p
+)
+mri_p_scaled["participant_id"] = mri_data_filtered["participant_id"]
 
-# For each ROI, plot z-score distribution for youth and mark depressed subjects according to youth KSADS questionnaire
-z_scores_y = z_scores_y.merge(
+# Add confound variables to the z-scores for youth and parent for confound analysis
+covar_cols = confound_df.columns.difference(["participant_id", "session_id"]).tolist()
+
+covars = mri_data_filtered[["participant_id"] + covar_cols]
+
+mri_y_scaled = mri_y_scaled.merge(covars, on="participant_id", how="inner")
+mri_p_scaled = mri_p_scaled.merge(covars, on="participant_id", how="inner")
+
+z_scores_y_confounds = (z_scores_y.drop(columns=["observations"]).merge(covars, left_on="subject_ids", right_on="participant_id", how="inner"))
+z_scores_p_confounds = (z_scores_p.drop(columns=["observations"]).merge(covars, left_on="subject_ids", right_on="participant_id", how="inner"))
+
+# Conduct confound analysis on z-scores for youth and parent
+summary_normative_y = confound_analysis(mri_y_scaled, z_scores_y_confounds, roi_cols_y)
+summary_normative_y.to_csv(os.path.join(baseline_output_path, "confound_analysis_normative_y.csv"), index=False)
+summary_normative_p = confound_analysis(mri_p_scaled, z_scores_p_confounds, roi_cols_p)
+summary_normative_p.to_csv(os.path.join(baseline_output_path, "confound_analysis_normative_p.csv"), index=False)
+
+# Create a z-score composite across ROIs for youth and parent
+# Flip the sign of the z-scores for ROIs with negative effect sizes to ensure that higher z-scores indicate greater deviation from the normative model in the direction of depression
+for roi in roi_cols_y:
+    if roi in mri_dep_y_sig["feature"].values:
+        effect_size = mri_dep_y_sig.loc[mri_dep_y_sig["feature"] == roi, "effect_size"].values[0]
+        if effect_size < 0:
+            z_scores_y[roi] = -z_scores_y[roi]
+
+for roi in roi_cols_p:
+    if roi in mri_dep_p_sig["feature"].values:
+        effect_size = mri_dep_p_sig.loc[mri_dep_p_sig["feature"] == roi, "effect_size"].values[0]
+        if effect_size < 0:
+            z_scores_p[roi] = -z_scores_p[roi]
+        
+# Apply effect size weights
+def _apply_effect_size_weights(whitened_df, sig_df):
+    weighted_df = whitened_df.copy()
+    for col in weighted_df.columns:
+        if col in sig_df["feature"].values:
+            effect_size = sig_df.loc[sig_df["feature"] == col, "effect_size"].values[0]
+            weight = 1 + abs(effect_size)
+        else:
+            print(f"Warning: Column {col} not found in features list. Skipping weighing for this column.")
+            continue
+
+        weighted_df[col] *= weight
+
+    return weighted_df
+
+# Apply weighing to the normalised mri data based on the absolute effect sizes of the significant ROIs by multiplying each ROI with its absolute effect size
+z_scores_y_weighted = _apply_effect_size_weights(z_scores_y, mri_dep_y_sig)
+# Reattach subject labels to wighted mri data
+z_scores_y_weighted["subject_ids"] = z_scores_y["subject_ids"]
+
+z_scores_p_weighted = _apply_effect_size_weights(z_scores_p, mri_dep_p_sig)
+# Reattach subject labels to wighted mri data
+z_scores_p_weighted["subject_ids"] = z_scores_p["subject_ids"]
+
+# Create composites based on covariance to control for correlation
+# Create composites of significant ROIs for youth and parent
+z_scores_y_composites, z_scores_y_composite_dict = create_composites(z_scores_y_weighted.drop(columns = ["subject_ids", "observations"]), overwrite = True, composite_output = os.path.join(baseline_output_path, "mri_dep_y_sig_composites.csv"))
+z_scores_y_composites["subject_ids"] = z_scores_y_weighted["subject_ids"]
+
+z_scores_p_composites, z_scores_p_composite_dict = create_composites(z_scores_p_weighted.drop(columns = ["subject_ids", "observations"]), overwrite = True, composite_output = os.path.join(baseline_output_path, "mri_dep_p_sig_composites.csv"))
+z_scores_p_composites["subject_ids"] = z_scores_p_weighted["subject_ids"]
+
+# Create a z-score composite across ROIs for youth and parent
+z_scores_y_composites["z_score_composite"] = z_scores_y_composites.drop(columns=["subject_ids"]).mean(axis=1)
+z_scores_p_composites["z_score_composite"] = z_scores_p_composites.drop(columns=["subject_ids"]).mean(axis=1)
+
+# Plot z-score composite distribution for youth and parent and mark depressed subjects according to youth and parent KSADS questionnaire
+z_scores_y_plot = z_scores_y_composites.merge(
     mri_data_filtered[["participant_id", "mh_y_ksads__dep__mdd__pres_dx"]],
     left_on="subject_ids",
     right_on="participant_id",
     how="left",
 )
-diagnosis_col = "mh_y_ksads__dep__mdd__pres_dx"
-
-for roi in roi_cols_y:
-    # Sort z-score and diagnosis together so they stay aligned
-    plot_df = z_scores_y[[roi, diagnosis_col]].sort_values(roi).reset_index(drop=True)
-    healthy = plot_df[plot_df[diagnosis_col] == 0]
-    depressed = plot_df[plot_df[diagnosis_col] == 1]
-
-    plt.figure(figsize=(10, 6))
-    plt.scatter(healthy.index, healthy[roi], c="lightgray", alpha=0.5, s=15, label="Healthy")
-    plt.scatter(depressed.index, depressed[roi], c="crimson", alpha=0.9, s=30,
-                edgecolor="black", linewidth=0.3, label="Depressed", zorder=5)
-
-    plt.axhline(0, color="black", lw=1, linestyle="--", alpha=0.6)
-    plt.axhline(1.96, color="gray", lw=0.8, linestyle=":")
-    plt.axhline(-1.96, color="gray", lw=0.8, linestyle=":")
-
-    plt.title(f"Z-score distribution for {roi} (Youth KSADS)")
-    plt.xlabel("Subjects (sorted by Z-score)")
-    plt.ylabel("Z-score")
-    plt.legend(loc="upper left")
-    plt.tight_layout()
-    plt.savefig(os.path.join(normative_output_dir_str_y, f"z_score_distribution_{roi}_youth.png"))
-    plt.close()
-
-# For each ROI, plot z-score distribution for parent and mark depressed subjects according to parent KSADS questionnaire
-z_scores_p = z_scores_p.merge(
+z_scores_p_plot = z_scores_p_composites.merge(
     mri_data_filtered[["participant_id", "mh_p_ksads__dep__mdd__pres_dx"]],
     left_on="subject_ids",
     right_on="participant_id",
     how="left",
 )
-diagnosis_col = "mh_y_ksads__dep__mdd__pres_dx"
 
-for roi in roi_cols_p:
-    # Sort z-score and diagnosis together so they stay aligned
-    plot_df = z_scores_p[[roi, diagnosis_col]].sort_values(roi).reset_index(drop=True)
-    healthy = plot_df[plot_df[diagnosis_col] == 0]
-    depressed = plot_df[plot_df[diagnosis_col] == 1]
+# Create plotting dataframe
+plot_df_y = z_scores_y_plot.copy()
+plot_df_p = z_scores_p_plot.copy()
 
-    plt.figure(figsize=(10, 6))
-    plt.scatter(healthy.index, healthy[roi], c="lightgray", alpha=0.5, s=15, label="Healthy")
-    plt.scatter(depressed.index, depressed[roi], c="crimson", alpha=0.9, s=30,
-                edgecolor="black", linewidth=0.3, label="Depressed", zorder=5)
+# Define diagnostic group
+plot_df_y["Group"] = np.where(
+    plot_df_y["mh_y_ksads__dep__mdd__pres_dx"] == 1,
+    "Depressed",
+    "Healthy"
+)
 
-    plt.axhline(0, color="black", lw=1, linestyle="--", alpha=0.6)
-    plt.axhline(1.96, color="gray", lw=0.8, linestyle=":")
-    plt.axhline(-1.96, color="gray", lw=0.8, linestyle=":")
+plot_df_p["Group"] = np.where(
+    plot_df_p["mh_p_ksads__dep__mdd__pres_dx"] == 1,
+    "Depressed",
+    "Healthy"
+)
 
-    plt.title(f"Z-score distribution for {roi} (Parent KSADS)")
-    plt.xlabel("Subjects (sorted by Z-score)")
-    plt.ylabel("Z-score")
-    plt.legend(loc="upper left")
-    plt.tight_layout()
-    plt.savefig(os.path.join(normative_output_dir_str_p, f"z_score_distribution_{roi}_parent.png"))
-    plt.close()
+violin_df_y = plot_df_y[["Group", "z_score_composite"]].dropna()
+violin_df_p = plot_df_p[["Group", "z_score_composite"]].dropna()
+
+# Split violin plot
+plt.figure(figsize=(6, 6))
+
+sns.violinplot(
+    data=violin_df_y,
+    y="z_score_composite",
+    x=np.zeros(len(violin_df_y)),
+    hue="Group",
+    split=True,
+    inner="quartile",
+    cut=0,
+    linewidth=1,
+    palette={"Healthy": "lightgray", "Depressed": "crimson"}
+)
+
+# Reference lines
+plt.axhline(0, color="black", lw=1, linestyle="--", alpha=0.6)
+plt.axhline(1.96, color="gray", lw=0.8, linestyle=":")
+plt.axhline(-1.96, color="gray", lw=0.8, linestyle=":")
+
+plt.xticks([])
+plt.xlabel("")
+plt.ylabel("Z-score composite")
+plt.title("Z-score composite distribution (Youth KSADS)")
+
+plt.legend(title="")
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(normative_output_dir_str_y, "z_score_composite_split_violin_youth.png"),
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+plt.figure(figsize=(6, 6))
+sns.violinplot(
+    data=violin_df_p,
+    y="z_score_composite",
+    x=np.zeros(len(violin_df_p)),
+    hue="Group",
+    split=True,
+    inner="quartile",
+    cut=0,
+    linewidth=1,
+    palette={"Healthy": "lightgray", "Depressed": "crimson"}
+)
+# Reference lines
+plt.axhline(0, color="black", lw=1, linestyle="--", alpha=0.6)
+plt.axhline(1.96, color="gray", lw=0.8, linestyle=":")
+plt.axhline(-1.96, color="gray", lw=0.8, linestyle=":")
+
+plt.xticks([])
+plt.xlabel("")
+plt.ylabel("Z-score composite")
+plt.title("Z-score composite distribution (Parent KSADS)")
+
+plt.legend(title="")
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(normative_output_dir_str_p, "z_score_composite_split_violin_parent.png"),
+    dpi=300,
+    bbox_inches="tight"
+)
+plt.close()
+
+# Check association between z-score composite and depression symptom severity for youth and parent
+# TODO: Implement
 
 # BASELINE CLASSIFICATION
 # Check overlap between subjects with fibtit features and subjects with mri features
@@ -743,7 +868,19 @@ con = setup_duckdb(dta_path, fit_meta_df, overwrite=False)
 subject_timepoint_pairs = mri_data_filtered[["participant_id", "session_id"]]
 subject_timepoint_pairs.rename(columns={"participant_id": "subject", "session_id": "timepoint"}, inplace=True)
 
-mri_data_filtered = None
+# Check which subject timepoint pairs exist in fit_meta_df
+existing_pairs = pd.merge(subject_timepoint_pairs, fit_meta_df[["subject", "timepoint"]], on=["subject", "timepoint"], how="inner")
+existing_pairs = existing_pairs.drop_duplicates(subset=["subject", "timepoint"])
+print(f"Number of subject timepoint pairs in filtered mri dataset: {subject_timepoint_pairs.shape[0]}")
+print(f"Number of existing subject timepoint pairs in fit_meta_df: {existing_pairs.shape[0]}")
+
+# Check which subject timepoint pairs that exist in fit_meta_df have a depression diagnosis according to the youth KSADS questionnaire
+existing_pairs_with_dep_y = pd.merge(existing_pairs, mri_data_filtered[["participant_id", "mh_y_ksads__dep__mdd__pres_dx"]], left_on="subject", right_on="participant_id", how="inner")
+existing_pairs_with_dep_y = existing_pairs_with_dep_y[existing_pairs_with_dep_y["mh_y_ksads__dep__mdd__pres_dx"] == 1]
+existing_pairs_with_dep_p = pd.merge(existing_pairs, mri_data_filtered[["participant_id", "mh_p_ksads__dep__mdd__pres_dx"]], left_on="subject", right_on="participant_id", how="inner")
+existing_pairs_with_dep_p = existing_pairs_with_dep_p[existing_pairs_with_dep_p["mh_p_ksads__dep__mdd__pres_dx"] == 1]
+print(f"Number of existing subject timepoint pairs in fit_meta_df with depression diagnosis according to youth KSADS questionnaire: {existing_pairs_with_dep_y.shape[0]}")
+print(f"Number of existing subject timepoint pairs in fit_meta_df with depression diagnosis according to parent KSADS questionnaire: {existing_pairs_with_dep_p.shape[0]}")
 
 def extract_fitbit_features_2(con, subject_timepoint_pairs, output_path=None, overwrite=False):
     if output_path is not None and os.path.exists(output_path) and not overwrite:
@@ -757,11 +894,11 @@ def extract_fitbit_features_2(con, subject_timepoint_pairs, output_path=None, ov
         FROM fitbit_data
         WHERE subject = '{row.subject}' AND timepoint = '{row.timepoint}'
         """
-        subject_fitbit_df = con.execute(query).fetchdf()
+        subject_fitbit_df = con.sql(query).fetchdf()
         fitbit_metric_cols = [col for col in subject_fitbit_df.columns if col not in ["subject", "timepoint", "Wear_Time"]]
         for col in fitbit_metric_cols:
             subject_fitbit_df[col] = pd.to_numeric(subject_fitbit_df[col], errors="coerce")
-        feature_dict = {"subject": row.subject}
+        feature_dict = {"subject": row.subject, "timepoint": row.timepoint}
         for metric in fitbit_metric_cols:
             # Check if the metric column exists in the group
             if metric in subject_fitbit_df.columns:
@@ -827,21 +964,21 @@ def extract_fitbit_features_2(con, subject_timepoint_pairs, output_path=None, ov
 
     return fitbit_features_df
 
-fitbit_features = extract_fitbit_features_2(con, subject_timepoint_pairs, output_path=os.path.join(baseline_output_path, "fitbit_features.csv"), overwrite=True)
+fitbit_features = extract_fitbit_features_2(con, existing_pairs, output_path=os.path.join(baseline_output_path, "fitbit_features.csv"), overwrite=False)
 fitbit_features.to_csv(os.path.join(baseline_output_path, "fitbit_features.csv"), index=False)
 
 # Make sure that the fitbit features are aligned with the filtered mri dataset by merging on subject and timepoint
-fitbit_features_filtered = fitbit_features.merge(subject_timepoint_pairs, left_on=["subject", "timepoint"], right_on=["subject", "timepoint"], how="inner")
+fitbit_features_filtered = fitbit_features.merge(existing_pairs, left_on=["subject", "timepoint"], right_on=["subject", "timepoint"], how="inner")
 
 # Create composites of fitbit features
 fitbit_features_composites, fitbit_features_composite_dict = create_composites(fitbit_features_filtered.drop(columns=["subject", "timepoint"]), overwrite=True, composite_output=os.path.join(baseline_output_path, "fitbit_features_composites.csv"))
 fitbit_features_composites["subject"] = fitbit_features_filtered["subject"]
 fitbit_features_composites["timepoint"] = fitbit_features_filtered["timepoint"]
 
-fitbit_features_composites.to_csv(os.path.join(baseline_output_path, "fitbit_features_composites.csv"), index=False)
+fitbit_features_composites.to_csv(os.path.join(baseline_output_path, "fitbit_features_with_composites.csv"), index=False)
 
 # Add depression diagnosis labels based on youth and parent KSADS questionnaires to the fitbit data
-fitbit_features_filtered = fitbit_features_filtered.merge(mri_data_filtered[["participant_id", "session_id", "mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx"]], left_on=["subject", "timepoint"], right_on=["participant_id", "session_id"], how="left")
+fitbit_features_filtered = fitbit_features_composites.merge(mri_data_filtered[["participant_id", "session_id", "mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx"]], left_on=["subject", "timepoint"], right_on=["participant_id", "session_id"], how="left")
 
 # Get number of subjects in fitbit data with depression diagnosis according to youth and parent KSADS questionnaires
 labels = (
@@ -868,64 +1005,3 @@ print(f"Number of subjects with depression diagnosis according to parent KSADS q
 
 
 
-
-# UNSUPERVISED CLUSTERING
-# Conduct unsupervised clustering on the normalized mri data of significant ROIs for youth KSADS questionnaire
-labels_y = mri_clustering(mri_dep_y_sig_scaled,
-                          dr=["PaCMAP", "PCA"],
-                          cl=["HDBSCAN"],
-                          n_clusters=2,
-                          output_path=os.path.join(baseline_output_path),
-                          clustering_output="labels_y.csv",
-                          bootstrapping=False,
-                          overwrite=True
-                          )
-
-# For each discovered cluster, get size and overlap with depressed subjects according to youth KSADS questionnaire
-for cluster in np.unique(labels_y["label"]):
-    cluster_size = np.sum(labels_y["label"] == cluster)
-    depressed_overlap = np.sum((labels_y["label"] == cluster) & (mri_data_filtered["mh_y_ksads__dep__mdd__pres_dx"].reset_index(drop=True) == 1))
-    print(f"Cluster {cluster}: Size = {cluster_size}, Overlap with depressed subjects = {depressed_overlap}")
-
-# Conduct unsupervised clustering on the normalized mri data of significant ROIs for parent KSADS questionnaire
-labels_p = mri_clustering(mri_dep_p_sig_scaled,
-                          dr=["PaCMAP", "PCA"],
-                          cl=["AgglomerativeClustering", "HDBSCAN"],
-                          n_clusters=2,
-                          output_path=os.path.join(baseline_output_path),
-                          clustering_output="labels_p.csv",
-                          bootstrapping=False,
-                          overwrite=True
-                          )
-
-# For each discovered cluster, get size and overlap with depressed subjects according to parent KSADS questionnaire
-for cluster in np.unique(labels_p["label"]):
-    cluster_size = np.sum(labels_p["label"] == cluster)
-    depressed_overlap = np.sum((labels_p["label"] == cluster) & (mri_data_filtered["mh_p_ksads__dep__mdd__pres_dx"].reset_index(drop=True) == 1))
-    print(f"Cluster {cluster}: Size = {cluster_size}, Overlap with depressed subjects = {depressed_overlap}")
-
-# Conduct unsupervised clustering on the weighted and whitened mri data of significant ROIs for youth KSADS questionnaire
-labels_y_weighted = mri_clustering(mri_dep_y_weighted.drop(columns=["subject"]),
-                          dr=["PaCMAP", "PCA"],
-                          cl=["Agglomerative", "KMeans"],
-                          n_clusters=2,
-                          output_path=os.path.join(baseline_output_path),
-                          bootstrapping=False,
-                          overwrite=True
-                          )
-
-# For each discovered cluster, get size and overlap with depressed subjects according to youth KSADS questionnaire
-for cluster in np.unique(labels_y_weighted):
-    cluster_size = np.sum(labels_y_weighted == cluster)
-    depressed_overlap = np.sum((labels_y_weighted == cluster) & (mri_data_filtered["mh_y_ksads__dep__mdd__pres_dx"].reset_index(drop=True) == 1))
-    print(f"Weighted Cluster {cluster}: Size = {cluster_size}, Overlap with depressed subjects = {depressed_overlap}")
-
-# Conduct unsupervised clustering on the weighted and whitened mri data of significant ROIs for parent KSADS questionnaire
-labels_p_weighted = mri_clustering(mri_dep_p_weighted.drop(columns=["subject"]),
-                          dr=["PaCMAP", "PCA"],
-                          cl=["Agglomerative", "KMeans"],
-                          n_clusters=2,
-                          output_path=os.path.join(baseline_output_path),
-                          bootstrapping=False,
-                          overwrite=True
-                          )
