@@ -237,6 +237,21 @@ def confound_analysis(data_pre, data_post, feature_cols):
 
     summary = []
 
+    r2_pre_all = []
+    r2_post_all = []
+
+    age_pre_all = []
+    age_post_all = []
+
+    sex_pre_all = []
+    sex_post_all = []
+
+    site_pre_all = []
+    site_post_all = []
+
+    tiv_pre_all = []
+    tiv_post_all = []
+
     for feature in tqdm(feature_cols, desc="Calculating confounds"):
 
         full = f'Q("{feature}") ~ bs(visit_age, df=4) + C(sex) + C(scan_site) + TIV_z'
@@ -288,6 +303,21 @@ def confound_analysis(data_pre, data_post, feature_cols):
             data_post
         )
 
+        r2_pre_all.append(model_pre.rsquared)
+        r2_post_all.append(model_post.rsquared)
+
+        age_pre_all.append(age_r2_pre)
+        age_post_all.append(age_r2_post)
+
+        sex_pre_all.append(sex_r2_pre)
+        sex_post_all.append(sex_r2_post)
+
+        site_pre_all.append(site_r2_pre)
+        site_post_all.append(site_r2_post)
+
+        tiv_pre_all.append(tiv_r2_pre)
+        tiv_post_all.append(tiv_r2_post)
+
         summary.append({
             "Feature": feature,
             "R2_pre": model_pre.rsquared,
@@ -303,13 +333,29 @@ def confound_analysis(data_pre, data_post, feature_cols):
         })
 
     # Conduct Wilcoxon signed-rank test to compare pre and post R2 values for each confound
-    model_stat, model_p = wilcoxon([model_pre.rsquared], [model_post.rsquared])
-    age_stat, age_p = wilcoxon([age_r2_pre], [age_r2_post])
-    sex_stat, sex_p = wilcoxon([sex_r2_pre], [sex_r2_post])
-    site_stat, site_p = wilcoxon([site_r2_pre], [site_r2_post])
-    tiv_stat, tiv_p = wilcoxon([tiv_r2_pre], [tiv_r2_post])
+    model_stat, model_p = wilcoxon(r2_pre_all, r2_post_all)
+    age_stat, age_p = wilcoxon(age_pre_all, age_post_all)
+    sex_stat, sex_p = wilcoxon(sex_pre_all, sex_post_all)
+    site_stat, site_p = wilcoxon(site_pre_all, site_post_all)
+    tiv_stat, tiv_p = wilcoxon(tiv_pre_all, tiv_post_all)
 
-    summary[-1].update({
+    # Create cross-feature means
+    summary.append({
+        "Feature": "Mean",
+        "R2_pre": np.mean([s["R2_pre"] for s in summary]),
+        "R2_post": np.mean([s["R2_post"] for s in summary]),
+        "Age_partial_R2": np.mean([s["Age_partial_R2"] for s in summary]),
+        "Age_partial_R2_post": np.mean([s["Age_partial_R2_post"] for s in summary]),
+        "Sex_partial_R2": np.mean([s["Sex_partial_R2"] for s in summary]),
+        "Sex_partial_R2_post": np.mean([s["Sex_partial_R2_post"] for s in summary]),
+        "Site_partial_R2": np.mean([s["Site_partial_R2"] for s in summary]),
+        "Site_partial_R2_post": np.mean([s["Site_partial_R2_post"] for s in summary]),
+        "TIV_partial_R2": np.mean([s["TIV_partial_R2"] for s in summary]),
+        "TIV_partial_R2_post": np.mean([s["TIV_partial_R2_post"] for s in summary]),
+    })
+
+    wilcoxon_results = {
+        "Feature": "Wilcoxon",
         "R2_Wilcoxon_stat": model_stat,
         "R2_Wilcoxon_p": model_p,
         "Age_Wilcoxon_stat": age_stat,
@@ -319,40 +365,17 @@ def confound_analysis(data_pre, data_post, feature_cols):
         "Site_Wilcoxon_stat": site_stat,
         "Site_Wilcoxon_p": site_p,
         "TIV_Wilcoxon_stat": tiv_stat,
-        "TIV_Wilcoxon_p": tiv_p,
-    })
-
-    # Create cross-feature means
-    summary.append({
-        "Feature": "Mean",
-        "R2_pre": np.mean([s["R2_pre"] for s in summary]),
-        "R2_post": np.mean([s["R2_post"] for s in summary]),
-        "R2_Wilcoxon_stat": np.mean([s["R2_Wilcoxon_stat"] for s in summary]),
-        "R2_Wilcoxon_p": np.mean([s["R2_Wilcoxon_p"] for s in summary]),
-        "Age_partial_R2": np.mean([s["Age_partial_R2"] for s in summary]),
-        "Age_partial_R2_post": np.mean([s["Age_partial_R2_post"] for s in summary]),
-        "Age_Wilcoxon_stat": np.mean([s["Age_Wilcoxon_stat"] for s in summary]),
-        "Age_Wilcoxon_p": np.mean([s["Age_Wilcoxon_p"] for s in summary]),
-        "Sex_partial_R2": np.mean([s["Sex_partial_R2"] for s in summary]),
-        "Sex_partial_R2_post": np.mean([s["Sex_partial_R2_post"] for s in summary]),
-        "Sex_Wilcoxon_stat": np.mean([s["Sex_Wilcoxon_stat"] for s in summary]),
-        "Sex_Wilcoxon_p": np.mean([s["Sex_Wilcoxon_p"] for s in summary]),
-        "Site_partial_R2": np.mean([s["Site_partial_R2"] for s in summary]),
-        "Site_partial_R2_post": np.mean([s["Site_partial_R2_post"] for s in summary]),
-        "Site_Wilcoxon_stat": np.mean([s["Site_Wilcoxon_stat"] for s in summary]),
-        "Site_Wilcoxon_p": np.mean([s["Site_Wilcoxon_p"] for s in summary]),
-        "TIV_partial_R2": np.mean([s["TIV_partial_R2"] for s in summary]),
-        "TIV_partial_R2_post": np.mean([s["TIV_partial_R2_post"] for s in summary]),
-        "TIV_Wilcoxon_stat": np.mean([s["TIV_Wilcoxon_stat"] for s in summary]),
-        "TIV_Wilcoxon_p": np.mean([s["TIV_Wilcoxon_p"] for s in summary])
-    })
+        "TIV_Wilcoxon_p": tiv_p
+    }
 
     summary = pd.DataFrame(summary)
+    wilcoxon_results = pd.DataFrame([wilcoxon_results])
 
-    return summary
+    return summary, wilcoxon_results
 
-summary_combat = confound_analysis(mri_data_pre_combat, mri_data_filtered, feature_cols)
+summary_combat, wilcoxon_results_combat = confound_analysis(mri_data_pre_combat, mri_data_filtered, feature_cols)
 summary_combat.to_csv(os.path.join(baseline_output_path, "confound_analysis_combat.csv"), index=False)
+wilcoxon_results_combat.to_csv(os.path.join(baseline_output_path, "wilcoxon_results_combat.csv"), index=False)
 
 # Do group difference analysis
 def _cohens_d(x, y):
@@ -695,10 +718,13 @@ z_scores_y_confounds = (z_scores_y.drop(columns=["observations"]).merge(covars, 
 z_scores_p_confounds = (z_scores_p.drop(columns=["observations"]).merge(covars, left_on="subject_ids", right_on="participant_id", how="inner"))
 
 # Conduct confound analysis on z-scores for youth and parent
-summary_normative_y = confound_analysis(mri_y_scaled, z_scores_y_confounds, roi_cols_y)
+summary_normative_y, wilcoxon_y = confound_analysis(mri_y_scaled, z_scores_y_confounds, roi_cols_y)
 summary_normative_y.to_csv(os.path.join(baseline_output_path, "confound_analysis_normative_y.csv"), index=False)
-summary_normative_p = confound_analysis(mri_p_scaled, z_scores_p_confounds, roi_cols_p)
+wilcoxon_y.to_csv(os.path.join(baseline_output_path, "wilcoxon_test_y.csv"), index=False)
+
+summary_normative_p, wilcoxon_p = confound_analysis(mri_p_scaled, z_scores_p_confounds, roi_cols_p)
 summary_normative_p.to_csv(os.path.join(baseline_output_path, "confound_analysis_normative_p.csv"), index=False)
+wilcoxon_p.to_csv(os.path.join(baseline_output_path, "wilcoxon_test_p.csv"), index=False)
 
 # Create a z-score composite across ROIs for youth and parent
 # Flip the sign of the z-scores for ROIs with negative effect sizes to ensure that higher z-scores indicate greater deviation from the normative model in the direction of depression
@@ -976,6 +1002,9 @@ fitbit_features_composites["subject"] = fitbit_features_filtered["subject"]
 fitbit_features_composites["timepoint"] = fitbit_features_filtered["timepoint"]
 
 fitbit_features_composites.to_csv(os.path.join(baseline_output_path, "fitbit_features_with_composites.csv"), index=False)
+
+# Optional: Reimport fitbit features with composites
+fitbit_features_composites = pd.read_csv(os.path.join(baseline_output_path, "fitbit_features_with_composites.csv"))
 
 # Add depression diagnosis labels based on youth and parent KSADS questionnaires to the fitbit data
 fitbit_features_filtered = fitbit_features_composites.merge(mri_data_filtered[["participant_id", "session_id", "mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx"]], left_on=["subject", "timepoint"], right_on=["participant_id", "session_id"], how="left")
