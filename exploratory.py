@@ -22,6 +22,11 @@ from sklearn.metrics import jaccard_score
 from statsmodels.formula.api import ols
 from scipy.stats import wilcoxon
 from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import roc_auc_score
+from statsmodels.stats.multitest import multipletests
+import shap
 
 # SETUP WORKSPACE
 # Set raw data directory 
@@ -533,19 +538,18 @@ def exploratory_group_difference_analysis(
 mri_dep_y_sig, mri_dep_y_all = exploratory_group_difference_analysis(mri_data_filtered, "mh_y_ksads__dep__mdd__pres_dx", 
                                                                      os.path.join(baseline_output_path, "mri_dep_y_results.csv"), 
                                                                      output_path_sig=os.path.join(baseline_output_path, "mri_dep_y_results_sig.csv"),
-                                                                     overwrite=True)
+                                                                     overwrite=False)
 mri_dep_p_sig, mri_dep_p_all = exploratory_group_difference_analysis(mri_data_filtered, "mh_p_ksads__dep__mdd__pres_dx", 
                                                                      os.path.join(baseline_output_path, "mri_dep_p_results.csv"), 
                                                                      output_path_sig=os.path.join(baseline_output_path, "mri_dep_p_results_sig.csv"),
-                                                                     overwrite=True)
+                                                                     overwrite=False)
 
-mri_dep_y_sig.columns
+mri_dep_p_sig.columns
+mri_dep_p_sig.drop(columns=["age_squared"])
 
 # Filter significant ROIs to only include those with an absolute effect size >0.2
 mri_dep_y_sig_filtered = mri_dep_y_sig[abs(mri_dep_y_sig["effect_size"]) > 0.2]
 mri_dep_p_sig_filtered = mri_dep_p_sig[abs(mri_dep_p_sig["effect_size"]) > 0.2]
-
-# Print the number of significant ROIs after filtering by effect size
 print(f"Number of significant ROIs after filtering by effect size (youth): {mri_dep_y_sig_filtered.shape[0]}")
 print(f"Number of significant ROIs after filtering by effect size (parent): {mri_dep_p_sig_filtered.shape[0]}")
 
@@ -1021,16 +1025,150 @@ labels = (
 
 num_depressed_youth = labels["mh_y_ksads__dep__mdd__pres_dx"].sum()
 num_depressed_parent = labels["mh_p_ksads__dep__mdd__pres_dx"].sum()
-print(f"Number of subjects with depression diagnosis according to youth KSADS questionnaire: {num_depressed_youth}")
-print(f"Number of subjects with depression diagnosis according to parent KSADS questionnaire: {num_depressed_parent}")
+print(f"Number of subjects with depression diagnosis in fitbit data according to youth KSADS questionnaire: {num_depressed_youth}")
+print(f"Number of subjects with depression diagnosis in fitbit data according to parent KSADS questionnaire: {num_depressed_parent}")
 
+# Impute missing values in fitbit features using median imputation
+fitbit_features_filtered_imputed = fitbit_features_filtered.drop(columns=["subject", "timepoint", "session_id", "participant_id"], errors="ignore").copy()
+imputer = SimpleImputer(strategy="median")
+fitbit_features_filtered_imputed = pd.DataFrame(imputer.fit_transform(fitbit_features_filtered_imputed), columns=fitbit_features_filtered_imputed.columns)
+fitbit_features_filtered_imputed["participant_id"] = fitbit_features_filtered["participant_id"].values
 
+# BASELINE CLASSIFICATION
+# Prepare data for classification
+# Add age and sex to the fitbit features for classification
+features = fitbit_features_filtered_imputed.merge(
+    mri_data_filtered[["participant_id", "visit_age", "sex"]],
+    left_on="participant_id",
+    right_on="participant_id",
+    how="left"
+)
 
+# Define features and labels for classification
+X = features.drop(columns=["mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx"])
+y_y = features["mh_y_ksads__dep__mdd__pres_dx"]
+y_p = features["mh_p_ksads__dep__mdd__pres_dx"]
 
+# Check for missing values in features and labels
+missing_X = X.isnull().sum().sum()
+missing_y_y = y_y.isnull().sum()
+missing_y_p = y_p.isnull().sum()
+print(f"Missing values in features: {missing_X}")
+print(f"Missing values in youth labels: {missing_y_y}")
+print(f"Missing values in parent labels: {missing_y_p}")
 
+# Print class distribution for youth and parent labels
+print("Class distribution for youth labels:")
+print(y_y.value_counts())
+print("Class distribution for parent labels:")
+print(y_p.value_counts())
 
+# Train-test split for classification
+X_train_y, X_test_y, y_train_y, y_test_y = train_test_split(X, y_y, test_size=0.2, random_state=42, stratify=y_y)
+X_train_p, X_test_p, y_train_p, y_test_p = train_test_split(X, y_p, test_size=0.2, random_state=42, stratify=y_p)
 
+# Print class distribution for training and testing sets for youth and parent labels
+print("Class distribution for youth labels (training set):")
+print(y_train_y.value_counts())
+print("Class distribution for youth labels (testing set):")
+print(y_test_y.value_counts())
+print("Class distribution for parent labels (training set):")
+print(y_train_p.value_counts())
+print("Class distribution for parent labels (testing set):")
+print(y_test_p.value_counts())
 
+# YOUTH MODEL
+# Train and evaluate baseline classification models using nested cross-validation
+final_model_y, best_hyperparams_y, train_predictions_y = train_final_model(
+    X_train_y.drop(columns=["participant_id"], errors="ignore"),
+    y_train_y,
+    model="SVM"
+)
 
+# Save final model, hyperparameters and predictions
+joblib.dump(final_model_y, os.path.join(baseline_output_path, "final_model_y.joblib"))
+joblib.dump(best_hyperparams_y, os.path.join(baseline_output_path, "best_hyperparams_y.json"))
+train_predictions_df = pd.DataFrame(train_predictions_y, columns=["predicted_label"])
+train_predictions_df["true_label"] = y_train_y.values
+train_predictions_df.to_csv(os.path.join(baseline_output_path, "train_predictions_y.csv"), index=False)
 
+# Calculate performance metrics for youth labels on training set
+auc_train_y = roc_auc_score(y_train_y, final_model_y.decision_function(X_train_y.drop(columns=["participant_id"], errors="ignore")))
+print(f"Performance metrics for youth labels (training set):")
+print(f"AUC: {auc_train_y:.4f}")
 
+# Get predictions on the test set for youth labels
+test_predictions_y = final_model_y.predict(X_test_y.drop(columns=["participant_id"], errors="ignore"))
+test_predictions_df_y = pd.DataFrame(test_predictions_y, columns=["predicted_label"])
+test_predictions_df_y["true_label"] = y_test_y.values
+test_predictions_df_y.to_csv(os.path.join(baseline_output_path, "test_predictions_y.csv"), index=False)
+
+# Calculate performance metrics for youth labels
+auc_y = roc_auc_score(y_test_y, final_model_y.decision_function(X_test_y.drop(columns=["participant_id"], errors="ignore")))
+f1_y = f1_score(y_test_y, test_predictions_y)
+accuracy_y = accuracy_score(y_test_y, test_predictions_y)
+precision_y = precision_score(y_test_y, test_predictions_y)
+print(f"Performance metrics for youth labels:")
+print(f"AUC: {auc_y:.4f}")
+print(f"F1 Score: {f1_y:.4f}")
+print(f"Accuracy: {accuracy_y:.4f}")
+print(f"Precision: {precision_y:.4f}")
+
+# Get SHAP values for youth model
+explainer_y = shap.Explainer(final_model_y.decision_function, X_train_y.drop(columns=["participant_id"], errors="ignore"))
+shap_values_y = explainer_y(X_test_y.drop(columns=["participant_id"], errors="ignore"))
+shap_values_y_df = pd.DataFrame(shap_values_y.values, columns=X_test_y.drop(columns=["participant_id"], errors="ignore").columns)
+shap_values_y_df["participant_id"] = X_test_y["participant_id"].values
+shap_values_y_df.to_csv(os.path.join(baseline_output_path, "shap_values_y.csv"), index=False)
+
+shap.summary_plot(shap_values_y, X_test_y.drop(columns=["participant_id"], errors="ignore"), show=False)
+plt.savefig(os.path.join(baseline_output_path, "shap_summary_y.png"), dpi=300, bbox_inches="tight")
+plt.close()
+
+# PARENT MODEL
+# Train and evaluate baseline classification models using nested cross-validation
+final_model_p, best_hyperparams_p, train_predictions_p = train_final_model(
+    X_train_p.drop(columns=["participant_id"], errors="ignore"),
+    y_train_p,
+    model="SVM"
+)
+
+# Save final model, hyperparameters and predictions
+joblib.dump(final_model_p, os.path.join(baseline_output_path, "final_model_p.joblib"))
+joblib.dump(best_hyperparams_p, os.path.join(baseline_output_path, "best_hyperparams_p.json"))
+train_predictions_df_p = pd.DataFrame(train_predictions_p, columns=["predicted_label"])
+train_predictions_df_p["true_label"] = y_train_p.values
+train_predictions_df_p.to_csv(os.path.join(baseline_output_path, "train_predictions_p.csv"), index=False)
+
+# Calculate performance metrics for parent labels on training set
+auc_train_p = roc_auc_score(y_train_p, final_model_p.decision_function(X_train_p.drop(columns=["participant_id"], errors="ignore")))
+print(f"Performance metrics for parent labels (training set):")
+print(f"AUC: {auc_train_p:.4f}")
+
+# Get predictions on the test set for parent labels
+test_predictions_p = final_model_p.predict(X_test_p.drop(columns=["participant_id"], errors="ignore"))
+test_predictions_df_p = pd.DataFrame(test_predictions_p, columns=["predicted_label"])
+test_predictions_df_p["true_label"] = y_test_p.values
+test_predictions_df_p.to_csv(os.path.join(baseline_output_path, "test_predictions_p.csv"), index=False)
+
+# Calculate performance metrics for parent labels
+auc_p = roc_auc_score(y_test_p, final_model_p.decision_function(X_test_p.drop(columns=["participant_id"], errors="ignore")))
+f1_p = f1_score(y_test_p, test_predictions_p)
+accuracy_p = accuracy_score(y_test_p, test_predictions_p)
+precision_p = precision_score(y_test_p, test_predictions_p)
+print(f"Performance metrics for parent labels:")
+print(f"AUC: {auc_p:.4f}")
+print(f"F1 Score: {f1_p:.4f}")
+print(f"Accuracy: {accuracy_p:.4f}")
+print(f"Precision: {precision_p:.4f}")
+
+# Get SHAP values for parent model
+explainer_p = shap.Explainer(final_model_p.decision_function, X_train_p.drop(columns=["participant_id"], errors="ignore"))
+shap_values_p = explainer_p(X_test_p.drop(columns=["participant_id"], errors="ignore"))
+shap_values_p_df = pd.DataFrame(shap_values_p.values, columns=X_test_p.drop(columns=["participant_id"], errors="ignore").columns)
+shap_values_p_df["participant_id"] = X_test_p["participant_id"].values
+shap_values_p_df.to_csv(os.path.join(baseline_output_path, "shap_values_p.csv"), index=False)
+
+shap.summary_plot(shap_values_p, X_test_p.drop(columns=["participant_id"], errors="ignore"), show=False)
+plt.savefig(os.path.join(baseline_output_path, "shap_summary_p.png"), dpi=300, bbox_inches="tight")
+plt.close()
