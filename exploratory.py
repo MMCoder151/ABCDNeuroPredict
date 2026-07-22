@@ -692,6 +692,9 @@ model_p.predict(data_full_p)
 # Read in z-scores for the full dataset for youth and parent
 z_scores_y = pd.read_csv(os.path.join(normative_output_dir_str_y, "results", "Z_mri_norm_full_y.csv"))
 z_scores_p = pd.read_csv(os.path.join(normative_output_dir_str_p, "results", "Z_mri_norm_full_p.csv"))
+# Note: For some reason, pcntoolkit adds padding to the subject_ids column
+z_scores_y.dropna(subset=["subject_ids"], inplace=True)
+z_scores_p.dropna(subset=["subject_ids"], inplace=True)
 z_scores_y.shape, z_scores_p.shape
 mri_data_filtered.shape
 
@@ -885,7 +888,7 @@ plt.close()
 # Check association between z-score composite and depression symptom severity for youth and parent
 # TODO: Implement
 
-# BASELINE CLASSIFICATION
+# EXTRACT FITBIT FEATURES
 # Check overlap between subjects with fibtit features and subjects with mri features
 # Filter subjects based on inclusion criteria and extract metadata
 dem_df, mri_meta_df, fit_meta_df = filter_subjects(dta_path, dta_path_tabular, test=False, overwrite=False)
@@ -1011,7 +1014,24 @@ fitbit_features_composites.to_csv(os.path.join(baseline_output_path, "fitbit_fea
 fitbit_features_composites = pd.read_csv(os.path.join(baseline_output_path, "fitbit_features_with_composites.csv"))
 
 # Add depression diagnosis labels based on youth and parent KSADS questionnaires to the fitbit data
-fitbit_features_filtered = fitbit_features_composites.merge(mri_data_filtered[["participant_id", "session_id", "mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx"]], left_on=["subject", "timepoint"], right_on=["participant_id", "session_id"], how="left")
+fitbit_features_filtered = (
+    fitbit_features_composites
+    .merge(
+        mri_data_filtered[
+            [
+                "participant_id",
+                "session_id",
+                "mh_y_ksads__dep__mdd__pres_dx",
+                "mh_p_ksads__dep__mdd__pres_dx",
+                "visit_age",
+                "sex",
+            ]
+        ],
+        left_on=["subject", "timepoint"],
+        right_on=["participant_id", "session_id"],
+        how="inner", 
+    )
+)
 
 # Get number of subjects in fitbit data with depression diagnosis according to youth and parent KSADS questionnaires
 labels = (
@@ -1172,3 +1192,107 @@ shap_values_p_df.to_csv(os.path.join(baseline_output_path, "shap_values_p.csv"),
 shap.summary_plot(shap_values_p, X_test_p.drop(columns=["participant_id"], errors="ignore"), show=False)
 plt.savefig(os.path.join(baseline_output_path, "shap_summary_p.png"), dpi=300, bbox_inches="tight")
 plt.close()
+
+# REGRESSION ANALYSIS
+# Create regression target from z-score composite for youth and parent
+# Get subjects indicator from train and test features
+train_subjects_y = X_train_y["participant_id"]
+test_subjects_y = X_test_y["participant_id"]
+train_subjects_p = X_train_p["participant_id"]
+test_subjects_p = X_test_p["participant_id"]
+
+# Create regression target from z-score composite for youth and parent
+reg_y_train_y = z_scores_y_composites[z_scores_y_composites["subject_ids"].isin(train_subjects_y)][["subject_ids", "z_score_composite"]].copy()
+reg_y_test_y = z_scores_y_composites[z_scores_y_composites["subject_ids"].isin(test_subjects_y)][["subject_ids", "z_score_composite"]].copy()
+reg_y_train_p = z_scores_p_composites[z_scores_p_composites["subject_ids"].isin(train_subjects_p)][["subject_ids", "z_score_composite"]].copy()
+reg_y_test_p = z_scores_p_composites[z_scores_p_composites["subject_ids"].isin(test_subjects_p)][["subject_ids", "z_score_composite"]].copy()
+
+# Add classification labels to regression targets for stratification during training
+y_train_y_df = pd.DataFrame({"subject_ids": train_subjects_y.values, "label": y_train_y.values})
+reg_y_train_y = reg_y_train_y.merge(y_train_y_df,on="subject_ids",how="left")
+y_test_y_df = pd.DataFrame({"subject_ids": test_subjects_y.values,"label": y_test_y.values})
+reg_y_test_y = reg_y_test_y.merge(y_test_y_df,on="subject_ids",how="left")
+y_train_p_df = pd.DataFrame({"subject_ids": train_subjects_p.values,"label": y_train_p.values})
+reg_y_train_p = reg_y_train_p.merge(y_train_p_df,on="subject_ids",how="left")
+y_test_p_df = pd.DataFrame({"subject_ids": test_subjects_p.values,"label": y_test_p.values})
+reg_y_test_p = reg_y_test_p.merge(y_test_p_df, on="subject_ids", how="left")
+
+# Check that the regression target is aligned with the training and testing features for youth
+assert set(reg_y_train_y["subject_ids"]) == set(train_subjects_y), "Mismatch between training features and regression target for youth"
+assert set(reg_y_test_y["subject_ids"]) == set(test_subjects_y), "Mismatch between testing features and regression target for youth"
+assert set(reg_y_train_p["subject_ids"]) == set(train_subjects_p), "Mismatch between training features and regression target for parent"
+assert set(reg_y_test_p["subject_ids"]) == set(test_subjects_p), "Mismatch between testing features and regression target for parent"
+
+# Check for missing values in regression targets for youth and parent
+missing_reg_y_train_y = reg_y_train_y.isnull().sum().sum()
+missing_reg_y_test_y = reg_y_test_y.isnull().sum().sum()
+missing_reg_y_train_p = reg_y_train_p.isnull().sum().sum()
+missing_reg_y_test_p = reg_y_test_p.isnull().sum().sum()
+print(f"Missing values in regression target for youth (training set): {missing_reg_y_train_y}")
+print(f"Missing values in regression target for youth (testing set): {missing_reg_y_test_y}")
+print(f"Missing values in regression target for parent (training set): {missing_reg_y_train_p}")
+print(f"Missing values in regression target for parent (testing set): {missing_reg_y_test_p}")
+
+# Print class distribution for regression targets in train and test sets for youth and parent
+print("Class distribution for regression targets (youth) in training set:")
+print(reg_y_train_y["label"].value_counts())
+print("Class distribution for regression targets (youth) in testing set:")
+print(reg_y_test_y["label"].value_counts())
+print("Class distribution for regression targets (parent) in training set:")
+print(reg_y_train_p["label"].value_counts())
+print("Class distribution for regression targets (parent) in testing set:")
+print(reg_y_test_p["label"].value_counts())
+
+# Train final regression model for youth z-score composite
+final_reg_model_y, best_hyperparams_reg_y, train_predictions_reg_y = train_final_regression_model(
+    X_train_y.drop(columns=["participant_id"], errors="ignore"),
+    reg_y_train_y[["z_score_composite", "label"]].squeeze(),
+    model="SVR"
+)
+
+# Save final regression model, hyperparameters and predictions for youth
+joblib.dump(final_reg_model_y, os.path.join(baseline_output_path, "final_reg_model_y.joblib"))
+joblib.dump(best_hyperparams_reg_y, os.path.join(baseline_output_path, "best_hyperparams_reg_y.json"))
+train_predictions_reg_df_y = pd.DataFrame(train_predictions_reg_y, columns=["predicted_z_score_composite"])
+train_predictions_reg_df_y["true_z_score_composite"] = reg_y_train_y["z_score_composite"].values
+train_predictions_reg_df_y.to_csv(os.path.join(baseline_output_path, "train_predictions_reg_y.csv"), index=False)
+
+# Get predictions on the test set for youth z-score composite
+test_predictions_reg_y = final_reg_model_y.predict(X_test_y.drop(columns=["participant_id"], errors="ignore"))
+test_predictions_reg_df_y = pd.DataFrame(test_predictions_reg_y, columns=["predicted_z_score_composite"])
+test_predictions_reg_df_y["true_z_score_composite"] = reg_y_test_y["z_score_composite"].values
+test_predictions_reg_df_y.to_csv(os.path.join(baseline_output_path, "test_predictions_reg_y.csv"), index=False)
+
+# Calculate performance metrics for youth z-score composite regression
+mse_reg_y = mean_squared_error(reg_y_test_y["z_score_composite"], test_predictions_reg_y)
+r2_reg_y = r2_score(reg_y_test_y["z_score_composite"], test_predictions_reg_y)
+print(f"Performance metrics for youth z-score composite regression:")
+print(f"MSE: {mse_reg_y:.4f}")
+print(f"R^2: {r2_reg_y:.4f}")
+
+# Train final regression model for parent z-score composite
+final_reg_model_p, best_hyperparams_reg_p, train_predictions_reg_p = train_final_regression_model(
+    X_train_p.drop(columns=["participant_id"], errors="ignore"),
+    reg_y_train_p[["z_score_composite", "label"]].squeeze(),
+    model="SVR"
+)
+
+# Save final regression model, hyperparameters and predictions for parent
+joblib.dump(final_reg_model_p, os.path.join(baseline_output_path, "final_reg_model_p.joblib"))
+joblib.dump(best_hyperparams_reg_p, os.path.join(baseline_output_path, "best_hyperparams_reg_p.json"))
+train_predictions_reg_df_p = pd.DataFrame(train_predictions_reg_p, columns=["predicted_z_score_composite"])
+train_predictions_reg_df_p["true_z_score_composite"] = reg_y_train_p["z_score_composite"].values
+train_predictions_reg_df_p.to_csv(os.path.join(baseline_output_path, "train_predictions_reg_p.csv"), index=False)
+
+# Get predictions on the test set for parent z-score composite
+test_predictions_reg_p = final_reg_model_p.predict(X_test_p.drop(columns=["participant_id"], errors="ignore"))
+test_predictions_reg_df_p = pd.DataFrame(test_predictions_reg_p, columns=["predicted_z_score_composite"])
+test_predictions_reg_df_p["true_z_score_composite"] = reg_y_test_p["z_score_composite"].values
+test_predictions_reg_df_p.to_csv(os.path.join(baseline_output_path, "test_predictions_reg_p.csv"), index=False)
+
+# Calculate performance metrics for parent z-score composite regression
+mse_reg_p = mean_squared_error(reg_y_test_p["z_score_composite"], test_predictions_reg_p)
+r2_reg_p = r2_score(reg_y_test_p["z_score_composite"], test_predictions_reg_p)
+print(f"Performance metrics for parent z-score composite regression:")
+print(f"MSE: {mse_reg_p:.4f}")
+print(f"R^2: {r2_reg_p:.4f}")

@@ -365,7 +365,7 @@ def define_regression_models():
                 "reg__min_child_samples": [20, 40],
             }
         ),
-        "SVM": (
+        "SVR": (
             Pipeline([
                 ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
                 ("thresholding", VarianceThreshold(threshold=0.01)),
@@ -569,12 +569,12 @@ def train_final_regression_model(X, y, model):
     all_models = define_regression_models()
     model_to_train, param_grid = all_models[model]
  
-    if "subtype" in X.columns:
-        strat = X["subtype"]
-        X = X.drop(columns=["subtype"])
+    if "label" in y.columns:
+        strat = y["label"]
+        y = y.drop(columns=["label"]).squeeze()
         grouped_cv_split_y = strat
     else:
-        raise ValueError("Expected 'subtype' column in features for stratification. Please ensure it is included in the input data.")
+        raise ValueError("Expected 'label' column in features for stratification. Please ensure it is included in the input data.")
  
     grouped_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
  
