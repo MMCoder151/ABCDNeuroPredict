@@ -239,9 +239,9 @@ def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, overwrite = True, 
     # Return the list of MRI ROIs and the results dataframe
     return mri_rois_sig, results_df
 
-def mri_clustering(data, n_clusters=None, max_clusters=None,dr=None, dr_params=None, cl=None, cl_params=None, mri_meta_df=None, output_path = Path("output"), clustering_output = None, bootstrapping = True, overwrite = True):
+def clustering(data, n_clusters=None, max_clusters=None,dr=None, dr_params=None, cl=None, cl_params=None, mri_meta_df=None, output_path = Path("output"), clustering_output = None, bootstrapping = True, overwrite = True):
     '''
-    This function performs clustering to identify subtypes of depression based on the selected subjects' MRI ROI data.
+    This function performs clustering to identify subtypes of depression based on the selected subjects' data.
     It uses several different clustering algorithms (HBDSCAN and Bayesian Gaussian Mixture Models).
     Clustering stability is assessed using bootstrapping and assessing stability using the Jaccard index.
     Algorithms are compared based on their Silhouette coefficient, Density-Based Clustering Validation (DBCV) score, and Davies-Bouldin Index (DBI).
@@ -377,7 +377,7 @@ def mri_clustering(data, n_clusters=None, max_clusters=None,dr=None, dr_params=N
     if n_clusters is not None:
         kmeans_params = list(ParameterGrid({
             "n_clusters": [n_clusters],
-            #"random_state": [42]
+            "random_state": [42]
         }))
 
         agglomerative_params = list(ParameterGrid({
@@ -387,7 +387,9 @@ def mri_clustering(data, n_clusters=None, max_clusters=None,dr=None, dr_params=N
 
         bayesian_gmm_params = list(ParameterGrid({
             "n_components": [n_clusters],
-            #"random_state": [42]
+            "max_iter": [300],
+            "n_init": [5],
+            "random_state": [42]
         }))
 
         hdbscan_params = list(ParameterGrid({
@@ -412,12 +414,14 @@ def mri_clustering(data, n_clusters=None, max_clusters=None,dr=None, dr_params=N
 
         bayesian_gmm_params = list(ParameterGrid({
             "n_components": [5, 10, 15, 20],
-            #"random_state": [42]
+            "max_iter": [300],
+            "n_init": [5],
+            "random_state": [42]
         }))
 
         kmeans_params = list(ParameterGrid({
             "n_clusters": [5, 10, 15, 20],
-            #"random_state": [42]
+            "random_state": [42]
         }))
 
         agglomerative_params = list(ParameterGrid({

@@ -7,8 +7,6 @@ from src.modelling import *
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 import matplotlib.pyplot as plt
-import pickle
-from sklearn.metrics import confusion_matrix, f1_score
 from sklearn.decomposition import PCA
 from pacmap import PaCMAP
 from sklearn.ensemble import IsolationForest
@@ -18,15 +16,15 @@ import seaborn as sns
 from src.mri_rois import *
 from functools import reduce
 from pygam import LinearGAM, s, l, f
-from sklearn.metrics import jaccard_score
 from statsmodels.formula.api import ols
 from scipy.stats import wilcoxon
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, precision_score, f1_score
 from sklearn.metrics import roc_auc_score
 from statsmodels.stats.multitest import multipletests
 import shap
+import statsmodels.api as sm
 
 # SETUP WORKSPACE
 # Set raw data directory 
@@ -99,6 +97,10 @@ ksads_mdd_combined.shape
 
 # Filter to only include subjects and timepoint pairs that exist in both youth and parent KSADS questionnaires
 ksads_mdd_combined_both = ksads_mdd_combined.dropna(subset=["mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx"])
+
+# Print number of unique subject timepoint pairs with both youth and parent KSADS questionnaires
+num_unique_subject_timepoints_both = ksads_mdd_combined_both[["participant_id", "session_id"]].drop_duplicates().shape[0]
+print(f"Number of unique subject timepoint pairs with both youth and parent KSADS questionnaires: {num_unique_subject_timepoints_both}")
 
 # For subjects with multiple timepoints, keep only the one with depression diagnosis in either parent or youth KSADS or the first timepoint if no diagnosis is present
 for subject in ksads_mdd_combined_both.groupby("participant_id")["participant_id"]:
@@ -224,161 +226,144 @@ mri_data_combat = neuroCombat(
 mri_data_filtered[feature_cols] = mri_data_combat["data"].transpose()
 
 # Conduct confound analysis pre and post harmonization
-def confound_analysis(data_pre, data_post, feature_cols):
+def partial_r2(full_formula, reduced_formula, data):
+    full = ols(full_formula, data=data).fit()
+    reduced = ols(reduced_formula, data=data).fit()
 
-    scaler = StandardScaler()
+    return (reduced.ssr - full.ssr) / reduced.ssr
 
-    data_pre["TIV_z"] = scaler.fit_transform(data_pre[["mr_y_smri__vol__aseg__icv_sum"]])
-    data_post["TIV_z"] = scaler.transform(data_post[["mr_y_smri__vol__aseg__icv_sum"]])
+def confound_analysis(data_pre, data_post, feature_cols, base_terms, confounds):
+    """
+    Parameters
+    ----------
+    data_pre, data_post : DataFrame
+        Data before and after harmonization/residualization.
 
-    def partial_r2(full_formula, reduced_formula, data):
-        full = ols(full_formula, data=data).fit()
-        reduced = ols(reduced_formula, data=data).fit()
+    feature_cols : list[str]
+        Features to evaluate.
 
-        ss_full = full.ssr
-        ss_reduced = reduced.ssr
+    base_terms : list[str]
+        Terms in the full model.
 
-        return (ss_reduced - ss_full) / ss_reduced
+        Example MRI:
+        [
+            "bs(visit_age, df=4)",
+            "C(sex)",
+            "C(scan_site)",
+            "TIV_z"
+        ]
+
+        Example Fitbit:
+        [
+            "visit_age",
+            "C(sex)"
+        ]
+
+    confounds : dict
+        Mapping from confound name to the exact model term.
+
+        Example MRI:
+        {
+            "Age": "bs(visit_age, df=4)",
+            "Sex": "C(sex)",
+            "Site": "C(scan_site)",
+            "TIV": "TIV_z"
+        }
+
+        Example Fitbit:
+        {
+            "Age": "visit_age",
+            "Sex": "C(sex)"
+        }
+    """
 
     summary = []
 
-    r2_pre_all = []
-    r2_post_all = []
+    full_r2_pre = []
+    full_r2_post = []
 
-    age_pre_all = []
-    age_post_all = []
+    partial_pre = {k: [] for k in confounds}
+    partial_post = {k: [] for k in confounds}
 
-    sex_pre_all = []
-    sex_post_all = []
+    for feature in tqdm(feature_cols):
 
-    site_pre_all = []
-    site_post_all = []
+        response = f'Q("{feature}")'
 
-    tiv_pre_all = []
-    tiv_post_all = []
+        full_formula = response + " ~ " + " + ".join(base_terms)
 
-    for feature in tqdm(feature_cols, desc="Calculating confounds"):
+        model_pre = ols(full_formula, data=data_pre).fit()
+        model_post = ols(full_formula, data=data_post).fit()
 
-        full = f'Q("{feature}") ~ bs(visit_age, df=4) + C(sex) + C(scan_site) + TIV_z'
-
-        model_pre = ols(full, data=data_pre).fit()
-        model_post = ols(full, data=data_post).fit()
-
-        age_r2_pre = partial_r2(
-            full,
-            f'Q("{feature}") ~ C(sex) + C(scan_site) + TIV_z',
-            data_pre
-        )
-        age_r2_post = partial_r2(
-            full,
-            f'Q("{feature}") ~ C(sex) + C(scan_site) + TIV_z',
-            data_post
-        )
-
-        sex_r2_pre = partial_r2(
-            full,
-            f'Q("{feature}") ~ bs(visit_age, df=4) + C(scan_site) + TIV_z',
-            data_pre
-        )
-        sex_r2_post = partial_r2(
-            full,
-            f'Q("{feature}") ~ bs(visit_age, df=4) + C(scan_site) + TIV_z',
-            data_post
-        )
-
-        site_r2_pre = partial_r2(
-            full,
-            f'Q("{feature}") ~ bs(visit_age, df=4) + C(sex) + TIV_z',
-            data_pre
-        )
-        site_r2_post = partial_r2(
-            full,
-            f'Q("{feature}") ~ bs(visit_age, df=4) + C(sex) + TIV_z',
-            data_post
-        )
-
-        tiv_r2_pre = partial_r2(
-            full,
-            f'Q("{feature}") ~ bs(visit_age, df=4) + C(sex) + C(scan_site)',
-            data_pre
-        )
-        tiv_r2_post = partial_r2(
-            full,
-            f'Q("{feature}") ~ bs(visit_age, df=4) + C(sex) + C(scan_site)',
-            data_post
-        )
-
-        r2_pre_all.append(model_pre.rsquared)
-        r2_post_all.append(model_post.rsquared)
-
-        age_pre_all.append(age_r2_pre)
-        age_post_all.append(age_r2_post)
-
-        sex_pre_all.append(sex_r2_pre)
-        sex_post_all.append(sex_r2_post)
-
-        site_pre_all.append(site_r2_pre)
-        site_post_all.append(site_r2_post)
-
-        tiv_pre_all.append(tiv_r2_pre)
-        tiv_post_all.append(tiv_r2_post)
-
-        summary.append({
+        row = {
             "Feature": feature,
             "R2_pre": model_pre.rsquared,
             "R2_post": model_post.rsquared,
-            "Age_partial_R2": age_r2_pre,
-            "Age_partial_R2_post": age_r2_post,
-            "Sex_partial_R2": sex_r2_pre,
-            "Sex_partial_R2_post": sex_r2_post,
-            "Site_partial_R2": site_r2_pre,
-            "Site_partial_R2_post": site_r2_post,
-            "TIV_partial_R2": tiv_r2_pre,
-            "TIV_partial_R2_post": tiv_r2_post,
-        })
+        }
 
-    # Conduct Wilcoxon signed-rank test to compare pre and post R2 values for each confound
-    model_stat, model_p = wilcoxon(r2_pre_all, r2_post_all)
-    age_stat, age_p = wilcoxon(age_pre_all, age_post_all)
-    sex_stat, sex_p = wilcoxon(sex_pre_all, sex_post_all)
-    site_stat, site_p = wilcoxon(site_pre_all, site_post_all)
-    tiv_stat, tiv_p = wilcoxon(tiv_pre_all, tiv_post_all)
+        full_r2_pre.append(model_pre.rsquared)
+        full_r2_post.append(model_post.rsquared)
 
-    # Create cross-feature means
-    summary.append({
-        "Feature": "Mean",
-        "R2_pre": np.mean([s["R2_pre"] for s in summary]),
-        "R2_post": np.mean([s["R2_post"] for s in summary]),
-        "Age_partial_R2": np.mean([s["Age_partial_R2"] for s in summary]),
-        "Age_partial_R2_post": np.mean([s["Age_partial_R2_post"] for s in summary]),
-        "Sex_partial_R2": np.mean([s["Sex_partial_R2"] for s in summary]),
-        "Sex_partial_R2_post": np.mean([s["Sex_partial_R2_post"] for s in summary]),
-        "Site_partial_R2": np.mean([s["Site_partial_R2"] for s in summary]),
-        "Site_partial_R2_post": np.mean([s["Site_partial_R2_post"] for s in summary]),
-        "TIV_partial_R2": np.mean([s["TIV_partial_R2"] for s in summary]),
-        "TIV_partial_R2_post": np.mean([s["TIV_partial_R2_post"] for s in summary]),
-    })
+        for name, term in confounds.items():
 
-    wilcoxon_results = {
+            reduced_terms = [t for t in base_terms if t != term]
+
+            reduced_formula = response + " ~ " + " + ".join(reduced_terms)
+
+            r2_pre = partial_r2(full_formula, reduced_formula, data_pre)
+            r2_post = partial_r2(full_formula, reduced_formula, data_post)
+
+            row[f"{name}_partial_R2_pre"] = r2_pre
+            row[f"{name}_partial_R2_post"] = r2_post
+
+            partial_pre[name].append(r2_pre)
+            partial_post[name].append(r2_post)
+
+        summary.append(row)
+
+    summary_df = pd.DataFrame(summary)
+
+    # Mean row
+    mean_row = {"Feature": "Mean"}
+
+    for col in summary_df.columns[1:]:
+        mean_row[col] = summary_df[col].mean()
+
+    summary_df = pd.concat(
+        [summary_df, pd.DataFrame([mean_row])],
+        ignore_index=True,
+    )
+
+    # Wilcoxon tests
+    wilcoxon_row = {
         "Feature": "Wilcoxon",
-        "R2_Wilcoxon_stat": model_stat,
-        "R2_Wilcoxon_p": model_p,
-        "Age_Wilcoxon_stat": age_stat,
-        "Age_Wilcoxon_p": age_p,
-        "Sex_Wilcoxon_stat": sex_stat,
-        "Sex_Wilcoxon_p": sex_p,
-        "Site_Wilcoxon_stat": site_stat,
-        "Site_Wilcoxon_p": site_p,
-        "TIV_Wilcoxon_stat": tiv_stat,
-        "TIV_Wilcoxon_p": tiv_p
+        "R2_stat": wilcoxon(full_r2_pre, full_r2_post).statistic,
+        "R2_p": wilcoxon(full_r2_pre, full_r2_post).pvalue,
     }
 
-    summary = pd.DataFrame(summary)
-    wilcoxon_results = pd.DataFrame([wilcoxon_results])
+    for name in confounds:
 
-    return summary, wilcoxon_results
+        stat, p = wilcoxon(partial_pre[name], partial_post[name])
 
-summary_combat, wilcoxon_results_combat = confound_analysis(mri_data_pre_combat, mri_data_filtered, feature_cols)
+        wilcoxon_row[f"{name}_stat"] = stat
+        wilcoxon_row[f"{name}_p"] = p
+
+    wilcoxon_df = pd.DataFrame([wilcoxon_row])
+
+    return summary_df, wilcoxon_df
+
+base_terms = [
+    "bs(visit_age, df=4)",
+    "C(sex)",
+    "C(scan_site)",
+    "mr_y_smri__vol__aseg__icv_sum"
+]
+confounds = {
+    "Age": "bs(visit_age, df=4)",
+    "Sex": "C(sex)",
+    "Site": "C(scan_site)",
+    "TIV": "mr_y_smri__vol__aseg__icv_sum"
+}
+summary_combat, wilcoxon_results_combat = confound_analysis(mri_data_pre_combat, mri_data_filtered, feature_cols, base_terms, confounds)
 summary_combat.to_csv(os.path.join(baseline_output_path, "confound_analysis_combat.csv"), index=False)
 wilcoxon_results_combat.to_csv(os.path.join(baseline_output_path, "wilcoxon_results_combat.csv"), index=False)
 
@@ -1023,8 +1008,6 @@ fitbit_features_filtered = (
                 "session_id",
                 "mh_y_ksads__dep__mdd__pres_dx",
                 "mh_p_ksads__dep__mdd__pres_dx",
-                "visit_age",
-                "sex",
             ]
         ],
         left_on=["subject", "timepoint"],
@@ -1054,16 +1037,159 @@ imputer = SimpleImputer(strategy="median")
 fitbit_features_filtered_imputed = pd.DataFrame(imputer.fit_transform(fitbit_features_filtered_imputed), columns=fitbit_features_filtered_imputed.columns)
 fitbit_features_filtered_imputed["participant_id"] = fitbit_features_filtered["participant_id"].values
 
-# BASELINE CLASSIFICATION
-# Prepare data for classification
 # Add age and sex to the fitbit features for classification
 features = fitbit_features_filtered_imputed.merge(
-    mri_data_filtered[["participant_id", "visit_age", "sex"]],
+    mri_data_filtered[["participant_id", "visit_age", "sex", "scan_site"]],
     left_on="participant_id",
     right_on="participant_id",
     how="left"
 )
 
+# EXPLORATORY GROUP DIFFERENCE ANALYSIS ON FITBIT FEATURES
+def exploratory_group_difference_analysis_fitbit(
+    mri_data_filtered,
+    group_col,
+    output_path_all,
+    output_path_sig,
+    overwrite=False,
+    n_bootstraps=100,
+    seed=0,
+):
+    if not overwrite and os.path.exists(output_path_all) and os.path.exists(output_path_sig):
+        print("Results already exist. Skipping analysis.")
+        return pd.read_csv(output_path_sig), pd.read_csv(output_path_all)
+ 
+    rng = np.random.default_rng(seed)
+ 
+    mri_data_filtered = mri_data_filtered.copy()
+    mri_data_filtered["scan_site_code"] = mri_data_filtered["scan_site"].astype("category").cat.codes
+ 
+    cols_to_exclude = [
+        "participant_id", "session_id",
+        "mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx",
+        "sex", "scan_site", "scan_site_code", "visit_age", "age_squared", "visit_age_squared",
+        "mr_y_smri__vol__aseg__icv_sum", group_col,
+    ]
+ 
+    nuisance_cols = ["visit_age", "sex"]
+    full_cols = nuisance_cols + [group_col]
+    group_term_index = full_cols.index(group_col)
+ 
+    group_labels = mri_data_filtered[group_col].to_numpy()
+    boot_indices = _stratified_bootstrap_indices(group_labels, n_bootstraps, rng)
+ 
+    gam_results = []
+    for col in tqdm(mri_data_filtered.columns, desc="GAM group-difference analysis"):
+        if col in cols_to_exclude:
+            continue
+        try:
+            y = mri_data_filtered[col]
+ 
+            # --- Point estimate on the real (non-resampled) data ---
+            X_full = mri_data_filtered[full_cols]
+            gam_full = LinearGAM(s(0) + f(1) + l(2)).fit(X_full, y)
+            p_value = gam_full.statistics_["p_values"][group_term_index]
+ 
+            X_nuisance = mri_data_filtered[nuisance_cols]
+            gam_nuisance = LinearGAM(s(0) + f(1)).fit(X_nuisance, y)
+            adjusted_residuals = (y - gam_nuisance.predict(X_nuisance)).to_numpy()
+ 
+            group_dep = adjusted_residuals[group_labels == 1]
+            group_nondep = adjusted_residuals[group_labels == 0]
+            effect_size = _cohens_d(group_dep, group_nondep)
+            effect_size_std_analytic = _cohens_d_std(group_dep, group_nondep, d=effect_size)
+ 
+            # --- Bootstrap distribution (resample residuals, don't refit GAMs) ---
+            # --- Bootstrap distribution (refit nuisance GAM each replicate) ---
+            boot_effect_sizes = np.empty(n_bootstraps)
+
+            for b, indices in enumerate(boot_indices):
+
+                boot_df = mri_data_filtered.iloc[indices].copy()
+
+                X_boot = boot_df[nuisance_cols]
+                y_boot = boot_df[col]
+                group_boot = boot_df[group_col].to_numpy()
+
+                try:
+                    gam_boot = LinearGAM(
+                        s(0) + f(1) + l(2) + l(3)
+                    ).fit(X_boot, y_boot)
+
+                    adjusted_boot = (
+                        y_boot - gam_boot.predict(X_boot)
+                    ).to_numpy()
+
+                    boot_effect_sizes[b] = _cohens_d(
+                        adjusted_boot[group_boot == 1],
+                        adjusted_boot[group_boot == 0]
+                    )
+
+                except Exception:
+                    boot_effect_sizes[b] = np.nan
+ 
+            boot_effect_sizes = boot_effect_sizes[np.isfinite(boot_effect_sizes)]
+
+            if boot_effect_sizes.size == 0:
+                print(f"Warning: all {n_bootstraps} bootstrap replicates failed for column '{col}'. Skipping stability stats.")
+                effect_size_std_boot = np.nan
+                ci_lower, ci_upper = np.nan, np.nan
+                sign_stability = np.nan
+            else:
+                effect_size_std_boot = np.std(boot_effect_sizes, ddof=1) if boot_effect_sizes.size > 1 else np.nan
+                ci_lower, ci_upper = np.percentile(boot_effect_sizes, [2.5, 97.5])
+                sign_stability = np.mean(np.sign(boot_effect_sizes) == np.sign(effect_size))
+ 
+            gam_results.append((
+                col, p_value, effect_size, effect_size_std_analytic,
+                effect_size_std_boot, ci_lower, ci_upper, sign_stability,
+            ))
+        except Exception as e:
+            print(f"Error occurred while fitting GAM model for column {col}: {e}")
+ 
+    results_df = pd.DataFrame(gam_results, columns=[
+        "feature", "p_value", "effect_size", "effect_size_std",
+        "effect_size_std_boot", "ci_lower_boot", "ci_upper_boot", "sign_stability",
+    ])
+    results_df = results_df.sort_values("p_value")
+ 
+    print("Performing FDR correction for multiple comparisons...")
+    rejected, corrected_p_values, _, _ = multipletests(results_df["p_value"], alpha=0.05, method="fdr_bh")
+    results_df["corrected_p_value"] = corrected_p_values
+    results_df["significant_fdr"] = rejected
+ 
+    results_df.to_csv(output_path_all, index=False)
+    print(f"All results saved to: {output_path_all}")
+ 
+    sig_results_df = results_df[results_df["significant_fdr"]]
+    sig_results_df.to_csv(output_path_sig, index=False)
+    print(f"Significant ROIs saved to: {output_path_sig}")
+ 
+    num_significant_rois = results_df["significant_fdr"].sum()
+    print(f"Number of significant ROIs after FDR correction: {num_significant_rois}")
+ 
+    return sig_results_df, results_df
+
+# Conduct exploratory group difference analysis on fitbit features for youth and parent depression diagnosis
+fitbit_dep_y_sig, fitbit_dep_y_all = exploratory_group_difference_analysis_fitbit(features, "mh_y_ksads__dep__mdd__pres_dx", 
+                                                                     os.path.join(baseline_output_path, "fitbit_dep_y_results.csv"), 
+                                                                     output_path_sig=os.path.join(baseline_output_path, "fitbit_dep_y_results_sig.csv"),
+                                                                     overwrite=True)
+fitbit_dep_p_sig, fitbit_dep_p_all = exploratory_group_difference_analysis_fitbit(features, "mh_p_ksads__dep__mdd__pres_dx", 
+                                                                     os.path.join(baseline_output_path, "fitbit_dep_p_results.csv"), 
+                                                                     output_path_sig=os.path.join(baseline_output_path, "fitbit_dep_p_results_sig.csv"),
+                                                                     overwrite=True)
+
+# Filter significant fitbit features to only include those with an absolute effect size >0.2
+fitbit_dep_y_sig_filtered = fitbit_dep_y_sig[abs(fitbit_dep_y_sig["effect_size"]) > 0.2]
+fitbit_dep_p_sig_filtered = fitbit_dep_p_sig[abs(fitbit_dep_p_sig["effect_size"]) > 0.2]
+print(f"Number of significant fitbit features after filtering by effect size (youth): {fitbit_dep_y_sig_filtered.shape[0]}")
+print(f"Number of significant fitbit features after filtering by effect size (parent): {fitbit_dep_p_sig_filtered.shape[0]}")
+
+# NOTE: This analysis did not result in any significant fitbit features at all. 
+
+# BASELINE CLASSIFICATION
+# Prepare data for classification
 # Define features and labels for classification
 X = features.drop(columns=["mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx"])
 y_y = features["mh_y_ksads__dep__mdd__pres_dx"]
@@ -1296,3 +1422,113 @@ r2_reg_p = r2_score(reg_y_test_p["z_score_composite"], test_predictions_reg_p)
 print(f"Performance metrics for parent z-score composite regression:")
 print(f"MSE: {mse_reg_p:.4f}")
 print(f"R^2: {r2_reg_p:.4f}")
+
+# EXPLORATORY SYMPTOM ANALYSIS
+# Create symptom profiles based on fitbit features and investigate their influence on depression diagnosis according to youth and parent
+# Conduct unsupervised clustering on fitbit features to identify symptom profiles
+# Get fitbit features for only depressed subjects according to youth and parent KSADS questionnaires
+fitbit_features_depressed_y = features[features["mh_y_ksads__dep__mdd__pres_dx"] == 1].drop(columns=["participant_id", "mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx"], errors="ignore")
+fitbit_features_depressed_p = features[features["mh_p_ksads__dep__mdd__pres_dx"] == 1].drop(columns=["participant_id", "mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx"], errors="ignore")
+
+# Residualize fitbit features by regressing out age and sex for youth and parent separately
+def residualize_features(df, feature_cols, covariates):
+    """
+    Residualize `feature_cols` against `covariates` (e.g., age, sex).
+    Returns a new dataframe with residualized features; other columns
+    (IDs, labels, etc.) are left untouched.
+    """
+    residualized_df = df.copy()
+
+    # Ensure categorical covariates (e.g. sex as 'M'/'F') are numeric dummies
+    X_cov = pd.get_dummies(df[covariates], drop_first=True)
+    X_cov = sm.add_constant(X_cov)
+
+    for col in feature_cols:
+        y = df[col]
+
+        # Align and drop rows with missing values in either y or X_cov
+        valid = y.notna() & X_cov.notna().all(axis=1)
+
+        model = sm.OLS(y[valid], X_cov[valid]).fit()
+        resid = model.predict(X_cov[valid])  # fitted values, for residual calc below
+        residualized_df.loc[valid, col] = y[valid] - model.fittedvalues
+        residualized_df.loc[~valid, col] = pd.NA  # or keep as NaN
+
+    return residualized_df
+
+feature_cols_y = fitbit_features_depressed_y.drop(columns=["participant_id", "visit_age", "sex"], errors="ignore").columns.tolist()
+covariates_y = ["visit_age", "sex"]
+feature_cols_p = fitbit_features_depressed_p.drop(columns=["participant_id", "visit_age", "sex"], errors="ignore").columns.tolist()
+covariates_p = ["visit_age", "sex"]
+
+fitbit_features_depressed_y_resid = residualize_features(fitbit_features_depressed_y, feature_cols_y, covariates_y)
+fitbit_features_depressed_p_resid = residualize_features(fitbit_features_depressed_p, feature_cols_p, covariates_p)
+
+# Check residualization by fitting a linear model and checking the correlation between residuals and covariates
+summary, stats = confound_analysis(
+    data_pre=fitbit_features_depressed_y,
+    data_post=fitbit_features_depressed_y_resid,
+    feature_cols=feature_cols_y,
+    base_terms=[
+        "bs(visit_age, df = 4)",
+        "C(sex)",
+    ],
+    confounds={
+        "Age": "visit_age",
+        "Sex": "C(sex)",
+    },
+)
+
+# Standardize residualized features for clustering
+scaler_y = StandardScaler()
+fitbit_features_depressed_y_resid_scaled = fitbit_features_depressed_y_resid.copy()
+fitbit_features_depressed_y_resid_scaled[feature_cols_y] = scaler_y.fit_transform(fitbit_features_depressed_y_resid[feature_cols_y])
+
+scaler_p = StandardScaler()
+fitbit_features_depressed_p_resid_scaled = fitbit_features_depressed_p_resid.copy()
+fitbit_features_depressed_p_resid_scaled[feature_cols_p] = scaler_p.fit_transform(fitbit_features_depressed_p_resid[feature_cols_p])
+
+# Plot data of depressed subjects in 2D PaCMAP space for youth and parent
+reducer = PaCMAP(n_components=2, n_neighbors=10, MN_ratio=0.5, FP_ratio=2.0, random_state=42)
+fitbit_features_depressed_y_pacmap = reducer.fit_transform(fitbit_features_depressed_y_resid_scaled[feature_cols_y])
+fitbit_features_depressed_p_pacmap = reducer.fit_transform(fitbit_features_depressed_p_resid_scaled[feature_cols_p])
+plot_y_df = pd.DataFrame(fitbit_features_depressed_y_pacmap, columns=["PaCMAP_1", "PaCMAP_2"])
+plt.figure(figsize=(6, 6))
+sns.scatterplot(
+    data=plot_y_df,
+    x="PaCMAP_1",
+    y="PaCMAP_2",
+    alpha=0.7,
+    s=50,
+)
+plt.title("PaCMAP projection of residualized and standardized fitbit features (Youth)")
+plt.xlabel("PaCMAP 1")
+plt.ylabel("PaCMAP 2")
+plt.tight_layout()
+plt.savefig(os.path.join(baseline_output_path, "fitbit_features_depressed_y_pacmap.png"), dpi=300, bbox_inches="tight")
+plt.close()
+
+# Perform clustering on residualized and standardized fitbit features for youth
+class_labels_y = clustering(fitbit_features_depressed_y_resid_scaled[feature_cols_y], 
+                                clustering_output = "class_labels_y", 
+                                cl=["HDBSCAN", "BayesianGMM"],
+                                max_clusters=10,
+                                bootstrapping=False,
+                                overwrite=True)
+
+# Print size of each cluster for youth
+print("Cluster sizes for youth:")
+print(class_labels_y["label"].value_counts())
+# NOTE: No cluster solutions met the filtering criteria for youth, so no clusters were identified.
+
+# Perform clustering on residualized and standardized fitbit features for parent
+class_labels_p = clustering(fitbit_features_depressed_p_resid_scaled[feature_cols_p],
+                                clustering_output = "class_labels_p", 
+                                cl=["HDBSCAN", "BayesianGMM"],
+                                max_clusters=10,
+                                bootstrapping=False,
+                                overwrite=True)
+
+# Print size of each cluster for parent
+print("Cluster sizes for parent:")
+print(class_labels_p["label"].value_counts())
