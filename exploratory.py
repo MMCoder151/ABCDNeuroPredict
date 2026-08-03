@@ -898,6 +898,8 @@ reg_y_test_y = z_scores_y_composites[z_scores_y_composites["subject_ids"].isin(t
 reg_y_train_p = z_scores_p_composites[z_scores_p_composites["subject_ids"].isin(train_subjects_p)][["subject_ids", "z_score_composite"]].copy()
 reg_y_test_p = z_scores_p_composites[z_scores_p_composites["subject_ids"].isin(test_subjects_p)][["subject_ids", "z_score_composite"]].copy()
 
+# NOTE: Are confounding variables included in the regression model? If not TODO: Include confounding variables in the regression model to control for their effects on the z-score composite.
+
 # Add classification labels to regression targets for stratification during training
 y_train_y_df = pd.DataFrame({"subject_ids": train_subjects_y.values, "label": y_train_y.values})
 reg_y_train_y = reg_y_train_y.merge(y_train_y_df,on="subject_ids",how="left")
@@ -936,8 +938,9 @@ print(reg_y_test_p["label"].value_counts())
 
 # Resample the training set to address class imbalance using random oversampler for regression targets
 oversampler = RandomOverSampler(random_state=42)
-X_train_y_resampled_reg, reg_y_train_y_resampled = oversampler.fit_resample(X_train_y.drop(columns=["participant_id"], errors="ignore"), reg_y_train_y[["z_score_composite", "label"]].squeeze())
-X_train_p_resampled_reg, reg_y_train_p_resampled = oversampler.fit_resample(X_train_p.drop(columns=["participant_id"], errors="ignore"), reg_y_train_p[["z_score_composite", "label"]].squeeze())
+X_res, labels_res = oversampler.fit_resample(X_train, reg_y_train["label"])
+indices = oversampler.sample_indices_
+y_res = reg_y_train["z_score_composite"].iloc[indices]
 
 # YOUTH MODEL 
 # Train final regression model for youth z-score composite
