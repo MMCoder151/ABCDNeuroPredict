@@ -3,15 +3,12 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-from pyampute.exploration.mcar_statistical_tests import MCARTest
-import matplotlib.pyplot as plt
 from sklearn.mixture import BayesianGaussianMixture
 import hdbscan
 from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.metrics import confusion_matrix, silhouette_score
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import jaccard_score, davies_bouldin_score, calinski_harabasz_score, adjusted_rand_score, matthews_corrcoef
-from pyampute.exploration.mcar_statistical_tests import MCARTest
 import pacmap
 from sklearn.decomposition import PCA
 import umap
@@ -19,34 +16,143 @@ from sklearn.manifold import trustworthiness
 from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import ParameterGrid
 from statsmodels.stats.multitest import multipletests
-from pygam import LinearGAM, s, l
-from src.mri_rois import mri_rois
+from pygam import LinearGAM, s, l, f
 from scipy.stats import fisher_exact
+from scipy.stats import wilcoxon
+from statsmodels.formula.api import ols
+
+def partial_r2(full_formula, reduced_formula, data):
+    full = ols(full_formula, data=data).fit()
+    reduced = ols(reduced_formula, data=data).fit()
+
+    return (reduced.ssr - full.ssr) / reduced.ssr
+
+def confound_analysis(data_pre, data_post, feature_cols, base_terms, confounds):
+    """
+    Parameters
+    ----------
+    data_pre, data_post : DataFrame
+        Data before and after harmonization/residualization.
+
+    feature_cols : list[str]
+        Features to evaluate.
+
+    base_terms : list[str]
+        Terms in the full model.
+
+        Example MRI:
+        [
+            "bs(visit_age, df=4)",
+            "C(sex)",
+            "C(scan_site)",
+            "TIV_z"
+        ]
+
+        Example Fitbit:
+        [
+            "visit_age",
+            "C(sex)"
+        ]
+
+    confounds : dict
+        Mapping from confound name to the exact model term.
+
+        Example MRI:
+        {
+            "Age": "bs(visit_age, df=4)",
+            "Sex": "C(sex)",
+            "Site": "C(scan_site)",
+            "TIV": "TIV_z"
+        }
+
+        Example Fitbit:
+        {
+            "Age": "visit_age",
+            "Sex": "C(sex)"
+        }
+    """
+
+    summary = []
+
+    full_r2_pre = []
+    full_r2_post = []
+
+    partial_pre = {k: [] for k in confounds}
+    partial_post = {k: [] for k in confounds}
+
+    for feature in tqdm(feature_cols, desc="Confound analysis", position=0):
+
+        response = f'Q("{feature}")'
+
+        full_formula = response + " ~ " + " + ".join(base_terms)
+
+        model_pre = ols(full_formula, data=data_pre).fit()
+        model_post = ols(full_formula, data=data_post).fit()
+
+        row = {
+            "Feature": feature,
+            "R2_pre": model_pre.rsquared,
+            "R2_post": model_post.rsquared,
+        }
+
+        full_r2_pre.append(model_pre.rsquared)
+        full_r2_post.append(model_post.rsquared)
+
+        for name, term in confounds.items():
+
+            reduced_terms = [t for t in base_terms if t != term]
+
+            reduced_formula = response + " ~ " + " + ".join(reduced_terms)
+
+            r2_pre = partial_r2(full_formula, reduced_formula, data_pre)
+            r2_post = partial_r2(full_formula, reduced_formula, data_post)
+
+            row[f"{name}_partial_R2_pre"] = r2_pre
+            row[f"{name}_partial_R2_post"] = r2_post
+
+            partial_pre[name].append(r2_pre)
+            partial_post[name].append(r2_post)
+
+        summary.append(row)
+
+    summary_df = pd.DataFrame(summary)
+
+    # Mean row
+    mean_row = {"Feature": "Mean"}
+
+    for col in summary_df.columns[1:]:
+        mean_row[col] = summary_df[col].mean()
+
+    summary_df = pd.concat(
+        [summary_df, pd.DataFrame([mean_row])],
+        ignore_index=True,
+    )
+
+    # Wilcoxon tests
+    wilcoxon_row = {
+        "Feature": "Wilcoxon",
+        "R2_stat": wilcoxon(full_r2_pre, full_r2_post).statistic,
+        "R2_p": wilcoxon(full_r2_pre, full_r2_post).pvalue,
+    }
+
+    for name in confounds:
+
+        stat, p = wilcoxon(partial_pre[name], partial_post[name])
+
+        wilcoxon_row[f"{name}_stat"] = stat
+        wilcoxon_row[f"{name}_p"] = p
+
+    wilcoxon_df = pd.DataFrame([wilcoxon_row])
+
+    return summary_df, wilcoxon_df
 
 def _cohens_d(x, y):
-    """
-    Calculate Cohen's d effect size between two groups.
-    Parameters:
-        x (array-like): Values for group 1
-        y (array-like): Values for group 2
-    Returns:
-        d (float): Cohen's d effect size
-    """
     nx, ny = len(x), len(y)
     dof = nx + ny - 2
     pooled_std = np.sqrt(((nx - 1) * np.var(x, ddof=1) + (ny - 1) * np.var(y, ddof=1)) / dof)
     return (np.mean(x) - np.mean(y)) / pooled_std
-
+ 
 def _cohens_d_std(x, y, d=None):
-    """
-    Approximate standard deviation (standard error) of Cohen's d.
-    Parameters:
-        x (array-like): Values for group 1
-        y (array-like): Values for group 2
-        d (float, optional): Precomputed Cohen's d
-    Returns:
-        float: Standard deviation (SE) estimate for Cohen's d
-    """
     nx, ny = len(x), len(y)
     if nx < 2 or ny < 2:
         return np.nan
@@ -54,190 +160,267 @@ def _cohens_d_std(x, y, d=None):
         d = _cohens_d(x, y)
     var_d = ((nx + ny) / (nx * ny)) + ((d ** 2) / (2 * (nx + ny - 2)))
     return np.sqrt(var_d)
-
-def extract_mri_rois(dta_path_tabular, dta_path, mri_meta_df, overwrite = True, output_path=Path("output")):
-    '''
-    This function analyses group differences between depressed an non-depressed subjects for each MRI feature in the specified mri_files to 
-    extract the MRI ROIs that show significant differences between the two groups.
-    1. Extract binary depression marker
-    2. For each MRI feature, perform regression analysis using a generalized additive model (GAM) to account for sex and non-linear age influence and extract p-values for group differences
-    3. Return a list of MRI ROIs that show significant differences between the two groups (p < 0.05)
-    Parameters:
-        dta_path_tabular (Path): Path to the tabular data directory
-        dta_path (Path): Path to the raw data directory
-    Returns:
-        mri_rois (list): List of MRI ROIs that show significant differences between depressed and non-depressed subjects
-        mri_rois_results (DataFrame): DataFrame containing the regression results for each MRI feature
-        mri_rois_results (CSV): CSV file containing the regression results for each MRI feature
-    NOTE: This function currently doesn't use DuckDB 
-    '''
-    if overwrite == False:
-        existing_results_path = output_path / "mri_rois_results.csv"
-        if existing_results_path.exists():
-            print(f"Overwrite set to False. Loading existing results.")
-            gam_results_df = pd.read_csv(existing_results_path)
-            mri_rois_sig = gam_results_df.loc[gam_results_df["significant_fdr"], "mri_feature"].tolist()
-            return mri_rois_sig, gam_results_df
-        else:
-            print(f"No existing results found at {existing_results_path}. Running analysis.")
-
-    # Read in clinical data for depression marker
-    youth_directory = dta_path_tabular / "mh_y_ksads__dep.tsv"
-    parent_directory = dta_path_tabular / "mh_p_ksads__dep.tsv"
-
-    ksads_youth = pd.read_csv(youth_directory, sep="\t")
-    ksads_parent = pd.read_csv(parent_directory, sep="\t")
-    
-    # Filter to only include subjects and timepoints that are present in mri_meta_df
-    ksads_youth = ksads_youth.merge(
-        mri_meta_df[["subject", "timepoint"]],
-        left_on=["participant_id", "session_id"],
-        right_on=["subject", "timepoint"],
-        how="inner"
-    )
-    ksads_parent = ksads_parent.merge(
-        mri_meta_df[["subject", "timepoint"]],
-        left_on=["participant_id", "session_id"],
-        right_on=["subject", "timepoint"],
-        how="inner"
-    )
-
-    # Filter to only include the first timepoint for each subject
-    ksads_youth = ksads_youth.sort_values(by=["participant_id", "session_id"]).groupby("participant_id").first().reset_index()
-    ksads_parent = ksads_parent.sort_values(by=["participant_id", "session_id"]).groupby("participant_id").first().reset_index()
-
-    # Get list of depressed subjects based on KSADS depression diagnosis (youth and parent report)
-    diagnosis_cols_youth = {#"mh_y_ksads__dep__mdd__partrem_dx"  :"Diagnosis: Major depressive disorder (F32.4) - Partial remission [Youth]",
-                            "mh_y_ksads__dep__mdd__pres_dx"     :"Diagnosis: Major depressive disorder - Present [Youth]",
-                            #"mh_y_ksads__dep__pdd__oth__pres_dx":"Diagnosis: Other specified depressive disorder, persistent depressive disorder (impairment does not meet full criteria) (F32.8) - Present [Youth]",
-                            #"mh_y_ksads__dep__pdd__partrem_dx"  :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Partial remission [Youth]",
-                            "mh_y_ksads__dep__pdd__pres_dx"     :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Present [Youth]"}
-    diagnosis_cols_parent = {#"mh_p_ksads__dep__mdd__partrem_dx"  :"Diagnosis: Major depressive disorder (F32.4) - Partial remission [Parent]",
-                            "mh_p_ksads__dep__mdd__pres_dx"     :"Diagnosis: Major depressive disorder - Present [Parent]",
-                            #"mh_p_ksads__dep__pdd__oth__pres_dx":"Diagnosis: Other specified depressive disorder, persistent depressive disorder (impairment does not meet full criteria) (F32.8) - Present [Parent]",
-                            #"mh_p_ksads__dep__pdd__partrem_dx"  :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Partial remission [Parent]",
-                            "mh_p_ksads__dep__pdd__pres_dx"     :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Present [Parent]"}
-    
-    # Create a binary depression marker for each subject based on youth and parent report
-    diagnosis_youth_cols = list(diagnosis_cols_youth.keys())
-    y_depr = (ksads_youth[diagnosis_youth_cols] == 1).any(axis=1)
-
-    diagnosis_parent_cols = list(diagnosis_cols_parent.keys())
-    p_depr = (ksads_parent[diagnosis_parent_cols] == 1).any(axis=1)
-
-    depr = y_depr | p_depr
-
-    # Create a binary depression marker for each subject
-    subjects_depr = set(ksads_youth.loc[depr, "participant_id"]) | set(ksads_parent.loc[depr, "participant_id"])
-
-    # Read in MRI data for each subject and timepoint from mri_files
-    mri_files, roi_names = mri_rois()
-    # Filter to only include the last three mri_files (i.e., the MRI features of interest)
-    mri_files = mri_files[-3:]
-    mri_df = []
-    for mri_file in mri_files:
-        mri_df.append(pd.read_csv(dta_path / "phenotype" / mri_file, sep="\t"))
-
-    # Filter to only include subjects and timepoints that are present in mri_meta_df
-    mri_df = [df.merge(mri_meta_df[["subject", "timepoint"]], left_on=["participant_id", "session_id"], right_on=["subject", "timepoint"], how="inner") for df in mri_df]
-
-    # Filter to only include the first timepoint for each subject
-    mri_df = [df.sort_values(by=["participant_id", "session_id"]).groupby("participant_id").first().reset_index() for df in mri_df]
-
-    # TODO: Add a check to ensure subjects and timepoints match between mri and clinical data
-
-    # Add depression marker to each MRI dataframe
-    for df in mri_df:
-        df["depression_marker"] = df["participant_id"].apply(lambda x: 1 if x in subjects_depr else 0)
-
-    # Get demographic information
-    stc_df = pd.read_csv(dta_path / "participants.tsv", sep="\t")
-    
-    # Append age from clinical file and sex from dem_df to the mri dataframe
-    mri_df = [df.merge(ksads_youth[["participant_id", "mh_y_ksads__dep_age"]], on="participant_id", how="left") for df in mri_df]
-    mri_df = [df.merge(stc_df[["participant_id", "sex"]], on="participant_id", how="left") for df in mri_df]
-
-    # Add scan_site from mri_meta_df to the mri dataframe
-    mri_meta_first = mri_meta_df.sort_values(["subject", "timepoint"]).groupby("subject").first().reset_index()
-    mri_df = [
-        df.merge(mri_meta_first[["subject", "scan_site"]], left_on="participant_id", right_on="subject", how="left")
-        .drop(columns=["subject"], errors="ignore")  # drop the redundant key column from this merge
-        for df in mri_df
+ 
+def _stratified_bootstrap_indices(group_labels, n_bootstraps, rng):
+    """Resample WITHIN each group separately, so every replicate preserves
+    the original group sizes and always contains both groups."""
+    idx_dep = np.where(group_labels == 1)[0]
+    idx_nondep = np.where(group_labels == 0)[0]
+    boots = []
+    for _ in range(n_bootstraps):
+        boot_dep = rng.choice(idx_dep, size=len(idx_dep), replace=True)
+        boot_nondep = rng.choice(idx_nondep, size=len(idx_nondep), replace=True)
+        boots.append(np.concatenate([boot_dep, boot_nondep]))
+    return boots
+ 
+def exploratory_group_difference_analysis(
+    mri_data_filtered,
+    group_col,
+    output_path_all,
+    output_path_sig,
+    overwrite=False,
+    n_bootstraps=100,
+    seed=0,
+):
+    if not overwrite and os.path.exists(output_path_all) and os.path.exists(output_path_sig):
+        print("Results already exist. Skipping analysis.")
+        return pd.read_csv(output_path_sig), pd.read_csv(output_path_all)
+ 
+    rng = np.random.default_rng(seed)
+ 
+    mri_data_filtered = mri_data_filtered.copy()
+    mri_data_filtered["scan_site_code"] = mri_data_filtered["scan_site"].astype("category").cat.codes
+ 
+    cols_to_exclude = [
+        "participant_id", "session_id",
+        "mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx",
+        "sex", "scan_site", "scan_site_code", "visit_age", "age_squared", "visit_age_squared",
+        "mr_y_smri__vol__aseg__icv_sum", group_col,
     ]
-
-    # Encode scan_site to numerical values
-    scan_site_mapping = {site: idx for idx, site in enumerate(mri_meta_df["scan_site"].unique())}
-    for df in mri_df:
-        df["scan_site"] = df["scan_site"].map(scan_site_mapping)
-
-    # Print number and percentage of depressed subjects in the MRI dataframe
-    depressed_count = mri_df[0]["depression_marker"].sum()
-    total_count = len(mri_df[0])
-    print(f"Number of depressed subjects in MRI dataframe: {depressed_count} ({(depressed_count/total_count)*100:.2f}%)")
-
-    mri_df[0]["depression_marker"].value_counts()
-
-    print(len(subjects_depr))
-    print(ksads_youth["participant_id"].nunique())
-
-    print(ksads_youth.shape)
-    print(ksads_youth["participant_id"].nunique())
-    print(ksads_youth.shape[0] - ksads_youth["participant_id"].nunique())  # excess rows if duplicated
-
-    # Recode sex from M/F to 0/1
-    for df in mri_df:
-        df["sex"] = df["sex"].map({"M": 0, "F": 1})
-
-    # Get total intracranial volume (TIV)
-    subcortical_vol = pd.read_csv(dta_path / "phenotype" / "mr_y_smri__vol__aseg.tsv", sep="\t")
-    mri_df = [df.merge(subcortical_vol[["participant_id", "mr_y_smri__vol__aseg__icv_sum"]], on="participant_id", how="left") for df in mri_df]
-
-    # Drop subjects with sex, age or TIV missing
-    mri_df_filtered = [df.dropna(subset=["sex", "mh_y_ksads__dep_age", "mr_y_smri__vol__aseg__icv_sum"]) for df in mri_df]
-
-    # Perform regression analysis per MRI feature while accounting for sex and non-linear age influence using a generalized additive model (GAM) and extract p-values for group differences
-    # Also calculate the effect size (Cohen's d) for each MRI feature to quantify the magnitude of group differences
+ 
+    nuisance_cols = ["visit_age", "scan_site_code", "sex", "mr_y_smri__vol__aseg__icv_sum"]
+    full_cols = nuisance_cols + [group_col]
+    group_term_index = full_cols.index(group_col)
+ 
+    group_labels = mri_data_filtered[group_col].to_numpy()
+    boot_indices = _stratified_bootstrap_indices(group_labels, n_bootstraps, rng)
+ 
     gam_results = []
-    for df in tqdm(mri_df_filtered, desc="Performing GAM regression analysis for MRI features"):
-        for col in df.columns:
-            if col not in ["participant_id", "session_id", "subject", "subject_x", "subject_y", "acq_time", "depression_marker", "mh_y_ksads__dep_age", "sex", 
-                           "mr_y_smri__vol__aseg__icv_sum", "timepoint", "timepoint_x", "timepoint_y", "scan_site"]:
-                model_cols = ["mh_y_ksads__dep_age", "sex", "depression_marker", "mr_y_smri__vol__aseg__icv_sum", "scan_site", col]
-                df_fit = df[model_cols].replace([np.inf, -np.inf], np.nan).dropna()
-                n_dropped = len(df) - len(df_fit)
-                if n_dropped > 0:
-                    print(f"{col}: dropped {n_dropped} rows ({(n_dropped/len(df)*100):.2f}%) with missing/invalid data")
-                try:
-                    gam = LinearGAM(s(0) + l(1) + l(2) + l(3) + l(4)).fit(df_fit[["mh_y_ksads__dep_age", "scan_site", "sex","mr_y_smri__vol__aseg__icv_sum", "depression_marker"]], df_fit[col])
-                    group_dep = df_fit.loc[df_fit["depression_marker"] == 1, col]
-                    group_nondep = df_fit.loc[df_fit["depression_marker"] == 0, col]
-                    effect_size = _cohens_d(group_dep, group_nondep)
-                    effect_size_std = _cohens_d_std(group_dep, group_nondep, d=effect_size)
-                    gam_results.append((col, gam.statistics_['p_values'][4], effect_size, effect_size_std))  # p-value for depression_marker
-                except Exception as e:
-                    print(f"Error occurred while fitting GAM model for column {col}: {e}")
-    # Combine GAM p-values, effect sizes, and effect size standard deviations into a single DataFrame
-    results_df = pd.DataFrame(gam_results, columns=["mri_feature", "p_value", "effect_size", "effect_size_std"])
-    results_df = results_df.sort_values("p_value")
+    for col in tqdm(mri_data_filtered.columns, desc="GAM group-difference analysis"):
+        if col in cols_to_exclude:
+            continue
+        try:
+            y = mri_data_filtered[col]
+ 
+            # --- Point estimate on the real (non-resampled) data ---
+            X_full = mri_data_filtered[full_cols]
+            gam_full = LinearGAM(s(0) + f(1) + l(2) + l(3) + l(4)).fit(X_full, y)
+            p_value = gam_full.statistics_["p_values"][group_term_index]
+ 
+            X_nuisance = mri_data_filtered[nuisance_cols]
+            gam_nuisance = LinearGAM(s(0) + f(1) + l(2) + l(3)).fit(X_nuisance, y)
+            adjusted_residuals = (y - gam_nuisance.predict(X_nuisance)).to_numpy()
+ 
+            group_dep = adjusted_residuals[group_labels == 1]
+            group_nondep = adjusted_residuals[group_labels == 0]
+            effect_size = _cohens_d(group_dep, group_nondep)
+            effect_size_std_analytic = _cohens_d_std(group_dep, group_nondep, d=effect_size)
+ 
+            # --- Bootstrap distribution (resample residuals, don't refit GAMs) ---
+            # --- Bootstrap distribution (refit nuisance GAM each replicate) ---
+            boot_effect_sizes = np.empty(n_bootstraps)
 
-    # Perform FDR correction for multiple comparisons
+            for b, indices in enumerate(boot_indices):
+
+                boot_df = mri_data_filtered.iloc[indices].copy()
+
+                X_boot = boot_df[nuisance_cols]
+                y_boot = boot_df[col]
+                group_boot = boot_df[group_col].to_numpy()
+
+                try:
+                    gam_boot = LinearGAM(
+                        s(0) + f(1) + l(2) + l(3)
+                    ).fit(X_boot, y_boot)
+
+                    adjusted_boot = (
+                        y_boot - gam_boot.predict(X_boot)
+                    ).to_numpy()
+
+                    boot_effect_sizes[b] = _cohens_d(
+                        adjusted_boot[group_boot == 1],
+                        adjusted_boot[group_boot == 0]
+                    )
+
+                except Exception:
+                    boot_effect_sizes[b] = np.nan
+ 
+            boot_effect_sizes = boot_effect_sizes[np.isfinite(boot_effect_sizes)]
+
+            effect_size_std_boot = np.std(boot_effect_sizes, ddof=1)
+
+            ci_lower, ci_upper = np.percentile(
+                boot_effect_sizes,
+                [2.5, 97.5]
+            )
+
+            sign_stability = np.mean(
+                np.sign(boot_effect_sizes) == np.sign(effect_size)
+            )
+ 
+            gam_results.append((
+                col, p_value, effect_size, effect_size_std_analytic,
+                effect_size_std_boot, ci_lower, ci_upper, sign_stability,
+            ))
+        except Exception as e:
+            print(f"Error occurred while fitting GAM model for column {col}: {e}")
+ 
+    results_df = pd.DataFrame(gam_results, columns=[
+        "feature", "p_value", "effect_size", "effect_size_std",
+        "effect_size_std_boot", "ci_lower_boot", "ci_upper_boot", "sign_stability",
+    ])
+    results_df = results_df.sort_values("p_value")
+ 
     print("Performing FDR correction for multiple comparisons...")
-    rejected, corrected_p_values, _, _ = multipletests(results_df["p_value"], alpha=0.05, method='fdr_bh')
+    rejected, corrected_p_values, _, _ = multipletests(results_df["p_value"], alpha=0.05, method="fdr_bh")
     results_df["corrected_p_value"] = corrected_p_values
     results_df["significant_fdr"] = rejected
-
-    # Print the number of significant MRI ROIs after FDR correction
+ 
+    results_df.to_csv(output_path_all, index=False)
+    print(f"All results saved to: {output_path_all}")
+ 
+    sig_results_df = results_df[results_df["significant_fdr"]]
+    sig_results_df.to_csv(output_path_sig, index=False)
+    print(f"Significant ROIs saved to: {output_path_sig}")
+ 
     num_significant_rois = results_df["significant_fdr"].sum()
-    print(f"Number of significant MRI ROIs after FDR correction: {num_significant_rois}")
+    print(f"Number of significant ROIs after FDR correction: {num_significant_rois}")
+ 
+    return sig_results_df, results_df
 
-    # Save to CSV
-    results_df.to_csv(output_path / "mri_rois_results.csv", index=False)
+def exploratory_group_difference_analysis_fitbit(
+    mri_data_filtered,
+    group_col,
+    output_path_all,
+    output_path_sig,
+    overwrite=False,
+    n_bootstraps=100,
+    seed=0,
+):
+    if not overwrite and os.path.exists(output_path_all) and os.path.exists(output_path_sig):
+        print("Results already exist. Skipping analysis.")
+        return pd.read_csv(output_path_sig), pd.read_csv(output_path_all)
+ 
+    rng = np.random.default_rng(seed)
+ 
+    mri_data_filtered = mri_data_filtered.copy()
+    mri_data_filtered["scan_site_code"] = mri_data_filtered["scan_site"].astype("category").cat.codes
+ 
+    cols_to_exclude = [
+        "participant_id", "session_id",
+        "mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx",
+        "sex", "scan_site", "scan_site_code", "visit_age", "age_squared", "visit_age_squared",
+        "mr_y_smri__vol__aseg__icv_sum", group_col,
+    ]
+ 
+    nuisance_cols = ["visit_age", "sex"]
+    full_cols = nuisance_cols + [group_col]
+    group_term_index = full_cols.index(group_col)
+ 
+    group_labels = mri_data_filtered[group_col].to_numpy()
+    boot_indices = _stratified_bootstrap_indices(group_labels, n_bootstraps, rng)
+ 
+    gam_results = []
+    for col in tqdm(mri_data_filtered.columns, desc="GAM group-difference analysis"):
+        if col in cols_to_exclude:
+            continue
+        try:
+            y = mri_data_filtered[col]
+ 
+            # --- Point estimate on the real (non-resampled) data ---
+            X_full = mri_data_filtered[full_cols]
+            gam_full = LinearGAM(s(0) + f(1) + l(2)).fit(X_full, y)
+            p_value = gam_full.statistics_["p_values"][group_term_index]
+ 
+            X_nuisance = mri_data_filtered[nuisance_cols]
+            gam_nuisance = LinearGAM(s(0) + f(1)).fit(X_nuisance, y)
+            adjusted_residuals = (y - gam_nuisance.predict(X_nuisance)).to_numpy()
+ 
+            group_dep = adjusted_residuals[group_labels == 1]
+            group_nondep = adjusted_residuals[group_labels == 0]
+            effect_size = _cohens_d(group_dep, group_nondep)
+            effect_size_std_analytic = _cohens_d_std(group_dep, group_nondep, d=effect_size)
+ 
+            # --- Bootstrap distribution (resample residuals, don't refit GAMs) ---
+            # --- Bootstrap distribution (refit nuisance GAM each replicate) ---
+            boot_effect_sizes = np.empty(n_bootstraps)
 
-    # Return list of MRI ROIs that show significant differences between depressed and non-depressed subjects (p < 0.05)
-    mri_rois_sig = results_df.loc[results_df["significant_fdr"], "mri_feature"].tolist()
+            for b, indices in enumerate(boot_indices):
 
-    # Return the list of MRI ROIs and the results dataframe
-    return mri_rois_sig, results_df
+                boot_df = mri_data_filtered.iloc[indices].copy()
+
+                X_boot = boot_df[nuisance_cols]
+                y_boot = boot_df[col]
+                group_boot = boot_df[group_col].to_numpy()
+
+                try:
+                    gam_boot = LinearGAM(
+                        s(0) + f(1) + l(2) + l(3)
+                    ).fit(X_boot, y_boot)
+
+                    adjusted_boot = (
+                        y_boot - gam_boot.predict(X_boot)
+                    ).to_numpy()
+
+                    boot_effect_sizes[b] = _cohens_d(
+                        adjusted_boot[group_boot == 1],
+                        adjusted_boot[group_boot == 0]
+                    )
+
+                except Exception:
+                    boot_effect_sizes[b] = np.nan
+ 
+            boot_effect_sizes = boot_effect_sizes[np.isfinite(boot_effect_sizes)]
+
+            if boot_effect_sizes.size == 0:
+                print(f"Warning: all {n_bootstraps} bootstrap replicates failed for column '{col}'. Skipping stability stats.")
+                effect_size_std_boot = np.nan
+                ci_lower, ci_upper = np.nan, np.nan
+                sign_stability = np.nan
+            else:
+                effect_size_std_boot = np.std(boot_effect_sizes, ddof=1) if boot_effect_sizes.size > 1 else np.nan
+                ci_lower, ci_upper = np.percentile(boot_effect_sizes, [2.5, 97.5])
+                sign_stability = np.mean(np.sign(boot_effect_sizes) == np.sign(effect_size))
+ 
+            gam_results.append((
+                col, p_value, effect_size, effect_size_std_analytic,
+                effect_size_std_boot, ci_lower, ci_upper, sign_stability,
+            ))
+        except Exception as e:
+            print(f"Error occurred while fitting GAM model for column {col}: {e}")
+ 
+    results_df = pd.DataFrame(gam_results, columns=[
+        "feature", "p_value", "effect_size", "effect_size_std",
+        "effect_size_std_boot", "ci_lower_boot", "ci_upper_boot", "sign_stability",
+    ])
+    results_df = results_df.sort_values("p_value")
+ 
+    print("Performing FDR correction for multiple comparisons...")
+    rejected, corrected_p_values, _, _ = multipletests(results_df["p_value"], alpha=0.05, method="fdr_bh")
+    results_df["corrected_p_value"] = corrected_p_values
+    results_df["significant_fdr"] = rejected
+ 
+    results_df.to_csv(output_path_all, index=False)
+    print(f"All results saved to: {output_path_all}")
+ 
+    sig_results_df = results_df[results_df["significant_fdr"]]
+    sig_results_df.to_csv(output_path_sig, index=False)
+    print(f"Significant ROIs saved to: {output_path_sig}")
+ 
+    num_significant_rois = results_df["significant_fdr"].sum()
+    print(f"Number of significant ROIs after FDR correction: {num_significant_rois}")
+ 
+    return sig_results_df, results_df
 
 def clustering(data, n_clusters=None, max_clusters=None,dr=None, dr_params=None, cl=None, cl_params=None, mri_meta_df=None, output_path = Path("output"), clustering_output = None, bootstrapping = True, overwrite = True):
     '''
@@ -576,303 +759,3 @@ def clustering(data, n_clusters=None, max_clusters=None,dr=None, dr_params=None,
     # TODO: Fix visualization
 
     return data
-
-def missingness_analysis(con, fit_meta_df, output_path = Path("output")):
-    '''
-    This function analyzes the missingness patterns in the fitbit data for the selected subjects for MCAR, MAR, or MNAR missingness
-    using Littles test from pyampute.
-        1. Queries each fitbit file for the first timepoint of the filtered subjects
-        2. For each, creates datetime index (days) with proper missing days based on min and max of the Wear_Time column for each subject and timepoint, 
-        and merges with the original data to get missingness patterns
-        3. Conducts Little's test for each fitbit domain to assess whether the missingness is MCAR, MAR, or MNAR
-
-    Parameters:
-        con (duckdb.Connection): DuckDB connection with views for fitbit and mri data
-        fit_meta_df (DataFrame): DataFrame containing the fitbit metadata for the selected subjects
-    Returns:
-        mcar_results_df (DataFrame): DataFrame containing the results of Little's test for each fitbit domain, including the p-value and any errors encountered during testing
-
-    NOTE: This function is currently broken. Little's test is not computing properly and I have no fucking clue why. WIP
-    '''
-
-    # For each subject create datetime index with proper missing days based on min and max of the Wear_Time column, and merge with original data to get missingness patterns
-    def create_missingness_df(df, domain_name):
-        missingness_list = []
-        grouped = df.groupby("subject")
-        for subject, group in grouped:
-            min_date = group["Wear_Time"].min().floor("D")
-            max_date = group["Wear_Time"].max().ceil("D")
-            value_cols = [c for c in group.columns if c not in ["subject", "Wear_Time"]]
-            daily_means = group.set_index("Wear_Time")[value_cols].resample("D").mean().reset_index()
-            date_range = pd.date_range(start=min_date, end=max_date, freq="D")
-            date_df = pd.DataFrame({"Wear_Time": date_range})
-            merged_df = date_df.merge(daily_means, on="Wear_Time", how="left")
-            merged_df["subject"] = subject
-            missingness_list.append(merged_df)
-        return pd.concat(missingness_list, ignore_index=True)
-
-    # Define safe littles test for debugging
-    def safe_little_test(df, min_obs_per_col=5, min_cols=2):
-        df = df.copy()
-        # coerce numeric and drop empty cols/rows
-        df = df.apply(pd.to_numeric, errors='coerce')
-        df = df.loc[:, df.notna().sum() >= min_obs_per_col]
-        df = df.dropna(how='all')
-        if df.shape[1] < min_cols or df.shape[0] < 2:
-            return np.nan, "insufficient data after filtering"
-        # compute pj/df quickly (same logic as pyampute)
-        vars_ = df.dtypes.index.values
-        n_var = df.shape[1]
-        r = 1 * df.isnull()
-        mdp = np.dot(r, [2**i for i in range(n_var)])
-        pj = 0
-        for i in np.unique(mdp):
-            dataset_temp = df.loc[mdp == i, vars_]
-            select_vars = ~dataset_temp.isnull().any()
-            pj += np.sum(select_vars)
-        df_val = pj - n_var
-        if df_val <= 0:
-            return np.nan, f"df <= 0 (pj={pj}, n_var={n_var})"
-        # try running the test and catch numerical errors
-        try:
-            pval = MCARTest(method="little").little_mcar_test(df)
-        except Exception as e:
-            return np.nan, f"test error: {e}"
-        return pval, None
-    
-    mcar_test = MCARTest(method="little")
-
-    # Setup bootstrapping for random selection of subjects to run Little's test with reduced memory load
-    bootstrap_results = []
-    for i in tqdm(range(10), desc="Bootstrapping Little's test for MCAR"):
-        
-        bootstrap_subjects = fit_meta_df["subject"].sample(frac=0.25, random_state=i).values
-        query = f"""
-            WITH earliest_timepoint AS (
-            SELECT subject, MIN(timepoint) AS first_tp
-            FROM fitbit_data
-            WHERE subject IN (SELECT unnest($subjects))
-            GROUP BY subject
-            ),
-            daily_agg AS (
-                SELECT 
-                    f.subject,
-                    CAST(f.Wear_Time AS DATE) AS date,
-                    AVG(f.Value_HR1m)       AS Value_HR1m,
-                    AVG(f.Steps_Stps1m)     AS Steps_Stps1m,
-                    AVG(f.Calories_Cal1m)   AS Calories_Cal1m,
-                    AVG(f.METs_METs1m)      AS METs_METs1m,
-                    AVG(f.Intensity_Int1m)  AS Intensity_Int1m,
-                    AVG(f.value_Slp1m)      AS value_Slp1m
-                FROM fitbit_data f
-                INNER JOIN earliest_timepoint e
-                    ON f.subject = e.subject 
-                    AND f.timepoint = e.first_tp
-                WHERE f.subject IN (SELECT unnest($subjects))
-                GROUP BY f.subject, CAST(f.Wear_Time AS DATE)
-            )
-            SELECT * FROM daily_agg
-            """
-        df = con.execute(query, {"subjects": list(bootstrap_subjects)}).df()
-
-        # Drop columns with all missing values and zero variance to avoid errors in Little's test
-        #df = df.drop(columns=["subject","timepoint", "Wear_Time", "Level_Slp1m"])  
-        df = df.drop(columns=["subject", "date"])
-        df = df.dropna(axis=1, how="all")
-        numeric_cols = df.select_dtypes(include="number").columns
-        zero_var_cols = numeric_cols[df[numeric_cols].std() == 0]
-        df = df.drop(columns=zero_var_cols)
-        df = df.apply(lambda col: col.astype(float) 
-                            if hasattr(col, 'dtype') and pd.api.types.is_extension_array_dtype(col) 
-                            else col)
-
-        # Convert columns to numeric and Wear_Time to datetime
-        cols_to_convert = [c for c in df.columns if c not in ["subject", "Wear_Time"]]
-        df[cols_to_convert] = df[cols_to_convert].apply(pd.to_numeric, errors='coerce')
-        #df["Wear_Time"] = pd.to_datetime(df["Wear_Time"])
-
-        #missingness_df = create_missingness_df(df, domain_name=f"bootstrap_{i}")
-        #df = None  # free memory
-
-        # --- Diagnostics ---
-        #test_df = missingness_df.drop(columns=["subject", "Wear_Time"])
-        #print(f"Shape: {test_df.shape}")
-        #print(f"Missingness per column (%):\n{test_df.isna().mean().sort_values(ascending=False).head(20)}")
-        #print(f"Columns with all NaN: {test_df.isna().all().sum()}")
-        #print(f"Columns with zero variance: {(test_df.std() == 0).sum()}")
-        #print(f"Sample of data:\n{test_df.head()}")
-
-        #print(f"Shape: {df.shape}")
-        #print(f"Missingness per column (%):\n{df.isna().mean().sort_values(ascending=False)}")
-        #print(f"Dtype of each column:\n{df.dtypes}")
-        #print(f"Any <NA> (pandas NA, not numpy NaN):\n{df.isin([pd.NA]).any()}")
-        #print(f"Sample:\n{df.head(10)}")
-        # ------------------
-
-        #mcar = mcar_test.little_mcar_test(missingness_df.drop(columns=["subject", "Wear_Time"]))
-        mcar = mcar_test.little_mcar_test(df)
-
-        # --- Diagnostics ---
-        #print(f"Raw result object: {mcar}")
-        #print(f"Type of result: {type(mcar)}")
-        # -------------------
-
-        print(f"Bootstrap iteration {i}: Little's test p-value = {mcar}")
-        bootstrap_results.append((i, mcar))
-
-    bootstrap_results_df = pd.DataFrame(bootstrap_results, columns=["bootstrap_iteration", "little_mcar_pval", "little_mcar_error"])
-    bootstrap_results_df.to_csv(os.path.join(output_path, "fitbit_missingness_mcar_bootstrap_results.csv"), index=False)
-    print("Completed bootstrapping for Little's test. Results saved to CSV.")
-    print("Average p-value across bootstraps:", bootstrap_results_df["little_mcar_pval"].mean())
-
-    # Get unique column names from fitbit tables
-    query = """
-    SELECT column_name
-    FROM (DESCRIBE fitbit_data)
-    """
-    fitbit_columns = con.execute(query).df()["column_name"].tolist()
-    fitbit_columns.remove("subject")
-    fitbit_columns.remove("timepoint")
-    fitbit_columns.remove("Wear_Time")
-
-    
-
-    query = f"""
-            SELECT subject, Wear_Time, {fitbit_columns[0]}
-            FROM fitbit_data   
-            WHERE timepoint = (
-                SELECT MIN(timepoint)
-                FROM fitbit_data f2
-                WHERE f2.subject = fitbit_data.subject
-            )
-            """
-    df = con.execute(query).df()
-
-    results = []
-    for column in tqdm(fitbit_columns, desc="Testing MCAR for each column"):
-        print(column)
-        query = f"""
-            SELECT subject, Wear_Time, {column}
-            FROM fitbit_data   
-            WHERE timepoint = (
-                SELECT MIN(timepoint)
-                FROM fitbit_data f2
-                WHERE f2.subject = fitbit_data.subject
-            )
-            """
-        df = con.execute(query).df()
-        missingness_df = create_missingness_df(df, column)
-        df = None  # free memory
-        mcar = mcar_test.little_mcar_test(missingness_df.drop(columns=["subject", "Wear_Time"]))
-        print(f"Little's test for {column}: p-value = {mcar}")
-        print("Safe test:")
-        pval, error = safe_little_test(missingness_df.drop(columns=["subject", "Wear_Time"]))
-        print(f"Column: {column}, p-value: {pval}, error: {error}")
-        missingness_df = None  # free memory
-        results.append((column, mcar, pval, error))
-    mcar_results_df = pd.DataFrame(results, columns=["filename", "little_mcar", "safe_little_pval", "safe_little_error"])
-    mcar_results_df.to_csv(os.path.join(output_path, "fitbit_missingness_mcar_results.csv"), index=False)
-
-    return mcar_results_df
-
-def group_difference_analysis(data, group_col, mri_meta_df, analysis_output = None, output_path = Path("output")):
-    '''
-    This function performs group difference analysis for the selected subjects' data based on the specified group column.
-    It uses a generalized additive model (GAM) to account for non-linear effects of covariates and extracts p-values for group differences.
-    It also calculates the effect size (Cohen's d) for each feature to quantify the magnitude of group differences.
-
-    Parameters:
-        data (DataFrame): DataFrame containing the data to analyze
-        group_col (str): Column name in the DataFrame that defines the groups for comparison
-    Returns:
-        results_df (DataFrame): DataFrame containing the results of the group difference analysis, including p-values, effect sizes, and effect size standard deviations for each feature
-    '''
-
-    def _cohens_d(x, y):
-        """
-        Calculate Cohen's d effect size between two groups.
-        Parameters:
-            x (array-like): Values for group 1
-            y (array-like): Values for group 2
-        Returns:
-            d (float): Cohen's d effect size
-        """
-        nx, ny = len(x), len(y)
-        dof = nx + ny - 2
-        pooled_std = np.sqrt(((nx - 1) * np.var(x, ddof=1) + (ny - 1) * np.var(y, ddof=1)) / dof)
-        return (np.mean(x) - np.mean(y)) / pooled_std
-
-    def _cohens_d_std(x, y, d=None):
-        """
-        Approximate standard deviation (standard error) of Cohen's d.
-        Parameters:
-            x (array-like): Values for group 1
-            y (array-like): Values for group 2
-            d (float, optional): Precomputed Cohen's d
-        Returns:
-            float: Standard deviation (SE) estimate for Cohen's d
-        """
-        nx, ny = len(x), len(y)
-        if nx < 2 or ny < 2:
-            return np.nan
-        if d is None:
-            d = _cohens_d(x, y)
-        var_d = ((nx + ny) / (nx * ny)) + ((d ** 2) / (2 * (nx + ny - 2)))
-        return np.sqrt(var_d)
-    
-    # Add covariates to data from mri_meta_df
-    covariate_cols = ["age_at_mri", "sex", "mr_y_smri__vol__aseg__icv_sum", "scan_site"]
-    for col in covariate_cols:
-        if col in mri_meta_df.columns:
-            data[col] = mri_meta_df[col]
-        else:
-            raise ValueError(f"Covariate column '{col}' not found in mri_meta_df.")
-    
-    # Recode sex to numeric
-    data["sex"] = data["sex"].map({"M": 0, "F": 1})
-
-    # Group difference analysis for each fitbit feature between discovered subtypes using GAM with effect size calculation
-    gam_results = []
-    for col in tqdm(data.columns, desc="Performing GAM regression analysis for MRI features"):
-        if col not in ["participant_id", "session_id", "subject", "subject_x", "subject_y", "acq_time", "depression_marker", "mh_y_ksads__dep_age", "sex", 
-                        "mr_y_smri__vol__aseg__icv_sum", "timepoint", "timepoint_x", "timepoint_y", "scan_site", "subject_ids", "label", "labels", "age_at_first_mri", group_col]:
-            model_cols = ["age_at_mri", "sex", group_col, "mr_y_smri__vol__aseg__icv_sum", "scan_site", col]
-            df_fit = data[model_cols].replace([np.inf, -np.inf], np.nan).dropna()
-            n_dropped = len(data) - len(df_fit)
-            if n_dropped > 0:
-                print(f"{col}: dropped {n_dropped} rows ({(n_dropped/len(data)*100):.2f}%) with missing/invalid data")
-            try:
-                gam = LinearGAM(s(0) + l(1) + l(2) + l(3) + l(4)).fit(df_fit[["age_at_mri", "scan_site", "sex","mr_y_smri__vol__aseg__icv_sum", group_col]], df_fit[col])
-                group_dep = df_fit.loc[df_fit[group_col] == 1, col]
-                group_nondep = df_fit.loc[df_fit[group_col] == 0, col]
-                effect_size = _cohens_d(group_dep, group_nondep)
-                effect_size_std = _cohens_d_std(group_dep, group_nondep, d=effect_size)
-                gam_results.append((col, gam.statistics_['p_values'][4], effect_size, effect_size_std))  # p-value for label
-            except Exception as e:
-                print(f"Error occurred while fitting GAM model for column {col}: {e}")
-    # Combine GAM p-values, effect sizes, and effect size standard deviations into a single DataFrame
-    results_df = pd.DataFrame(gam_results, columns=["feature", "p_value", "effect_size", "effect_size_std"])
-    results_df = results_df.sort_values("p_value")
-
-    # Perform FDR correction for multiple comparisons
-    print("Performing FDR correction for multiple comparisons...")
-    rejected, corrected_p_values, _, _ = multipletests(results_df["p_value"], alpha=0.05, method='fdr_bh')
-    results_df["corrected_p_value"] = corrected_p_values
-    results_df["significant_fdr"] = rejected
-
-    # If analysis_output is provided, save the results to a CSV file
-    if analysis_output is not None:
-        results_df.to_csv(os.path.join(output_path, str(analysis_output)), index=False)
-        print(f"Results saved to: {os.path.join(output_path, str(analysis_output))}")
-
-    # Print the number of significant ROIs after FDR correction
-    num_significant_rois = results_df["significant_fdr"].sum()
-    print(f"Number of significant ROIs after FDR correction: {num_significant_rois}")
-
-    sig_results_df = results_df[results_df["significant_fdr"]]
-    # If analysis_output is provided, save the significant results to a CSV file
-    if analysis_output is not None:
-        sig_results_df.to_csv(os.path.join(output_path, str(analysis_output)), index=False)
-        print(f"Significant ROIs saved to: {os.path.join(output_path, str(analysis_output))}")
-
-    return sig_results_df, results_df

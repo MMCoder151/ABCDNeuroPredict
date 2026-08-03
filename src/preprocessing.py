@@ -1,10 +1,14 @@
 import pandas as pd
+import numpy as np
+import os
 from pathlib import Path
-from src.mri_rois import mri_rois
 import duckdb
 from tqdm import tqdm
 import pathlib
-from src.mri_rois import mri_rois
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import statsmodels.api as sm
+from sklearn.impute import SimpleImputer
+from statsmodels.tsa.seasonal import STL
 
 def _load_fitbit_df(filepath):
     '''
@@ -74,7 +78,7 @@ def _recode_fitbit_data(fit_df):
 
     return fit_df
 
-def filter_subjects(dta_path, dta_path_tabular, test=False, overwrite=True, output_path=pathlib.Path("output")):
+def filter_subjects(dta_path, test=False, overwrite=True, output_path=pathlib.Path("output")):
     '''
     This function selects subjects and time points based on selection criteria (below) and extracts demographic and meta information for fitbit and mri data
         - Only subjects with both "fit" and "scans" files are included (=> subjects with both Fitbit and MRI data)
@@ -85,15 +89,11 @@ def filter_subjects(dta_path, dta_path_tabular, test=False, overwrite=True, outp
     Subjects/timepoints with less than 7 days of actually recorded Fitbit data and less than 60% missings are marked for later filtering
     Parameters:
         dta_path (Path): Path to the raw data directory
-        dta_path_tabular (Path): Path to the tabular data directory
         test (bool): Whether to run in test mode (only uses first 100 subjects for faster testing)
         overwrite (bool): Whether to overwrite existing metadata files (if False, will load existing metadata files if they exist and skip the selection process)
         output_path (Path): Path to the output directory to reimport metadata files if overwrite=False
     Returns:
-        demo_df (DataFrame): DataFrame containing demographic data for included subjects (sex, age at mri, scan site)
-        mri_meta_df (DataFrame): DataFrame containing MRI date and  age at MRI scan for included subjects and timepoints/sessions
         fit_meta_df (DataFrame): DataFrame containing filepaths for Fitbit data for included subjects and timepoints/sessions
-        demo_df, mri_meta_df, and fit_meta_df are saved as CSV files in the output directory for easy re-import if overwrite=False
     Note:
         "fit" files contain fitbit data. Multiple fitbit files exist containing different types of data:
         - Cal1m: calories measured in 1 minute intervals
@@ -110,10 +110,8 @@ def filter_subjects(dta_path, dta_path_tabular, test=False, overwrite=True, outp
     '''
     if overwrite == False:
         print("Subject selection skipped (overwrite=False). To re-run subject selection, set overwrite=True.")
-        demo_df = pd.read_csv(output_path / "demographics_metadata.csv")
-        mri_meta_df = pd.read_csv(output_path / "mri_metadata.csv")
         fit_meta_df = pd.read_csv(output_path / "fitbit_metadata.csv")
-        return demo_df, mri_meta_df, fit_meta_df
+        return fit_meta_df
 
     # Read participant information and get subject folders
     subs = pd.read_csv(dta_path / "participants.tsv", sep="\t")
@@ -193,211 +191,19 @@ def filter_subjects(dta_path, dta_path_tabular, test=False, overwrite=True, outp
     # Mark short recordings in binary column in fit_meta_df
     fit_meta_df["short"] = fit_meta_df.apply(lambda row: 1 if (row["recording_duration_days"] < 7) | (row["missing_days_percentage"] > 60) else 0, axis=1)
 
-    # GET MRI METADATA
-
-    # Find "scans" files
-    scan_files = []
-
-    for sub_folder in tqdm(sub_folders, total=len(sub_folders), desc="Searching MRI subjects"):
-        sub_id = sub_folder.name
-        
-        # Search recursively for files with "scans" in the name
-        for scan_file in sub_folder.rglob("*scans*"):
-            if scan_file.is_file():
-                # check if "acq_time" column is empty in the file, if so, skip the file
-                temp_file = pd.read_csv(scan_file, sep="\t")
-                if temp_file.empty:
-                    continue
-                temp_file["acq_time"] = pd.to_datetime(temp_file["acq_time"], errors="coerce")
-                if temp_file["acq_time"].isna().all():
-                    continue
-                # Extract timepoint/session from file path
-                parts = scan_file.relative_to(sub_folder).parts
-                timepoint = next((p for p in parts if p.startswith("ses-")), "unknown")
-                
-                scan_files.append({
-                    "subject": sub_id,
-                    "timepoint": timepoint,
-                    "filename": scan_file.name,
-                    "filepath": str(scan_file)
-                })
-    # Convert to DataFrame for easy inspection
-    mri_meta_df = pd.DataFrame(scan_files)
-    print(mri_meta_df.columns)
-
-    print(f"Number of subjects with 'scans' files: {mri_meta_df['subject'].nunique()}")
-    print(f"Average number of timepoints per subject with 'scans' files: {mri_meta_df.groupby('subject')['timepoint'].nunique().mean():.2f}")
-
-    # Get timepoints per subjects with both "fit" and "scans" files
-    fit_timepoints = fit_meta_df.groupby("subject")["timepoint"].unique().reset_index()
-    scan_timepoints = mri_meta_df.groupby("subject")["timepoint"].unique().reset_index()
-    merged_timepoints = pd.merge(fit_timepoints, scan_timepoints, on="subject", how="inner", suffixes=("_fit", "_scan"))
-    merged_timepoints["common_timepoints"] = merged_timepoints.apply(lambda row: set(row["timepoint_fit"]) & set(row["timepoint_scan"]), axis=1)
-
-    # Ensure we keep only exact matching (subject, timepoint) pairs that exist in BOTH fit and MRI metadata.
-    fit_pairs = fit_meta_df[["subject", "timepoint"]].drop_duplicates()
-    mri_pairs = mri_meta_df[["subject", "timepoint"]].drop_duplicates()
-    common_pairs = pd.merge(fit_pairs, mri_pairs, on=["subject", "timepoint"], how="inner")
-    # Filter both metadata tables to the intersection of pairs
-    fit_meta_df = fit_meta_df.merge(common_pairs, on=["subject", "timepoint"], how="inner")
-    mri_meta_df = mri_meta_df.merge(common_pairs, on=["subject", "timepoint"], how="inner")
-    print(f"Number of subjects with both fitbit and mri files: {common_pairs['subject'].nunique()}")
-
     # Get subjects with multiple timepoints/sessions with both "fit" and "scans" files
     timepoint_counts = fit_meta_df.groupby("subject")["timepoint"].nunique().reset_index(name="timepoint_count")
     subjects_multiple_timepoints = timepoint_counts[timepoint_counts["timepoint_count"] > 1]
-    print(f"Number of subjects with multiple timepoints/sessions with both fitbit and mri files: {len(subjects_multiple_timepoints)}")
-
-    # Get subjects with immediate follow-up timepoints (e.g., ses-01A and ses-02A)
-    def has_immediate_followup(timepoints):
-        timepoint_numbers = [int(tp.split("-")[1][:-1]) for tp in timepoints if tp.startswith("ses-")]
-        timepoint_numbers.sort()
-        return any((n2 - n1 == 1) for n1, n2 in zip(timepoint_numbers, timepoint_numbers[1:]))
-    subjects_immediate_followup = merged_timepoints[merged_timepoints["common_timepoints"].apply(has_immediate_followup)]
-    print(f"Number of subjects with immediate follow-up timepoints: {len(subjects_immediate_followup)}")
-
-    # GET DEMOGRAPHIC DATA
-    
-    # Get list of included subjects
-    included_subjects = fit_meta_df["subject"].unique()
-
-    # import static demographic information
-    mri_path = dta_path / "phenotype"
-    stc_df = pd.read_csv(mri_path / "ab_g_stc.tsv", sep="\t")
-
-    # import scansite information
-    scan_site_df = pd.read_csv(mri_path / "ab_g_dyn.tsv", sep="\t")
-
-    # create dataframe with sex, date of birth, and scan site for included subjects
-    demo_df = subs[subs["participant_id"].isin(included_subjects)][["participant_id", "sex"]].merge(
-        stc_df[stc_df["participant_id"].isin(included_subjects)][["participant_id", "ab_g_stc__cohort_dob"]],
-        on="participant_id",
-        how="left"
-    )
-    demo_df = demo_df.merge(
-        scan_site_df[scan_site_df["participant_id"].isin(included_subjects)][["participant_id", "ab_g_dyn__design_site"]],
-        on="participant_id",
-        how="left"
-    )
-    demo_df.rename(columns={"ab_g_stc__cohort_dob": "date_of_birth", "participant_id": "subject", "ab_g_dyn__design_site": "scan_site"}, inplace=True)
-
-    # Extract MRI acquisition date and add to mri_meta_df
-    for file in mri_meta_df["filepath"]:
-        temp_file = pd.read_csv(file, sep="\t")
-        if temp_file["acq_time"].dtype != "datetime64[ns]":
-            temp_file["acq_time"] = pd.to_datetime(temp_file["acq_time"])
-        mri_date = temp_file["acq_time"].min()
-        mri_meta_df.loc[mri_meta_df["filepath"] == file, "mri_date"] = mri_date
-
-    # add sex and age at MRI scan (rounded to nearest year) to mri_meta_df
-    mri_meta_df = mri_meta_df.merge(demo_df[["subject", "sex", "date_of_birth", "scan_site"]], left_on="subject", right_on="subject", how="left")
-    mri_meta_df["mri_date"] = pd.to_datetime(mri_meta_df["mri_date"], errors="coerce")
-    mri_meta_df["date_of_birth"] = pd.to_datetime(mri_meta_df["date_of_birth"], errors="coerce")
-    mri_meta_df["age_at_mri"] = ((mri_meta_df["mri_date"] - mri_meta_df["date_of_birth"]).dt.days / 365.25).round(0).astype("Int64")
-    mri_meta_df = mri_meta_df.drop(columns=["date_of_birth"])
-
-    # add depression marker to mri_meta_df
-    # Read in clinical data for depression marker
-    youth_directory = dta_path_tabular / "mh_y_ksads__dep.tsv"
-    parent_directory = dta_path_tabular / "mh_p_ksads__dep.tsv"
-
-    ksads_youth = pd.read_csv(youth_directory, sep="\t")
-    ksads_parent = pd.read_csv(parent_directory, sep="\t")
-    
-    # Filter to only include subjects and timepoints that are present in mri_meta_df
-    ksads_youth = ksads_youth.merge(
-        mri_meta_df[["subject", "timepoint"]],
-        left_on=["participant_id", "session_id"],
-        right_on=["subject", "timepoint"],
-        how="inner"
-    )
-    ksads_parent = ksads_parent.merge(
-        mri_meta_df[["subject", "timepoint"]],
-        left_on=["participant_id", "session_id"],
-        right_on=["subject", "timepoint"],
-        how="inner"
-    )
-
-    # Filter to only include the first timepoint for each subject
-    ksads_youth = ksads_youth.sort_values(by=["participant_id", "session_id"]).groupby("participant_id").first().reset_index()
-    ksads_parent = ksads_parent.sort_values(by=["participant_id", "session_id"]).groupby("participant_id").first().reset_index()
-
-    # Get list of depressed subjects based on KSADS depression diagnosis (youth and parent report)
-    diagnosis_cols_youth = {#"mh_y_ksads__dep__mdd__partrem_dx"  :"Diagnosis: Major depressive disorder (F32.4) - Partial remission [Youth]",
-                            "mh_y_ksads__dep__mdd__pres_dx"     :"Diagnosis: Major depressive disorder - Present [Youth]",
-                            #"mh_y_ksads__dep__pdd__oth__pres_dx":"Diagnosis: Other specified depressive disorder, persistent depressive disorder (impairment does not meet full criteria) (F32.8) - Present [Youth]",
-                            #"mh_y_ksads__dep__pdd__partrem_dx"  :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Partial remission [Youth]",
-                            "mh_y_ksads__dep__pdd__pres_dx"     :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Present [Youth]"}
-    diagnosis_cols_parent = {#"mh_p_ksads__dep__mdd__partrem_dx"  :"Diagnosis: Major depressive disorder (F32.4) - Partial remission [Parent]",
-                            "mh_p_ksads__dep__mdd__pres_dx"     :"Diagnosis: Major depressive disorder - Present [Parent]",
-                            #"mh_p_ksads__dep__pdd__oth__pres_dx":"Diagnosis: Other specified depressive disorder, persistent depressive disorder (impairment does not meet full criteria) (F32.8) - Present [Parent]",
-                            #"mh_p_ksads__dep__pdd__partrem_dx"  :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Partial remission [Parent]",
-                            "mh_p_ksads__dep__pdd__pres_dx"     :"Diagnosis: Persistent depressive disorder (Dysthymia) (F34.1) - Present [Parent]"}
-    
-    # Create a binary depression marker for each subject based on youth and parent report
-    diagnosis_youth_cols = list(diagnosis_cols_youth.keys())
-    y_depr = (ksads_youth[diagnosis_youth_cols] == 1).any(axis=1)
-
-    diagnosis_parent_cols = list(diagnosis_cols_parent.keys())
-    p_depr = (ksads_parent[diagnosis_parent_cols] == 1).any(axis=1)
-
-    depr = y_depr | p_depr
-
-    # Create a binary depression marker for each subject
-    subjects_depr = set(ksads_youth.loc[depr, "participant_id"]) | set(ksads_parent.loc[depr, "participant_id"])
-
-    # Add depression marker to mri_meta_df
-    mri_meta_df["dep_dx"] = mri_meta_df["subject"].apply(lambda x: 1 if x in subjects_depr else 0)
-
-    # Add parent and youth depression markers to mri_meta_df
-    mri_meta_df["dep_dx_y"] = mri_meta_df["subject"].apply(lambda x: 1 if x in set(ksads_youth.loc[y_depr, "participant_id"]) else 0)
-    mri_meta_df["dep_dx_p"] = mri_meta_df["subject"].apply(lambda x: 1 if x in set(ksads_parent.loc[p_depr, "participant_id"]) else 0)
-
-    # Add raw diagnosis columns to mri_meta_df for reference
-    mri_meta_df = mri_meta_df.merge(
-        ksads_youth[["participant_id", *diagnosis_youth_cols]],
-        left_on="subject",
-        right_on="participant_id",
-        how="left"
-    ).drop(columns=["participant_id"])
-
-    mri_meta_df = mri_meta_df.merge(
-        ksads_parent[["participant_id", *diagnosis_parent_cols]],
-        left_on="subject",
-        right_on="participant_id",
-        how="left"
-    ).drop(columns=["participant_id"])
-
-    # Add total intracranial volume (TIV) to mri_meta_df per subject and time point
-    subcortical_vol = pd.read_csv(dta_path / "phenotype" / "mr_y_smri__vol__aseg.tsv", sep="\t")
-    mri_meta_df = mri_meta_df.merge(subcortical_vol[["participant_id", "session_id", "mr_y_smri__vol__aseg__icv_sum"]], left_on=["subject", "timepoint"], right_on=["participant_id", "session_id"], how="left")
-
-    # Check that subject/timepoint PAIRS in mri_meta_df and fit_meta_df match exactly
-    pairs_fit = set(map(tuple, fit_meta_df[["subject","timepoint"]].drop_duplicates().values))
-    pairs_mri = set(map(tuple, mri_meta_df[["subject","timepoint"]].drop_duplicates().values))
-    assert pairs_fit == pairs_mri, "Subject-timepoint pairs in mri_meta_df and fit_meta_df do not match"
-
-    # drop filepath and filename columns from mri_meta_df
-    mri_meta_df = mri_meta_df.drop(columns=["filepath", "filename"])
-
-    # Drop duplicates from mri_meta_df and demo_df
-    mri_meta_df.drop_duplicates(subset=["subject", "timepoint"], inplace=True)
-    demo_df.drop_duplicates(subset=["subject"], inplace=True)
-
-    # Add age at MRI to dem_df for first timepoint
-    demo_df["age_at_first_mri"] = demo_df["subject"].map(mri_meta_df.groupby("subject")["age_at_mri"].min())
-
-    print(f"Final number of subjects included after filtering: {demo_df['subject'].nunique()}")
+    print(f"Number of subjects with multiple timepoints/sessions with fitbit files: {len(subjects_multiple_timepoints)}")
+    print(f"Final number of subjects with fitbit data: {fit_meta_df['subject'].nunique()}")
 
     # save metadata to csv
     output_path.mkdir(parents=True, exist_ok=True)
-    demo_df.to_csv(output_path / "demographics_metadata.csv", index=False)
-    mri_meta_df.to_csv(output_path / "mri_metadata.csv", index=False)
     fit_meta_df.to_csv(output_path / "fitbit_metadata.csv", index=False)
 
-    return demo_df, mri_meta_df, fit_meta_df
+    return fit_meta_df
 
-def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
+def setup_duckdb(dta_path, fit_meta_df, overwrite=False):
     '''
     This function transforms the raw fitbit and MRI data to make it easier to query with DuckDB for downstream analysis
     and sets up a DuckDB connection with views for the transformed fitbit and MRI data.
@@ -418,16 +224,13 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
 
     # Create output directories for fitbit and mri data
     output_dir_fit = dta_path / "processed_fitbit_data"
-    output_dir_mri = dta_path / "processed_mri_data"
     output_dir_fit.mkdir(parents=True, exist_ok=True)
-    output_dir_mri.mkdir(parents=True, exist_ok=True)
 
     if overwrite == False:
         print("DuckDB setup skipped (overwrite=False). To re-run data transformation and DuckDB setup, set overwrite=True.")
         try:
             con = duckdb.connect()
             con.execute(f"CREATE OR REPLACE VIEW fitbit_data AS SELECT * FROM read_parquet('{output_dir_fit}/**/combined_fitbit.parquet', union_by_name => TRUE)")
-            con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/all_subjects_combined_mri.parquet')")
 
         except Exception as e:
             print(f"Error setting up DuckDB views: {e}")
@@ -491,197 +294,273 @@ def setup_duckdb(dta_path, fit_meta_df, overwrite=True):
 
         # Save combined dataframe as parquet file aligned on Wear_Time (overwrites existing files)
         combined_df.sort_values("Wear_Time").to_parquet(output_file, index=False)
-        
-    # Get MRI ROIs and files to import
-    mri_files, mri_rois_dict = mri_rois()
-
-    # Accumulate MRI data for each subject-timepoint across all phenotype files
-    mri_data_accumulator = {}  # {(subject, timepoint): {columns from all files}}
-    mri_column_source = {}     # {(subject, timepoint): {column: source_file}} - tracks provenance to detect collisions
-
-    # Extract MRI data for each subject and timepoint and accumulate across all files
-    for file in tqdm(mri_files, total=len(mri_files), desc="Processing MRI phenotype files"):
-        mri_df = pd.read_csv(dta_path / "phenotype" / file, sep="\t")
-
-        # CHANGE: keep all columns from the file (not just mri_rois_dict) for possible future analysis.
-        # participant_id/session_id are still needed for the merge below and dropped afterward.
-        if "participant_id" not in mri_df.columns or "session_id" not in mri_df.columns:
-            print(f"Warning: {file} missing participant_id/session_id — skipping file")
-            continue
-
-        merged_df = mri_df.merge(
-            fit_meta_df[["subject", "timepoint"]].drop_duplicates(),
-            left_on=["participant_id", "session_id"],
-            right_on=["subject", "timepoint"],
-            how="inner",
-        ).drop(columns=["participant_id", "session_id"])
-
-        # Warn if the inner join dropped everything (likely a session_id/timepoint encoding
-        # mismatch between this file and fit_meta_df), since that fails silently otherwise.
-        if len(mri_df) > 0 and len(merged_df) == 0:
-            print(f"Warning: {file} had {len(mri_df)} rows but 0 matched fit_meta_df on subject/timepoint — "
-                f"check session_id encoding (e.g. '{mri_df['session_id'].iloc[0]}' vs "
-                f"'{fit_meta_df['timepoint'].iloc[0]}')")
-
-        # Accumulate this file's data for each subject-timepoint
-        for _, row in merged_df.iterrows():
-            subject = row["subject"]
-            timepoint = row["timepoint"]
-            key = (subject, timepoint)
-
-            if key not in mri_data_accumulator:
-                mri_data_accumulator[key] = {}
-                mri_column_source[key] = {}
-
-            # Merge this row's data into the accumulator
-            for col in row.index:
-                if col not in ["subject", "timepoint"]:
-                    # Detect collisions before overwriting instead of silently clobbering
-                    # an earlier file's value for this column.
-                    if col in mri_column_source[key] and mri_column_source[key][col] != file:
-                        print(f"Warning: column '{col}' for {key} present in both "
-                            f"'{mri_column_source[key][col]}' and '{file}' — keeping value from '{file}'")
-                    mri_data_accumulator[key][col] = row[col]
-                    mri_column_source[key][col] = file
-
-    # Write accumulated MRI data to one bit parquet file
-    all_rows = []
-    for (subject, timepoint), data_dict in mri_data_accumulator.items():
-        row = dict(data_dict)
-        row["subject"] = subject
-        row["timepoint"] = timepoint
-        all_rows.append(row)
-
-    mri_combined_df = pd.DataFrame(all_rows)
-
-    output_file = output_dir_mri / "all_subjects_combined_mri.parquet"
-    mri_combined_df.to_parquet(output_file, index=False)
     
     # Setup DuckDB connection to query the combined fitbit and mri data
     con = duckdb.connect()
     # Use read_parquet with union_by_name=True to allow files with differing schemas
     con.execute(f"CREATE OR REPLACE VIEW fitbit_data AS SELECT * FROM read_parquet('{output_dir_fit}/**/combined_fitbit.parquet', union_by_name => TRUE)")
-    con.execute(f"CREATE OR REPLACE VIEW mri_data AS SELECT * FROM read_parquet('{output_dir_mri}/all_subjects_combined_mri.parquet')")
 
     # Sanity check
     n_fitbit = con.execute("SELECT COUNT(DISTINCT subject) FROM fitbit_data").fetchone()[0]
-    n_mri    = con.execute("SELECT COUNT(DISTINCT subject) FROM mri_data").fetchone()[0]
-    print(f"✓ DuckDB ready — {n_fitbit} Fitbit subjects, {n_mri} MRI subjects")
+    print(f"✓ DuckDB ready — {n_fitbit} Fitbit subjects available for querying.")
 
     return con
 
-def describe_subjects(fit_meta_df, mri_meta_df):
-    '''
-    This function prints descriptive statistics about the fitbit data for included subjects at the first timepoint in general and split by file domain (e.g., "fitbInt1m", "fitbCal1m", etc.) to the console.
+def create_composites(selected_subjects, vif_threshold=10, overwrite=True, output_path=Path("output"), composite_output = None):
+    """
+    Creates composite scores out of given variables based on variance inflation factors (VIF) and drops zero variance columns.
+ 
     Parameters:
-        fit_meta_df (DataFrame): DataFrame containing metadata for the selected fitbit files (subjects, timepoints, filepaths, recording durations, missingness percentages, etc.)
-        mri_meta_df (DataFrame): DataFrame containing MRI metadata for the subjects
+        selected_subjects (DataFrame): DataFrame containing the selected subjects and their data to be analysed
+        vif_threshold (float): VIF value above which a variable triggers compositing
+        max_iterations (int): safety cap so a degenerate case can't loop forever
+ 
     Returns:
-        None (prints descriptive statistics to console)
-    '''
+        selected_subjects (DataFrame): DataFrame with high-VIF columns replaced by composites
+        composite_dict (dict): Maps composite score name -> list of *original* base columns
+                                that were averaged together to build it (flattened, not nested)
+    """
 
-    if "missing_days_percentage" in fit_meta_df.columns:
-        missingness_series = pd.to_numeric(fit_meta_df["missing_days_percentage"], errors="coerce")
-        needs_recompute = missingness_series.isna().any() or (~missingness_series.between(0, 100)).any()
-    else:
-        needs_recompute = True
+    if overwrite == False:
+        print("Overwrite set to False. Reimporting composites.")
+        try:
+            if composite_output is not None:
+                composite_output_path = Path(output_path) / composite_output
+                features_path = composite_output_path / "features_with_composites.csv"
+                composite_dict_path = composite_output_path / "composite_dictionary.csv"
+            else:
+                features_path = Path(output_path) / "fitbit_features_with_composites.csv"
+                composite_dict_path = Path(output_path) / "composite_dictionary.csv"
 
-    if needs_recompute:
-        if {"present_recording_days", "recording_duration_days"}.issubset(fit_meta_df.columns):
-            fit_meta_df = fit_meta_df.copy()
-            present_days = pd.to_numeric(fit_meta_df["present_recording_days"], errors="coerce")
-            recording_days = pd.to_numeric(fit_meta_df["recording_duration_days"], errors="coerce")
-            fit_meta_df["missing_days_percentage"] = 100.0
-            valid_duration = recording_days > 0
-            fit_meta_df.loc[valid_duration, "missing_days_percentage"] = (
-                1 - (present_days.loc[valid_duration] / recording_days.loc[valid_duration])
-            ) * 100
-            fit_meta_df["missing_days_percentage"] = fit_meta_df["missing_days_percentage"].clip(lower=0, upper=100)
-        else:
-            raise KeyError(
-                "fit_meta_df must contain 'missing_days_percentage' or the columns required to derive it: "
-                "'present_recording_days' and 'recording_duration_days'."
-            )
+            features_with_composites = pd.read_csv(features_path)
+            composite_df = pd.read_csv(composite_dict_path)
+            return features_with_composites, composite_df
+        except Exception as e:
+            print(f"An error occured: {e}")
+            return e
 
-    # Print demographics of selected subjects with both fitbit and mri data
-    print("General demographics:")
-    print(f"N: {mri_meta_df['subject'].nunique()}")
-    print("\nMRI Age Statistics:")
-    print(f"Mean: {mri_meta_df['age_at_mri'].mean()}, Std: {mri_meta_df['age_at_mri'].std()}, Min: {mri_meta_df['age_at_mri'].min()}, Max: {mri_meta_df['age_at_mri'].max()}")
-    print("\nSex Distribution:")
-    print(mri_meta_df["sex"].value_counts())
-    print(f"\nAverage missingness percentage of fitbit data: {fit_meta_df['missing_days_percentage'].mean()}")
+    vif_cols = [
+        col for col in selected_subjects.columns
+        if col not in ["subject", "participant_id", "composite_z", "Wear_Time", "subtype", "group", "observations"]
+    ]
+ 
+    # Drop zero-variance columns (VIF undefined for these)
+    variances = selected_subjects[vif_cols].var()
+    zero_variance_cols = variances[variances == 0].index.tolist()
+    if zero_variance_cols:
+        print(f"Dropping columns with zero variance: {len(zero_variance_cols)}")
+        print(zero_variance_cols)
+        vif_cols = [c for c in vif_cols if c not in zero_variance_cols]
+ 
+    vif_data = selected_subjects[vif_cols].dropna()
+    selected_subjects = selected_subjects[vif_cols].copy()
+ 
+    # Snapshot of original values, indexed the same as vif_data, used so we can always
+    # average from true base columns even after they've been dropped from selected_subjects.
+    original_values = vif_data.copy()
+ 
+    # composite_dict maps a SHORT composite id -> flattened list of original base columns.
+    # base_members maps current-column-name -> flattened list of original base columns,
+    # for every column currently alive in vif_data (whether original or composite).
+    composite_dict = {}
+    base_members = {col: [col] for col in vif_data.columns}
+    composite_counter = 0
+ 
+    def vif_table(df):
+        if df.shape[1] == 0:
+            return pd.DataFrame(columns=["variable", "vif"])
+        if df.shape[1] == 1:
+            return pd.DataFrame({"variable": df.columns, "vif": [np.inf]})
 
-    # Print Fitbit completeness at the first available timepoint, split by file domain
-    first_timepoint_fit_df = fit_meta_df[["subject", "timepoint", "filename", "short", "missing_days_percentage"]].copy()
-    first_timepoint_fit_df["domain"] = "other"
-    first_timepoint_fit_df.loc[
-        first_timepoint_fit_df["filename"].str.contains(r"fitbInt1m", case=False, regex=True),
-        "domain",
-    ] = "actigraphy"
-    first_timepoint_fit_df.loc[
-        first_timepoint_fit_df["filename"].str.contains(r"fitbHR1m", case=False, regex=True),
-        "domain",
-    ] = "heart_rate"
-    first_timepoint_fit_df.loc[
-        first_timepoint_fit_df["filename"].str.contains(r"fitbSlp1m", case=False, regex=True),
-        "domain",
-    ] = "sleep"
-    first_timepoint_fit_df = first_timepoint_fit_df[first_timepoint_fit_df["domain"] != "other"]
-    first_timepoint_fit_df["timepoint_order"] = first_timepoint_fit_df["timepoint"].str.extract(r"(\d+)")[0].astype(int)
-
-    first_timepoint_subject_df = (
-        first_timepoint_fit_df.sort_values(["subject", "timepoint_order", "timepoint"])
-        .drop_duplicates(subset=["subject"], keep="first")[["subject", "timepoint"]]
-    )
-
-    first_timepoint_fit_df = first_timepoint_fit_df.merge(first_timepoint_subject_df, on=["subject", "timepoint"], how="inner")
-
-    domain_subject_df = (
-        first_timepoint_fit_df.groupby(["domain", "subject"], as_index=False)
-        .agg(
-            n_files=("filename", "size"),
-            has_short=("short", lambda s: bool((s == 1).any())),
-            has_non_short=("short", lambda s: bool((s == 0).any())),
-            mean_missingness=("missing_days_percentage", "mean"),
+        df_with_const = sm.add_constant(df)
+        vifs = [
+            variance_inflation_factor(df_with_const.values, i)
+            for i in range(1, df_with_const.shape[1])  # skip the constant column (index 0)
+        ]
+        return pd.DataFrame({"variable": df.columns, "vif": vifs}).sort_values("vif", ascending=False)
+ 
+    vif_df = vif_table(vif_data)
+ 
+    while not vif_df.empty and vif_df["vif"].max() > vif_threshold:
+        if vif_data.shape[1] < 2:
+            print("Stopping composite creation because fewer than two VIF columns remain.")
+            break
+ 
+        high_vif_col = vif_df.iloc[0]["variable"]
+ 
+        correlations = vif_data.corr()[high_vif_col].drop(high_vif_col).abs()
+        if correlations.empty:
+            # Nothing left to pair with — stop rather than crash
+            break
+        most_correlated_col = correlations.idxmax()
+ 
+        # Short, stable, human-readable name — does NOT concatenate ancestry
+        composite_counter += 1
+        composite_name = f"composite_{composite_counter}"
+ 
+        # Flattened provenance: original base variables in both parents, deduped,
+        # order-preserved
+        merged_members = []
+        for c in base_members[high_vif_col] + base_members[most_correlated_col]:
+            if c not in merged_members:
+                merged_members.append(c)
+ 
+        print(
+            f"Created {composite_name} from '{high_vif_col}' + '{most_correlated_col}' "
+            f"(VIF={vif_df.iloc[0]['vif']:.1f}, corr={correlations.max():.3f}) "
+            f"-> {len(merged_members)} base vars: {merged_members}"
         )
-    )
-
-    print("\nSubject descriptive statistics at the first available timepoint, by domain:")
-
-    for domain in ["actigraphy", "heart_rate", "sleep"]:
-        domain_df = domain_subject_df[domain_subject_df["domain"] == domain]
-        if domain_df.empty:
-            continue
-
-        short_subjects = set(domain_df.loc[domain_df["has_short"], "subject"])
-        non_short_subjects = set(domain_df.loc[domain_df["has_non_short"], "subject"])
-
-        print(f"\n{domain.replace('_', ' ').title()}:")
-        print(f"Subjects at first timepoint: {domain_df['subject'].nunique()}")
-        print(f"Subjects with any short files: {len(short_subjects)}")
-        print(f"Subjects with any non-short files: {len(non_short_subjects)}")
-        print(f"Average missingness percentage: {domain_df['mean_missingness'].mean()}")
-
-        for label, subject_set in [("short", short_subjects), ("non-short", non_short_subjects)]:
-            subject_list = list(subject_set)
-            if not subject_list:
-                print(f"\n{domain.replace('_', ' ').title()} - {label.title()}:")
-                print("N: 0")
+ 
+        # Average from the ORIGINAL base columns (not from intermediate composites),
+        # so a variable's influence on the final composite doesn't depend on which
+        # merge order it happened to go through. We must read these from the
+        # `original_values` snapshot taken before the loop started, because by this
+        # point some of `merged_members` may already have been dropped from
+        # `selected_subjects` in an earlier iteration (folded into a prior composite).
+        # NOTE: `original_values` only has rows that survived the initial dropna() for
+        # VIF purposes, so this assignment will introduce NaN in `selected_subjects`
+        # for any row that had a NaN in ANY vif_col originally. If you need composite
+        # scores for those rows too, compute composites on a per-pair basis from
+        # selected_subjects directly instead (see alternative below).
+        selected_subjects[composite_name] = original_values[merged_members].mean(axis=1)
+ 
+        composite_dict[composite_name] = merged_members
+ 
+        # Drop the two parent columns, register the new composite
+        selected_subjects.drop(columns=[high_vif_col, most_correlated_col], inplace=True, errors="ignore")
+        vif_data = vif_data.drop(columns=[high_vif_col, most_correlated_col])
+        vif_data[composite_name] = selected_subjects[composite_name]
+ 
+        base_members.pop(high_vif_col, None)
+        base_members.pop(most_correlated_col, None)
+        base_members[composite_name] = merged_members
+ 
+        vif_df = vif_table(vif_data)
+ 
+    selected_subjects = selected_subjects.copy()  # defragment
+ 
+    # composite_dict can still contain entries for intermediate composites that were
+    # absorbed into a later, larger composite (e.g. composite_1 -> [A, B] got folded
+    # into composite_2 -> [A, B, C]). The composite_1 *column* is already gone from
+    # selected_subjects at this point — it was dropped the moment it got merged — but
+    # the dict entry lingers as a bookkeeping artifact. Prune any entry whose member
+    # set is a strict subset of another entry's member set, since it no longer
+    # corresponds to an actual column and is purely redundant provenance info.
+    obsolete = set()
+    for name_a, members_a in composite_dict.items():
+        set_a = set(members_a)
+        for name_b, members_b in composite_dict.items():
+            if name_a == name_b:
                 continue
+            if set_a < set(members_b):  # strict subset
+                obsolete.add(name_a)
+                break
+    for name in obsolete:
+        composite_dict.pop(name)
+ 
+    print(f"\nComposites created: {len(composite_dict)}")
+    for name, members in composite_dict.items():
+        print(f"  {name}: {members}")
 
-            subject_mri_df = mri_meta_df[mri_meta_df["subject"].isin(subject_list)]
+    if zero_variance_cols:
+        print(f"Dropping columns with zero variance: {len(zero_variance_cols)}")
+        print(zero_variance_cols)
+        selected_subjects.drop(columns=zero_variance_cols, inplace=True, errors="ignore")
 
-            print(f"\n{domain.replace('_', ' ').title()} - {label.title()}:")
-            print(f"N: {len(subject_set)}")
-            print("MRI Age Statistics:")
-            print(
-                f"Mean: {subject_mri_df['age_at_mri'].mean()}, "
-                f"Std: {subject_mri_df['age_at_mri'].std()}, "
-                f"Min: {subject_mri_df['age_at_mri'].min()}, "
-                f"Max: {subject_mri_df['age_at_mri'].max()}"
-            )
-            print("Sex Distribution:")
-            print(subject_mri_df["sex"].value_counts())
-            print("Average missingness percentage:")
-            print(domain_df[domain_df["subject"].isin(subject_set)]["mean_missingness"].mean())
+    if composite_output is not None:
+        composite_output_path = Path(output_path) / composite_output
+        if not composite_output_path.exists():
+            composite_output_path.mkdir(parents=True)
+        selected_subjects.to_csv(Path(composite_output_path / "features_with_composites.csv"), index=False)
+        composite_df = pd.DataFrame({
+            "composite_name": list(composite_dict.keys()),
+            "features_included": [", ".join(features) for features in composite_dict.values()]
+        })
+        composite_df.to_csv(Path(composite_output_path / "composite_dictionary.csv"), index=False)
+    else:    
+        selected_subjects.to_csv(Path(output_path / "features_with_composites.csv"), index=False)
+        composite_df = pd.DataFrame({
+            "composite_name": list(composite_dict.keys()),
+            "features_included": [", ".join(features) for features in composite_dict.values()]
+        })
+        composite_df.to_csv(Path(output_path / "composite_dictionary.csv"), index=False)
+    
+    return selected_subjects, composite_dict
+
+def extract_fitbit_features_2(con, subject_timepoint_pairs, output_path=None, overwrite=False):
+    if output_path is not None and os.path.exists(output_path) and not overwrite:
+        print(f"Fitbit features already exist at {output_path}. Skipping extraction.")
+        return pd.read_csv(output_path)
+
+    features_list = []
+    for row in tqdm(subject_timepoint_pairs.itertuples(index=False), total=subject_timepoint_pairs.shape[0], desc="Extracting Fitbit features"):
+        query = f"""
+        SELECT *
+        FROM fitbit_data
+        WHERE subject = '{row.subject}' AND timepoint = '{row.timepoint}'
+        """
+        subject_fitbit_df = con.sql(query).fetchdf()
+        fitbit_metric_cols = [col for col in subject_fitbit_df.columns if col not in ["subject", "timepoint", "Wear_Time"]]
+        for col in fitbit_metric_cols:
+            subject_fitbit_df[col] = pd.to_numeric(subject_fitbit_df[col], errors="coerce")
+        feature_dict = {"subject": row.subject, "timepoint": row.timepoint}
+        for metric in fitbit_metric_cols:
+            # Check if the metric column exists in the group
+            if metric in subject_fitbit_df.columns:
+                daily_data = subject_fitbit_df[["Wear_Time", metric]].dropna()
+                if not daily_data.empty:
+                    # Create daily features (mean, std, min, max)
+                    daily_data.set_index("Wear_Time", inplace=True)
+                    daily_stats = daily_data.resample("D").agg(['mean', 'std', 'min', 'max'])
+                    daily_stats.columns = ['_'.join(col) for col in daily_stats.columns]
+                    # Create datetime index with proper missing days based on the daily resampling range
+                    daily_stats = daily_stats.dropna(how="all")
+                    min_date = daily_stats.index.min()
+                    max_date = daily_stats.index.max()
+                    date_range = pd.date_range(start=min_date, end=max_date, freq="D")
+                    # Reindex to include missing days and impute missing values with multiple imputation
+                    daily_stats = daily_stats.reindex(date_range)
+                    # Get percentage of missing values in the daily_stats DataFrame
+                    missing_percentage = daily_stats.isna().mean().mean() * 100
+                    if daily_stats.shape[0] > 1 and daily_stats.notna().sum().sum() > daily_stats.shape[1]:
+                        imputer = SimpleImputer(strategy="median")
+                        daily_stats = pd.DataFrame(
+                            imputer.fit_transform(daily_stats),
+                            index=daily_stats.index,
+                            columns=daily_stats.columns,
+                        )
+                    else:
+                        daily_stats = daily_stats.ffill().bfill()
+                    feature_dict.update(daily_stats.mean().to_dict())
+                    # STL decomposition on the imputed daily aggregate series.
+                    for agg in ["mean", "std", "min", "max"]:
+                        try:
+                            stl_input = daily_stats[f"{metric}_{agg}"].copy()
+                            stl_input.index = pd.to_datetime(stl_input.index)
+                            stl_input = stl_input.sort_index().asfreq("D")
+                            stl = STL(stl_input, period=7, robust=True)
+                            result = stl.fit()
+                            stl_features = {
+                                f"{metric}_{agg}_trend_mean": result.trend.mean(),
+                                f"{metric}_{agg}_trend_std": result.trend.std(),
+                                f"{metric}_{agg}_trend_min": result.trend.min(),
+                                f"{metric}_{agg}_trend_max": result.trend.max(),
+                                f"{metric}_{agg}_seasonal_mean": result.seasonal.mean(),
+                                f"{metric}_{agg}_seasonal_std": result.seasonal.std(),
+                                f"{metric}_{agg}_seasonal_min": result.seasonal.min(),
+                                f"{metric}_{agg}_seasonal_max": result.seasonal.max(),
+                                f"{metric}_{agg}_resid_mean": result.resid.mean(),
+                                f"{metric}_{agg}_resid_std": result.resid.std(),
+                                f"{metric}_{agg}_resid_min": result.resid.min(),
+                                f"{metric}_{agg}_resid_max": result.resid.max(),
+                            }
+                            feature_dict.update(stl_features)
+                            feature_dict.update({f"{metric}_missing_percentage": missing_percentage})
+                        except Exception as e:
+                            print(f"STL decomposition failed for subject {row.subject}, metric {metric}: {e}")
+        features_list.append(feature_dict)
+    fitbit_features_df = pd.DataFrame(features_list)
+    
+    fitbit_features_df.to_csv(Path("output")/ "fitbit_features.csv", index=False)
+
+    return fitbit_features_df
