@@ -274,15 +274,17 @@ covars = pd.DataFrame({
 })
 
 categorical_cols = ["sex"]
-batch_cols = ["scan_site"]
+continuous_cols = ["visit_age", "age_squared", "mr_y_smri__vol__aseg__icv_sum"]
+batch_col = "scan_site"
 
 for modality, feature_cols in feature_col_types:
     print(f"Conducting ComBat harmonization for {modality} features...")
     mri_data_combat = neuroCombat(
         dat=mri_data_filtered[feature_cols].transpose(), 
         covars=covars, 
-        batch_col=batch_cols, 
-        categorical_cols=categorical_cols
+        batch_col=batch_col, 
+        categorical_cols=categorical_cols,
+        continuous_cols=continuous_cols
     )
     # Transpose back to original shape
     mri_data_filtered[feature_cols] = mri_data_combat["data"].transpose()
