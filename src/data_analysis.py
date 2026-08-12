@@ -214,11 +214,11 @@ def exploratory_group_difference_analysis(
  
             # --- Point estimate on the real (non-resampled) data ---
             X_full = mri_data_filtered[full_cols]
-            gam_full = LinearGAM(s(0) + f(1) + l(2) + l(3) + l(4)).fit(X_full, y)
+            gam_full = LinearGAM(s(0) + f(1) + f(2) + l(3) + f(4)).fit(X_full, y)
             p_value = gam_full.statistics_["p_values"][group_term_index]
  
             X_nuisance = mri_data_filtered[nuisance_cols]
-            gam_nuisance = LinearGAM(s(0) + f(1) + l(2) + l(3)).fit(X_nuisance, y)
+            gam_nuisance = LinearGAM(s(0) + f(1) + f(2) + l(3)).fit(X_nuisance, y)
             adjusted_residuals = (y - gam_nuisance.predict(X_nuisance)).to_numpy()
  
             group_dep = adjusted_residuals[group_labels == 1]
@@ -240,7 +240,7 @@ def exploratory_group_difference_analysis(
 
                 try:
                     gam_boot = LinearGAM(
-                        s(0) + f(1) + l(2) + l(3)
+                        s(0) + f(1) + f(2) + l(3)
                     ).fit(X_boot, y_boot)
 
                     adjusted_boot = (

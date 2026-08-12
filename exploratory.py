@@ -277,17 +277,21 @@ categorical_cols = ["sex"]
 continuous_cols = ["visit_age", "age_squared", "mr_y_smri__vol__aseg__icv_sum"]
 batch_col = "scan_site"
 
-for modality, feature_cols in feature_col_types:
+confound_analysis_output_path = os.path.join(baseline_output_path, "confound_analysis_combat")
+if not os.path.exists(confound_analysis_output_path):
+    os.makedirs(confound_analysis_output_path)
+    
+for modality, feature_cols_loop in feature_col_types:
     print(f"Conducting ComBat harmonization for {modality} features...")
     mri_data_combat = neuroCombat(
-        dat=mri_data_filtered[feature_cols].transpose(), 
+        dat=mri_data_filtered[feature_cols_loop].transpose(), 
         covars=covars, 
         batch_col=batch_col, 
         categorical_cols=categorical_cols,
         continuous_cols=continuous_cols
     )
     # Transpose back to original shape
-    mri_data_filtered[feature_cols] = mri_data_combat["data"].transpose()
+    mri_data_filtered[feature_cols_loop] = mri_data_combat["data"].transpose()
 
     # Conduct confound analysis pre and post harmonization
     base_terms = [
@@ -302,9 +306,9 @@ for modality, feature_cols in feature_col_types:
         "Site": "C(scan_site)",
         "TIV": "mr_y_smri__vol__aseg__icv_sum"
     }
-    summary_combat, wilcoxon_results_combat = confound_analysis(mri_data_pre_combat, mri_data_filtered, feature_cols, base_terms, confounds)
-    summary_combat.to_csv(os.path.join(baseline_output_path, f"confound_analysis_combat_{modality.replace(' ', '_')}.csv"), index=False)
-    wilcoxon_results_combat.to_csv(os.path.join(baseline_output_path, f"wilcoxon_results_combat_{modality.replace(' ', '_')}.csv"), index=False)
+    summary_combat, wilcoxon_results_combat = confound_analysis(mri_data_pre_combat, mri_data_filtered, feature_cols_loop, base_terms, confounds)
+    summary_combat.to_csv(os.path.join(confound_analysis_output_path, f"confound_analysis_combat_{modality.replace(' ', '_')}.csv"), index=False)
+    wilcoxon_results_combat.to_csv(os.path.join(confound_analysis_output_path, f"wilcoxon_results_combat_{modality.replace(' ', '_')}.csv"), index=False)
 
 # Do group difference analysis
 mri_dep_y_sig, mri_dep_y_all = exploratory_group_difference_analysis(mri_data_filtered, "mh_y_ksads__dep__mdd__pres_dx", 
