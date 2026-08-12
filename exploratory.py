@@ -242,10 +242,27 @@ print(depressed_both["visit_age"].describe())
 print(depressed_both["visit_age"].std())
 
 # Conduct site harmonization using ComBat for all MRI features in mri_data_filtered
-# Prepare data for ComBat 
+# Keep a copy of the data before ComBat harmonization for confound analysis
+mri_data_pre_combat = mri_data_filtered.copy() 
+
+# Get feature cols per imaging modality
 feature_cols = mri_data.columns.difference(["participant_id", "session_id"])
-mri_data_pre_combat = mri_data_filtered.copy()
-mri_data_combat = mri_data_filtered[feature_cols].transpose()  # Transpose to have features as rows and subjects as columns
+feature_cols_vol = [mri for mri in feature_cols if "mr_y_smri__vol" in mri]
+feature_cols_thk = [mri for mri in feature_cols if "mr_y_smri__thk" in mri]
+feature_cols_fa = [mri for mri in feature_cols if "mr_y_dti__fs__fa__at" in mri]
+feature_cols_wm = [mri for mri in feature_cols if "mr_y_dti__fs__fa__wm" in mri]
+feature_cols_gpnet_aseg = [mri for mri in feature_cols if "mr_y_rsfmri__corr__gpnet__aseg" in mri]
+feature_cols_gpnet = [mri for mri in feature_cols if "mr_y_rsfmri__corr__gpnet" in mri and "aseg" not in mri]
+
+# Create list of feature column types to iterate over
+feature_col_types = [
+    ("Volume", feature_cols_vol),
+    ("Cortical Thickness", feature_cols_thk),
+    ("Fractional Anisotropy", feature_cols_fa),
+    ("Fractional Anisotropy White Matter", feature_cols_wm),
+    ("Gordon Network to Subcortical Correlations", feature_cols_gpnet_aseg),
+    ("Gordon Network Correlations", feature_cols_gpnet)
+]
 
 # Define covariates for ComBat
 covars = pd.DataFrame({
@@ -259,33 +276,33 @@ covars = pd.DataFrame({
 categorical_cols = ["sex"]
 batch_cols = ["scan_site"]
 
-# Harmonize
-mri_data_combat = neuroCombat(
-                    dat=mri_data_combat, 
-                    covars=covars, 
-                    batch_col=batch_cols, 
-                    categorical_cols=categorical_cols
-                    )
+for modality, feature_cols in feature_col_types:
+    print(f"Conducting ComBat harmonization for {modality} features...")
+    mri_data_combat = neuroCombat(
+        dat=mri_data_filtered[feature_cols].transpose(), 
+        covars=covars, 
+        batch_col=batch_cols, 
+        categorical_cols=categorical_cols
+    )
+    # Transpose back to original shape
+    mri_data_filtered[feature_cols] = mri_data_combat["data"].transpose()
 
-# Transpose back to original shape
-mri_data_filtered[feature_cols] = mri_data_combat["data"].transpose()
-
-# Conduct confound analysis pre and post harmonization
-base_terms = [
-    "bs(visit_age, df=4)",
-    "C(sex)",
-    "C(scan_site)",
-    "mr_y_smri__vol__aseg__icv_sum"
-]
-confounds = {
-    "Age": "bs(visit_age, df=4)",
-    "Sex": "C(sex)",
-    "Site": "C(scan_site)",
-    "TIV": "mr_y_smri__vol__aseg__icv_sum"
-}
-summary_combat, wilcoxon_results_combat = confound_analysis(mri_data_pre_combat, mri_data_filtered, feature_cols, base_terms, confounds)
-summary_combat.to_csv(os.path.join(baseline_output_path, "confound_analysis_combat.csv"), index=False)
-wilcoxon_results_combat.to_csv(os.path.join(baseline_output_path, "wilcoxon_results_combat.csv"), index=False)
+    # Conduct confound analysis pre and post harmonization
+    base_terms = [
+        "bs(visit_age, df=4)",
+        "C(sex)",
+        "C(scan_site)",
+        "mr_y_smri__vol__aseg__icv_sum"
+    ]
+    confounds = {
+        "Age": "bs(visit_age, df=4)",
+        "Sex": "C(sex)",
+        "Site": "C(scan_site)",
+        "TIV": "mr_y_smri__vol__aseg__icv_sum"
+    }
+    summary_combat, wilcoxon_results_combat = confound_analysis(mri_data_pre_combat, mri_data_filtered, feature_cols, base_terms, confounds)
+    summary_combat.to_csv(os.path.join(baseline_output_path, f"confound_analysis_combat_{modality.replace(' ', '_')}.csv"), index=False)
+    wilcoxon_results_combat.to_csv(os.path.join(baseline_output_path, f"wilcoxon_results_combat_{modality.replace(' ', '_')}.csv"), index=False)
 
 # Do group difference analysis
 mri_dep_y_sig, mri_dep_y_all = exploratory_group_difference_analysis(mri_data_filtered, "mh_y_ksads__dep__mdd__pres_dx", 
