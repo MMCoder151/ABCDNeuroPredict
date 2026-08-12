@@ -102,6 +102,7 @@ num_unique_subject_timepoints_both = ksads_mdd_combined_both[["participant_id", 
 print(f"Number of unique subject timepoint pairs with both youth and parent KSADS questionnaires: {num_unique_subject_timepoints_both}")
 
 # For subjects with multiple timepoints, keep only the one with depression diagnosis in either parent or youth KSADS or the first timepoint if no diagnosis is present
+sub_late_diagnosis = []
 for subject in ksads_mdd_combined_both.groupby("participant_id")["participant_id"]:
     subject_id = subject[0]
     subject_data = ksads_mdd_combined_both[ksads_mdd_combined_both["participant_id"] == subject_id]
@@ -110,6 +111,7 @@ for subject in ksads_mdd_combined_both.groupby("participant_id")["participant_id
         if (subject_data["mh_y_ksads__dep__mdd__pres_dx"] == 1).any() or (subject_data["mh_p_ksads__dep__mdd__pres_dx"] == 1).any():
             ksads_mdd_combined_both = ksads_mdd_combined_both.drop(subject_data.index)
             ksads_mdd_combined_both = pd.concat([ksads_mdd_combined_both, subject_data[(subject_data["mh_y_ksads__dep__mdd__pres_dx"] == 1) | (subject_data["mh_p_ksads__dep__mdd__pres_dx"] == 1)]])
+            sub_late_diagnosis.append(subject_id)
         else:
             ksads_mdd_combined_both = ksads_mdd_combined_both.drop(subject_data.index)
             ksads_mdd_combined_both = pd.concat([ksads_mdd_combined_both, subject_data.iloc[[0]]])
@@ -174,6 +176,22 @@ mri_data_filtered.to_csv(os.path.join(baseline_output_path, "mri_data_filtered.c
 # Optional: Reimport mri_data_filtered
 mri_data_filtered = pd.read_csv(os.path.join(baseline_output_path, "mri_data_filtered.csv"))
 
+# Print age and sex distribution of subjects in mri_data_filtered
+print("Age and sex distribution of subjects in mri_data_filtered:")
+sex_distribution = mri_data_filtered["sex"].value_counts()
+print(sex_distribution)
+age_distribution = mri_data_filtered["visit_age"].describe()
+print(age_distribution)
+age_std = mri_data_filtered["visit_age"].std()
+print(age_std)
+
+# Print age and sex distribution of subjects with a late diagnosis of depression according to youth and parent KSADS questionnaires
+print("Age and sex distribution of subjects with a late diagnosis of depression according to youth and parent KSADS questionnaires:")
+late_diagnosis_df = mri_data_filtered[mri_data_filtered["participant_id"].isin(sub_late_diagnosis)]
+print(late_diagnosis_df["sex"].value_counts())
+print(late_diagnosis_df["visit_age"].describe())
+print(late_diagnosis_df["visit_age"].std())
+
 # Conduct outlier detection using Isolation Forest on the MRI data of only healthy subjects (no depression diagnosis according to both KSADS questionnaire)
 healthy_subjects = mri_data_filtered[(mri_data_filtered["mh_y_ksads__dep__mdd__pres_dx"] == 0) & (mri_data_filtered["mh_p_ksads__dep__mdd__pres_dx"] == 0)]
 # Select only numeric columns for outlier detection
@@ -194,6 +212,34 @@ imputer = SimpleImputer(strategy="median")
 numeric_cols = mri_data_filtered.select_dtypes(include=["float64", "int64"]).columns
 # Assign the raw numpy array directly — purely positional, no index alignment risk
 mri_data_filtered[numeric_cols] = imputer.fit_transform(mri_data_filtered[numeric_cols])
+
+# Print age and sex distribution of all subjects
+print("Age and sex distribution of all subjects after outlier removal:")
+sex_distribution = mri_data_filtered["sex"].value_counts()
+print(sex_distribution)
+age_distribution = mri_data_filtered["visit_age"].describe()
+print(age_distribution)
+age_std = mri_data_filtered["visit_age"].std()
+print(age_std)
+
+# Print age and sex distribution of depressed subjects according to youth and parent KSADS questionnaires
+print("Age and sex distribution of depressed subjects according to youth KSADS questionnaire:")
+depressed_youth = mri_data_filtered[mri_data_filtered["mh_y_ksads__dep__mdd__pres_dx"] == 1]
+print(depressed_youth["sex"].value_counts())
+print(depressed_youth["visit_age"].describe())
+print(depressed_youth["visit_age"].std())
+
+print("Age and sex distribution of depressed subjects according to parent KSADS questionnaire:")
+depressed_parent = mri_data_filtered[mri_data_filtered["mh_p_ksads__dep__mdd__pres_dx"] == 1]
+print(depressed_parent["sex"].value_counts())
+print(depressed_parent["visit_age"].describe())
+print(depressed_parent["visit_age"].std())
+
+print("Age and sex distribution of depressed subjects according to both youth and parent KSADS questionnaires:")
+depressed_both = mri_data_filtered[(mri_data_filtered["mh_y_ksads__dep__mdd__pres_dx"] == 1) & (mri_data_filtered["mh_p_ksads__dep__mdd__pres_dx"] == 1)]
+print(depressed_both["sex"].value_counts())
+print(depressed_both["visit_age"].describe())
+print(depressed_both["visit_age"].std())
 
 # Conduct site harmonization using ComBat for all MRI features in mri_data_filtered
 # Prepare data for ComBat 
@@ -257,11 +303,11 @@ mri_dep_p_sig_filtered = mri_dep_p_sig[abs(mri_dep_p_sig["effect_size"]) > 0.2]
 print(f"Number of significant ROIs after filtering by effect size (youth): {mri_dep_y_sig_filtered.shape[0]}")
 print(f"Number of significant ROIs after filtering by effect size (parent): {mri_dep_p_sig_filtered.shape[0]}")
 
-# Print effect sizes and standard deviations for filtered significant ROIs
+# Print corrected p value, effect sizes and standard deviations for filtered significant ROIs
 print("Effect sizes and standard deviations for filtered significant ROIs (youth):")
-print(mri_dep_y_sig_filtered[["feature", "effect_size", "effect_size_std"]])
+print(mri_dep_y_sig_filtered[["feature", "corrected_p_value", "effect_size", "effect_size_std", "effect_size_std_boot"]])
 print("Effect sizes and standard deviations for filtered significant ROIs (parent):")
-print(mri_dep_p_sig_filtered[["feature", "effect_size", "effect_size_std"]])
+print(mri_dep_p_sig_filtered[["feature", "corrected_p_value", "effect_size", "effect_size_std", "effect_size_std_boot"]])
 
 # Get the list of filtered significant ROIs for both youth and parent
 mri_dep_y_sig_filtered_rois = mri_dep_y_sig_filtered["feature"].tolist()
@@ -273,15 +319,6 @@ print(f"Overlapping significant ROIs between youth and parent: {mri_dep_sig_filt
 # Get difference in effect sizes for overlapping significant ROIs between youth and parent
 mri_dep_sig_filtered_overlap_df = pd.merge(mri_dep_y_sig_filtered[["feature", "effect_size", "effect_size_std"]], mri_dep_p_sig_filtered[["feature", "effect_size", "effect_size_std"]], on="feature", suffixes=("_youth", "_parent"))
 mri_dep_sig_filtered_overlap_df["effect_size_diff"] = mri_dep_sig_filtered_overlap_df["effect_size_youth"] - mri_dep_sig_filtered_overlap_df["effect_size_parent"]
-
-# Print age and sex distribution of all subjects
-print("Age and sex distribution of all subjects:")
-sex_distribution = mri_data_filtered["sex"].value_counts()
-print(sex_distribution)
-age_distribution = mri_data_filtered["visit_age"].describe()
-print(age_distribution)
-age_sex_distribution = mri_data_filtered.groupby("sex")["visit_age"].describe()
-print(age_sex_distribution)
 
 # Compute correlation matrix for significant ROIs for youth and parent
 mri_dep_y_sig_corr = mri_data_filtered[mri_dep_y_sig_filtered_rois].corr()
@@ -558,6 +595,31 @@ existing_pairs_with_dep_p = existing_pairs_with_dep_p[existing_pairs_with_dep_p[
 print(f"Number of existing subject timepoint pairs in fit_meta_df with depression diagnosis according to youth KSADS questionnaire: {existing_pairs_with_dep_y.shape[0]}")
 print(f"Number of existing subject timepoint pairs in fit_meta_df with depression diagnosis according to parent KSADS questionnaire: {existing_pairs_with_dep_p.shape[0]}")
 
+# Print age and sex distribution of subjects in existing_pairs
+existing_pairs_with_demographics = pd.merge(existing_pairs, mri_data_filtered[["participant_id", "visit_age", "sex", "mh_y_ksads__dep__mdd__pres_dx", "mh_p_ksads__dep__mdd__pres_dx"]], left_on="subject", right_on="participant_id", how="inner")
+print("Age and sex distribution of subjects in existing_pairs:")
+print(existing_pairs_with_demographics["sex"].value_counts())
+print(existing_pairs_with_demographics["visit_age"].describe())
+print(existing_pairs_with_demographics["visit_age"].std())
+
+print("Age and sex distribution of subjects in existing_pairs with depression diagnosis according to youth KSADS questionnaire:")
+depressed_youth = existing_pairs_with_demographics[existing_pairs_with_demographics["mh_y_ksads__dep__mdd__pres_dx"] == 1]
+print(depressed_youth["sex"].value_counts())
+print(depressed_youth["visit_age"].describe())
+print(depressed_youth["visit_age"].std())
+
+print("Age and sex distribution of subjects in existing_pairs with depression diagnosis according to parent KSADS questionnaire:")
+depressed_parent = existing_pairs_with_demographics[existing_pairs_with_demographics["mh_p_ksads__dep__mdd__pres_dx"] == 1]
+print(depressed_parent["sex"].value_counts())
+print(depressed_parent["visit_age"].describe())
+print(depressed_parent["visit_age"].std())
+
+print("Age and sex distribution of subjects in existing_pairs with depression diagnosis according to both youth and parent KSADS questionnaires:")
+depressed_both = existing_pairs_with_demographics[(existing_pairs_with_demographics["mh_y_ksads__dep__mdd__pres_dx"] == 1) & (existing_pairs_with_demographics["mh_p_ksads__dep__mdd__pres_dx"] == 1)]
+print(depressed_both["sex"].value_counts())
+print(depressed_both["visit_age"].describe())
+print(depressed_both["visit_age"].std())
+
 # Extract fitbit features for subject timepoint pairs in the filtered mri dataset
 fitbit_features = extract_fitbit_features_2(con, existing_pairs, output_path=os.path.join(baseline_output_path, "fitbit_features.csv"), overwrite=True)
 fitbit_features.to_csv(os.path.join(baseline_output_path, "fitbit_features.csv"), index=False)
@@ -627,11 +689,11 @@ features = fitbit_features_filtered_imputed.merge(
 fitbit_dep_y_sig, fitbit_dep_y_all = exploratory_group_difference_analysis_fitbit(features, "mh_y_ksads__dep__mdd__pres_dx", 
                                                                      os.path.join(baseline_output_path, "fitbit_dep_y_results.csv"), 
                                                                      output_path_sig=os.path.join(baseline_output_path, "fitbit_dep_y_results_sig.csv"),
-                                                                     overwrite=True)
+                                                                     overwrite=False)
 fitbit_dep_p_sig, fitbit_dep_p_all = exploratory_group_difference_analysis_fitbit(features, "mh_p_ksads__dep__mdd__pres_dx", 
                                                                      os.path.join(baseline_output_path, "fitbit_dep_p_results.csv"), 
                                                                      output_path_sig=os.path.join(baseline_output_path, "fitbit_dep_p_results_sig.csv"),
-                                                                     overwrite=True)
+                                                                     overwrite=False)
 
 # Filter significant fitbit features to only include those with an absolute effect size >0.2
 fitbit_dep_y_sig_filtered = fitbit_dep_y_sig[abs(fitbit_dep_y_sig["effect_size"]) > 0.2]
@@ -898,8 +960,6 @@ reg_y_test_y = z_scores_y_composites[z_scores_y_composites["subject_ids"].isin(t
 reg_y_train_p = z_scores_p_composites[z_scores_p_composites["subject_ids"].isin(train_subjects_p)][["subject_ids", "z_score_composite"]].copy()
 reg_y_test_p = z_scores_p_composites[z_scores_p_composites["subject_ids"].isin(test_subjects_p)][["subject_ids", "z_score_composite"]].copy()
 
-# NOTE: Are confounding variables included in the regression model? If not TODO: Include confounding variables in the regression model to control for their effects on the z-score composite.
-
 # Add classification labels to regression targets for stratification during training
 y_train_y_df = pd.DataFrame({"subject_ids": train_subjects_y.values, "label": y_train_y.values})
 reg_y_train_y = reg_y_train_y.merge(y_train_y_df,on="subject_ids",how="left")
@@ -936,12 +996,6 @@ print(reg_y_train_p["label"].value_counts())
 print("Class distribution for regression targets (parent) in testing set:")
 print(reg_y_test_p["label"].value_counts())
 
-# Resample the training set to address class imbalance using random oversampler for regression targets
-oversampler = RandomOverSampler(random_state=42)
-X_res, labels_res = oversampler.fit_resample(X_train, reg_y_train["label"])
-indices = oversampler.sample_indices_
-y_res = reg_y_train["z_score_composite"].iloc[indices]
-
 # YOUTH MODEL 
 # Train final regression model for youth z-score composite
 final_reg_model_y, best_hyperparams_reg_y, train_predictions_reg_y = train_final_regression_model(
@@ -957,6 +1011,13 @@ train_predictions_reg_df_y = pd.DataFrame(train_predictions_reg_y, columns=["pre
 train_predictions_reg_df_y["true_z_score_composite"] = reg_y_train_y["z_score_composite"].values
 train_predictions_reg_df_y.to_csv(os.path.join(baseline_output_path, "train_predictions_reg_y.csv"), index=False)
 
+# Calculate performance metrics for youth z-score composite regression on training set
+mse_train_reg_y = mean_squared_error(reg_y_train_y["z_score_composite"], train_predictions_reg_y)
+r2_train_reg_y = r2_score(reg_y_train_y["z_score_composite"], train_predictions_reg_y)
+print(f"Performance metrics for youth z-score composite regression (training set):")
+print(f"MSE: {mse_train_reg_y:.4f}")
+print(f"R^2: {r2_train_reg_y:.4f}")
+
 # Get predictions on the test set for youth z-score composite
 test_predictions_reg_y = final_reg_model_y.predict(X_test_y.drop(columns=["participant_id"], errors="ignore"))
 test_predictions_reg_df_y = pd.DataFrame(test_predictions_reg_y, columns=["predicted_z_score_composite"])
@@ -971,9 +1032,15 @@ print(f"MSE: {mse_reg_y:.4f}")
 print(f"R^2: {r2_reg_y:.4f}")
 
 # Train regression model using resampled data to address class imbalance for youth z-score composite
+oversampler_y = RandomOverSampler(random_state=42)
+X_train_y_numeric = X_train_y.drop(columns=["participant_id"], errors="ignore")
+X_res_y, labels_res_y = oversampler_y.fit_resample(X_train_y_numeric, reg_y_train_y["label"])
+indices_y = oversampler_y.sample_indices_
+reg_y_train_y_resampled = reg_y_train_y.iloc[indices_y].reset_index(drop=True)
+
 final_reg_model_y_resampled, best_hyperparams_reg_y_resampled, train_predictions_reg_y_resampled = train_final_regression_model(
-    X_train_y_resampled_reg,
-    reg_y_train_y_resampled[["z_score_composite", "label"]].squeeze(),
+    X_res_y,
+    reg_y_train_y_resampled[["z_score_composite", "label"]],
     model="SVR"
 )
 
@@ -983,6 +1050,13 @@ joblib.dump(best_hyperparams_reg_y_resampled, os.path.join(baseline_output_path,
 train_predictions_reg_df_y_resampled = pd.DataFrame(train_predictions_reg_y_resampled, columns=["predicted_z_score_composite"])
 train_predictions_reg_df_y_resampled["true_z_score_composite"] = reg_y_train_y_resampled["z_score_composite"].values
 train_predictions_reg_df_y_resampled.to_csv(os.path.join(baseline_output_path, "train_predictions_reg_y_resampled.csv"), index=False)
+
+# Calculate performance metrics for resampled youth z-score composite regression on training set
+mse_train_reg_y_resampled = mean_squared_error(reg_y_train_y_resampled["z_score_composite"], train_predictions_reg_y_resampled)
+r2_train_reg_y_resampled = r2_score(reg_y_train_y_resampled["z_score_composite"], train_predictions_reg_y_resampled)
+print(f"Performance metrics for resampled youth z-score composite regression (training set):")
+print(f"MSE: {mse_train_reg_y_resampled:.4f}")
+print(f"R^2: {r2_train_reg_y_resampled:.4f}")
 
 # Get predictions on the test set for resampled youth z-score composite
 test_predictions_reg_y_resampled = final_reg_model_y_resampled.predict(X_test_y.drop(columns=["participant_id"], errors="ignore"))
@@ -1026,9 +1100,15 @@ print(f"MSE: {mse_reg_p:.4f}")
 print(f"R^2: {r2_reg_p:.4f}")
 
 # Train regression model using resampled data to address class imbalance for parent z-score composite
+oversampler_p = RandomOverSampler(random_state=42)
+X_train_p_numeric = X_train_p.drop(columns=["participant_id"], errors="ignore")
+X_res_p, labels_res_p = oversampler_p.fit_resample(X_train_p_numeric, reg_y_train_p["label"])
+indices_p = oversampler_p.sample_indices_
+reg_y_train_p_resampled = reg_y_train_p.iloc[indices_p].reset_index(drop=True)
+
 final_reg_model_p_resampled, best_hyperparams_reg_p_resampled, train_predictions_reg_p_resampled = train_final_regression_model(
-    X_train_p_resampled_reg,
-    reg_y_train_p_resampled[["z_score_composite", "label"]].squeeze(),
+    X_res_p,
+    reg_y_train_p_resampled[["z_score_composite", "label"]],
     model="SVR"
 )
 
