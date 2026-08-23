@@ -207,6 +207,18 @@ print(f"Number of outliers detected: {(outlier_preds == -1).sum()}")
 outliers = healthy_subjects[healthy_subjects["outlier"] == -1]["participant_id"].tolist()
 mri_data_filtered = mri_data_filtered[~mri_data_filtered["participant_id"].isin(outliers)]
 
+# Print percentage of missing data 
+missing_data_percentage = mri_data_filtered.isnull().mean() * 100
+missing_data_percentage.sort_values(ascending=False, inplace=True)
+print(f"Percentage of missing data: {missing_data_percentage.mean():.2f}% (SD={missing_data_percentage.std():.2f})")
+
+# Check if any demographic columns had missing data
+demographic_cols = confound_df.columns
+missing_demographic_data = confound_df[demographic_cols].isnull().sum()
+if missing_demographic_data.sum() > 0:
+    print("Missing data in demographic columns:")
+    print(missing_demographic_data[missing_demographic_data > 0])
+
 # Impute missing values in mri_data_filtered using the median
 imputer = SimpleImputer(strategy="median")
 numeric_cols = mri_data_filtered.select_dtypes(include=["float64", "int64"]).columns
@@ -247,21 +259,15 @@ mri_data_pre_combat = mri_data_filtered.copy()
 
 # Get feature cols per imaging modality
 feature_cols = mri_data.columns.difference(["participant_id", "session_id"])
-feature_cols_vol = [mri for mri in feature_cols if "mr_y_smri__vol" in mri]
-feature_cols_thk = [mri for mri in feature_cols if "mr_y_smri__thk" in mri]
-feature_cols_fa = [mri for mri in feature_cols if "mr_y_dti__fs__fa__at" in mri]
-feature_cols_wm = [mri for mri in feature_cols if "mr_y_dti__fs__fa__wm" in mri]
-feature_cols_gpnet_aseg = [mri for mri in feature_cols if "mr_y_rsfmri__corr__gpnet__aseg" in mri]
-feature_cols_gpnet = [mri for mri in feature_cols if "mr_y_rsfmri__corr__gpnet" in mri and "aseg" not in mri]
+feature_cols_struct = [mri for mri in feature_cols if "mr_y_smri__vol" in mri or "mr_y_smri__thk" in mri]
+feature_cols_diff = [mri for mri in feature_cols if "mr_y_dti__fs__fa" in mri]
+feature_cols_gpnet = [mri for mri in feature_cols if "mr_y_rsfmri__corr__gpnet" in mri]
 
 # Create list of feature column types to iterate over
 feature_col_types = [
-    ("Volume", feature_cols_vol),
-    ("Cortical Thickness", feature_cols_thk),
-    ("Fractional Anisotropy", feature_cols_fa),
-    ("Fractional Anisotropy White Matter", feature_cols_wm),
-    ("Gordon Network to Subcortical Correlations", feature_cols_gpnet_aseg),
-    ("Gordon Network Correlations", feature_cols_gpnet)
+    ("Structural", feature_cols_struct),
+    ("Diffusion", feature_cols_diff),
+    ("Gordon Network", feature_cols_gpnet)
 ]
 
 # Define covariates for ComBat
@@ -589,9 +595,6 @@ z_scores_p_composites["z_score_composite"] = z_scores_p_composites.drop(columns=
 # TODO: REDO PLOTTING AS VIOLIN PLOT DOESNT MAKE SENSE WITH Z-SCORES AS THE HEALTHY POPULATION IS NORMALZED
 # INSTEAD DO LINE PLOT WITH REFERENCE LINE FOR HEALTHY POPULATION SORTED ASCENDING
 
-# Check association between z-score composite and depression symptom load for youth and parent
-# TODO: Implement
-
 # EXTRACT FITBIT FEATURES
 # Filter subjects based on inclusion criteria and extract metadata
 fit_meta_df = filter_subjects(dta_path, test=False, overwrite=False)
@@ -693,38 +696,13 @@ num_depressed_parent = labels["mh_p_ksads__dep__mdd__pres_dx"].sum()
 print(f"Number of subjects with depression diagnosis in fitbit data according to youth KSADS questionnaire: {num_depressed_youth}")
 print(f"Number of subjects with depression diagnosis in fitbit data according to parent KSADS questionnaire: {num_depressed_parent}")
 
-# Impute missing values in fitbit features using median imputation
-fitbit_features_filtered_imputed = fitbit_features_filtered.drop(columns=["subject", "timepoint", "session_id", "participant_id"], errors="ignore").copy()
-imputer = SimpleImputer(strategy="median")
-fitbit_features_filtered_imputed = pd.DataFrame(imputer.fit_transform(fitbit_features_filtered_imputed), columns=fitbit_features_filtered_imputed.columns)
-fitbit_features_filtered_imputed["participant_id"] = fitbit_features_filtered["participant_id"].values
-
 # Add age and sex to the fitbit features for classification
-features = fitbit_features_filtered_imputed.merge(
+features = fitbit_features_filtered.merge(
     mri_data_filtered[["participant_id", "visit_age", "sex", "scan_site"]],
     left_on="participant_id",
     right_on="participant_id",
     how="left"
 )
-
-# EXPLORATORY GROUP DIFFERENCE ANALYSIS ON FITBIT FEATURES
-# Conduct exploratory group difference analysis on fitbit features for youth and parent depression diagnosis
-fitbit_dep_y_sig, fitbit_dep_y_all = exploratory_group_difference_analysis_fitbit(features, "mh_y_ksads__dep__mdd__pres_dx", 
-                                                                     os.path.join(baseline_output_path, "fitbit_dep_y_results.csv"), 
-                                                                     output_path_sig=os.path.join(baseline_output_path, "fitbit_dep_y_results_sig.csv"),
-                                                                     overwrite=False)
-fitbit_dep_p_sig, fitbit_dep_p_all = exploratory_group_difference_analysis_fitbit(features, "mh_p_ksads__dep__mdd__pres_dx", 
-                                                                     os.path.join(baseline_output_path, "fitbit_dep_p_results.csv"), 
-                                                                     output_path_sig=os.path.join(baseline_output_path, "fitbit_dep_p_results_sig.csv"),
-                                                                     overwrite=False)
-
-# Filter significant fitbit features to only include those with an absolute effect size >0.2
-fitbit_dep_y_sig_filtered = fitbit_dep_y_sig[abs(fitbit_dep_y_sig["effect_size"]) > 0.2]
-fitbit_dep_p_sig_filtered = fitbit_dep_p_sig[abs(fitbit_dep_p_sig["effect_size"]) > 0.2]
-print(f"Number of significant fitbit features after filtering by effect size (youth): {fitbit_dep_y_sig_filtered.shape[0]}")
-print(f"Number of significant fitbit features after filtering by effect size (parent): {fitbit_dep_p_sig_filtered.shape[0]}")
-
-# NOTE: This analysis did not result in any significant fitbit features at all. 
 
 # BASELINE CLASSIFICATION
 # Prepare data for classification
@@ -761,6 +739,18 @@ print(y_train_p.value_counts())
 print("Class distribution for parent labels (testing set):")
 print(y_test_p.value_counts())
 
+# Drop redundant columns
+redundant_cols = ["session_id", "subject", "timepoint"]
+for col in redundant_cols:
+    if col in X_train_y.columns:
+        X_train_y.drop(columns=[col], inplace=True)
+    if col in X_test_y.columns:
+        X_test_y.drop(columns=[col], inplace=True)
+    if col in X_train_p.columns:
+        X_train_p.drop(columns=[col], inplace=True)
+    if col in X_test_p.columns:
+        X_test_p.drop(columns=[col], inplace=True)
+
 # Resample the training set to address class imbalance using random oversampler
 resampler = RandomOverSampler(random_state=42)
 X_train_y_resampled, y_train_y_resampled = resampler.fit_resample(X_train_y.drop(columns=["participant_id"], errors="ignore"), y_train_y)
@@ -777,36 +767,35 @@ print(pd.Series(y_train_p_resampled).value_counts())
 final_model_y, best_hyperparams_y, train_predictions_y = train_final_model(
     X_train_y.drop(columns=["participant_id"], errors="ignore"),
     y_train_y,
-    model="SVM"
+    model="SVM",
+    inner_splits=5,
+    outer_splits=5
 )
 
 # Save final model, hyperparameters and predictions
 joblib.dump(final_model_y, os.path.join(baseline_output_path, "final_model_y.joblib"))
 joblib.dump(best_hyperparams_y, os.path.join(baseline_output_path, "best_hyperparams_y.json"))
-train_predictions_df = pd.DataFrame(train_predictions_y, columns=["predicted_label"])
-train_predictions_df["true_label"] = y_train_y.values
-train_predictions_df.to_csv(os.path.join(baseline_output_path, "train_predictions_y.csv"), index=False)
+train_predictions_df_y = pd.DataFrame(train_predictions_y, columns=["predicted_proba"])
+train_predictions_df_y["predicted_label"] = final_model_y.predict(X_train_y.drop(columns=["participant_id"], errors="ignore"))
+train_predictions_df_y["true_label"] = y_train_y.values
+train_predictions_df_y.to_csv(os.path.join(baseline_output_path, "train_predictions_y.csv"), index=False)
 
 # Optional: reimport final model for evaluation
 final_model_y = joblib.load(os.path.join(baseline_output_path, "final_model_y.joblib"))
 
-# Calculate performance metrics for youth labels on training set
-auc_train_y = roc_auc_score(y_train_y, final_model_y.decision_function(X_train_y.drop(columns=["participant_id"], errors="ignore")))
-print(f"Performance metrics for youth labels (training set):")
-print(f"AUC: {auc_train_y:.4f}")
-
 # Get predictions on the test set for youth labels
-test_predictions_y = final_model_y.predict(X_test_y.drop(columns=["participant_id"], errors="ignore"))
-test_predictions_df_y = pd.DataFrame(test_predictions_y, columns=["predicted_label"])
+test_predictions_y = final_model_y.predict_proba(X_test_y.drop(columns=["participant_id"], errors="ignore"))
+test_predictions_df_y = pd.DataFrame({"predicted_proba": test_predictions_y[:, 1]})
+test_predictions_df_y["predicted_label"] = final_model_y.predict(X_test_y.drop(columns=["participant_id"], errors="ignore"))
 test_predictions_df_y["true_label"] = y_test_y.values
 test_predictions_df_y.to_csv(os.path.join(baseline_output_path, "test_predictions_y.csv"), index=False)
 
 # Calculate performance metrics for youth labels
 auc_y = roc_auc_score(y_test_y, final_model_y.decision_function(X_test_y.drop(columns=["participant_id"], errors="ignore")))
-f1_y = f1_score(y_test_y, test_predictions_y)
-accuracy_y = accuracy_score(y_test_y, test_predictions_y)
-precision_y = precision_score(y_test_y, test_predictions_y)
-print(f"Performance metrics for youth labels:")
+f1_y = f1_score(y_test_y, test_predictions_df_y["predicted_label"])
+accuracy_y = accuracy_score(y_test_y, test_predictions_df_y["predicted_label"])
+precision_y = precision_score(y_test_y, test_predictions_df_y["predicted_label"])
+print(f"Performance metrics for youth labels on the test set:")
 print(f"AUC: {auc_y:.4f}")
 print(f"F1 Score: {f1_y:.4f}")
 print(f"Accuracy: {accuracy_y:.4f}")
@@ -827,36 +816,35 @@ plt.close()
 final_model_y_resampled, best_hyperparams_y_resampled, train_predictions_y_resampled = train_final_model(
     X_train_y_resampled,
     y_train_y_resampled,
-    model="SVM"
+    model="SVM",
+    inner_splits=5,
+    outer_splits=5
 )
 
 # Save final model, hyperparameters and predictions for resampled youth model
 joblib.dump(final_model_y_resampled, os.path.join(baseline_output_path, "final_model_y_resampled.joblib"))
 joblib.dump(best_hyperparams_y_resampled, os.path.join(baseline_output_path, "best_hyperparams_y_resampled.json"))
-train_predictions_df_y_resampled = pd.DataFrame(train_predictions_y_resampled, columns=["predicted_label"])
+train_predictions_df_y_resampled = pd.DataFrame(train_predictions_y_resampled, columns=["predicted_proba"])
+train_predictions_df_y_resampled["predicted_label"] = final_model_y_resampled.predict(X_train_y_resampled)
 train_predictions_df_y_resampled["true_label"] = y_train_y_resampled.values
 train_predictions_df_y_resampled.to_csv(os.path.join(baseline_output_path, "train_predictions_y_resampled.csv"), index=False)
 
 # Optional: reimport final model for evaluation
 final_model_y_resampled = joblib.load(os.path.join(baseline_output_path, "final_model_y_resampled.joblib"))
 
-# Calculate performance metrics for resampled youth model on training set
-auc_train_y_resampled = roc_auc_score(y_train_y_resampled, final_model_y_resampled.decision_function(X_train_y_resampled))
-print(f"Performance metrics for resampled youth model (training set):")
-print(f"AUC: {auc_train_y_resampled:.4f}")
-
 # Get predictions on the test set for resampled youth model
-test_predictions_y_resampled = final_model_y_resampled.predict(X_test_y.drop(columns=["participant_id"], errors="ignore"))
-test_predictions_df_y_resampled = pd.DataFrame(test_predictions_y_resampled, columns=["predicted_label"])
+test_predictions_y_resampled = final_model_y_resampled.predict_proba(X_test_y.drop(columns=["participant_id"], errors="ignore"))
+test_predictions_df_y_resampled = pd.DataFrame({"predicted_proba": test_predictions_y_resampled[:, 1]})
+test_predictions_df_y_resampled["predicted_label"] = final_model_y_resampled.predict(X_test_y.drop(columns=["participant_id"], errors="ignore"))
 test_predictions_df_y_resampled["true_label"] = y_test_y.values
 test_predictions_df_y_resampled.to_csv(os.path.join(baseline_output_path, "test_predictions_y_resampled.csv"), index=False)
 
 # Calculate performance metrics for resampled youth model
 auc_y_resampled = roc_auc_score(y_test_y, final_model_y_resampled.decision_function(X_test_y.drop(columns=["participant_id"], errors="ignore")))
-f1_y_resampled = f1_score(y_test_y, test_predictions_y_resampled)
-accuracy_y_resampled = accuracy_score(y_test_y, test_predictions_y_resampled)
-precision_y_resampled = precision_score(y_test_y, test_predictions_y_resampled)
-print(f"Performance metrics for resampled youth model:")
+f1_y_resampled = f1_score(y_test_y, test_predictions_df_y_resampled["predicted_label"])
+accuracy_y_resampled = accuracy_score(y_test_y, test_predictions_df_y_resampled["predicted_label"])
+precision_y_resampled = precision_score(y_test_y, test_predictions_df_y_resampled["predicted_label"])
+print(f"Performance metrics for resampled youth model test set:")
 print(f"AUC: {auc_y_resampled:.4f}")
 print(f"F1 Score: {f1_y_resampled:.4f}")
 print(f"Accuracy: {accuracy_y_resampled:.4f}")
@@ -878,7 +866,9 @@ plt.close()
 final_model_p, best_hyperparams_p, train_predictions_p = train_final_model(
     X_train_p.drop(columns=["participant_id"], errors="ignore"),
     y_train_p,
-    model="SVM"
+    model="SVM",
+    inner_splits=5,
+    outer_splits=5
 )
 
 # Save final model, hyperparameters and predictions
@@ -888,22 +878,18 @@ train_predictions_df_p = pd.DataFrame(train_predictions_p, columns=["predicted_l
 train_predictions_df_p["true_label"] = y_train_p.values
 train_predictions_df_p.to_csv(os.path.join(baseline_output_path, "train_predictions_p.csv"), index=False)
 
-# Calculate performance metrics for parent labels on training set
-auc_train_p = roc_auc_score(y_train_p, final_model_p.decision_function(X_train_p.drop(columns=["participant_id"], errors="ignore")))
-print(f"Performance metrics for parent labels (training set):")
-print(f"AUC: {auc_train_p:.4f}")
-
 # Get predictions on the test set for parent labels
-test_predictions_p = final_model_p.predict(X_test_p.drop(columns=["participant_id"], errors="ignore"))
-test_predictions_df_p = pd.DataFrame(test_predictions_p, columns=["predicted_label"])
+test_predictions_p = final_model_p.predict_proba(X_test_p.drop(columns=["participant_id"], errors="ignore"))
+test_predictions_df_p = pd.DataFrame({"predicted_proba": test_predictions_p[:, 1]})
+test_predictions_df_p["predicted_label"] = final_model_p.predict(X_test_p.drop(columns=["participant_id"], errors="ignore"))
 test_predictions_df_p["true_label"] = y_test_p.values
 test_predictions_df_p.to_csv(os.path.join(baseline_output_path, "test_predictions_p.csv"), index=False)
 
 # Calculate performance metrics for parent labels
 auc_p = roc_auc_score(y_test_p, final_model_p.decision_function(X_test_p.drop(columns=["participant_id"], errors="ignore")))
-f1_p = f1_score(y_test_p, test_predictions_p)
-accuracy_p = accuracy_score(y_test_p, test_predictions_p)
-precision_p = precision_score(y_test_p, test_predictions_p)
+f1_p = f1_score(y_test_p, test_predictions_df_p["predicted_label"])
+accuracy_p = accuracy_score(y_test_p, test_predictions_df_p["predicted_label"])
+precision_p = precision_score(y_test_p, test_predictions_df_p["predicted_label"])
 print(f"Performance metrics for parent labels:")
 print(f"AUC: {auc_p:.4f}")
 print(f"F1 Score: {f1_p:.4f}")
@@ -925,7 +911,9 @@ plt.close()
 final_model_p_resampled, best_hyperparams_p_resampled, train_predictions_p_resampled = train_final_model(
     X_train_p_resampled,
     y_train_p_resampled,
-    model="SVM"
+    model="SVM",
+    inner_splits=5,
+    outer_splits=5
 )
 
 # Save final model, hyperparameters and predictions for resampled parent model
@@ -936,22 +924,18 @@ train_predictions_df_p_resampled = pd.DataFrame(train_predictions_p_resampled, c
 # Optional: reimport final model for evaluation
 final_model_p_resampled = joblib.load(os.path.join(baseline_output_path, "final_model_p_resampled.joblib"))
 
-# Calculate performance metrics for resampled parent model on training set
-auc_train_p_resampled = roc_auc_score(y_train_p_resampled, final_model_p_resampled.decision_function(X_train_p_resampled))
-print(f"Performance metrics for resampled parent model (training set):")
-print(f"AUC: {auc_train_p_resampled:.4f}")
-
 # Get predictions on the test set for resampled parent model
-test_predictions_p_resampled = final_model_p_resampled.predict(X_test_p.drop(columns=["participant_id"], errors="ignore"))
-test_predictions_df_p_resampled = pd.DataFrame(test_predictions_p_resampled, columns=["predicted_label"])
+test_predictions_p_resampled = final_model_p_resampled.predict_proba(X_test_p.drop(columns=["participant_id"], errors="ignore"))
+test_predictions_df_p_resampled = pd.DataFrame({"predicted_proba": test_predictions_p_resampled[:, 1]})
+test_predictions_df_p_resampled["predicted_label"] = final_model_p_resampled.predict(X_test_p.drop(columns=["participant_id"], errors="ignore"))
 test_predictions_df_p_resampled["true_label"] = y_test_p.values
 test_predictions_df_p_resampled.to_csv(os.path.join(baseline_output_path, "test_predictions_p_resampled.csv"), index=False)
 
 # Calculate performance metrics for resampled parent model
 auc_p_resampled = roc_auc_score(y_test_p, final_model_p_resampled.decision_function(X_test_p.drop(columns=["participant_id"], errors="ignore")))
-f1_p_resampled = f1_score(y_test_p, test_predictions_p_resampled)
-accuracy_p_resampled = accuracy_score(y_test_p, test_predictions_p_resampled)
-precision_p_resampled = precision_score(y_test_p, test_predictions_p_resampled)
+f1_p_resampled = f1_score(y_test_p, test_predictions_df_p_resampled["predicted_label"])
+accuracy_p_resampled = accuracy_score(y_test_p, test_predictions_df_p_resampled["predicted_label"])
+precision_p_resampled = precision_score(y_test_p, test_predictions_df_p_resampled["predicted_label"])
 print(f"Performance metrics for resampled parent model:")
 print(f"AUC: {auc_p_resampled:.4f}")
 print(f"F1 Score: {f1_p_resampled:.4f}")

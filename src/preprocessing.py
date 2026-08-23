@@ -522,6 +522,7 @@ def extract_fitbit_features_2(con, subject_timepoint_pairs, output_path=None, ov
                     daily_stats = daily_stats.reindex(date_range)
                     # Get percentage of missing values in the daily_stats DataFrame
                     missing_percentage = daily_stats.isna().mean().mean() * 100
+                    # Impute missing values using median imputation if there are enough non-missing values, otherwise use forward/backward fill
                     if daily_stats.shape[0] > 1 and daily_stats.notna().sum().sum() > daily_stats.shape[1]:
                         imputer = SimpleImputer(strategy="median")
                         daily_stats = pd.DataFrame(

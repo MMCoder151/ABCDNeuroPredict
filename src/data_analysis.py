@@ -109,6 +109,7 @@ def confound_analysis(data_pre, data_post, feature_cols, base_terms, confounds):
 
             row[f"{name}_partial_R2_pre"] = r2_pre
             row[f"{name}_partial_R2_post"] = r2_post
+            row[f"{name}_partial_R2_change"] = r2_post - r2_pre
 
             partial_pre[name].append(r2_pre)
             partial_post[name].append(r2_post)

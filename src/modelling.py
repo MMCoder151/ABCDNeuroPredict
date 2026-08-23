@@ -7,15 +7,11 @@ from lightgbm import LGBMClassifier
 from sklearn.svm import SVC
 import numpy as np
 from tqdm import tqdm
-import json
-import time
-import traceback
-from pathlib import Path
 from sklearn.metrics import roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.feature_selection import SelectKBest, mutual_info_classif, VarianceThreshold
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler, FunctionTransformer
+from sklearn.preprocessing import StandardScaler
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.feature_selection import SelectFromModel
 from sklearn.ensemble import ExtraTreesClassifier
@@ -277,7 +273,7 @@ def train_and_evaluate_models(X, y, search="random", outer_splits=10, inner_spli
 
     return nested_cv_scores
 
-def train_final_model(X, y, model):
+def train_final_model(X, y, model, outer_splits=10, inner_splits=10):
     ''' Trains the final model on the full dataset using the best hyperparameters identified from nested CV.
         1. Performs a hyperparameter search on the entire dataset to find the best parameters.
         2. Fits the model with the best hyperparameters on the full dataset to create a deployable model.
@@ -287,30 +283,91 @@ def train_final_model(X, y, model):
 
     all_models = define_models()
     model_to_train, param_grid = all_models[model]
-        
-    grouped_cv = StratifiedKFold(
-    n_splits=5,
-    shuffle=True,
-    random_state=42
-    )
 
-    searcher = GridSearchCV(
-                    estimator=model_to_train,
-                    param_grid=param_grid,
-                    cv=grouped_cv,
-                    scoring="roc_auc",
-                    n_jobs=3,
-                    verbose = 3
-                )
-    searcher.fit(X, y)
-    best_model = searcher.best_estimator_
-    best_hyperparams = searcher.best_params_
-    train_predictions = best_model.predict_proba(X)[:, 1]
+    # Define nested cross-validation structure
+    cv_struct = {
+        "outer_cv": StratifiedKFold(
+            n_splits=outer_splits,
+            shuffle=True,
+            random_state=42
+        ),
+        "inner_cv": StratifiedKFold(
+            n_splits=inner_splits,
+            shuffle=True,
+            random_state=42
+        )
+    }
+
+    # Helper function to safely index dataframes or numpy arrays
+    def _safe_index(data, indices):
+        if hasattr(data, "iloc"):
+            return data.iloc[indices]
+        return data[indices]
+
+    X_work = X.copy() if hasattr(X, "copy") else X
+    if "subtype" in X_work.columns:
+        strat = X_work["subtype"]
+        X_work = X_work.drop(columns=["subtype"])
+    else:
+        print("Expected 'subtype' column in features for stratification during CV. Stratifying according to labels instead.")
+        strat = y
+
+    outer_best_params = []
+    outer_inner_best_scores = []
+    oof_pred = np.full(len(y), np.nan)
+    outer_scores = []
+
+    # Nested CV Setup: inner tuning inside each outer training split
+    for train_idx, test_idx in tqdm(cv_struct["outer_cv"].split(X_work, y=strat), desc=f"Running nested CV for {model}"):
+        # Safely index data for current fold
+        X_train = _safe_index(X_work, train_idx)
+        y_train = _safe_index(y, train_idx)
+        X_test = _safe_index(X_work, test_idx)
+        y_test = _safe_index(y, test_idx)
+
+        fold_searcher = GridSearchCV(
+            estimator=clone(model_to_train),
+            param_grid=param_grid,
+            cv=cv_struct["inner_cv"],
+            scoring="roc_auc",
+            n_jobs=3,
+            verbose=3,
+        )
+        fold_searcher.fit(X_train, y_train)
+
+        outer_best_params.append(fold_searcher.best_params_)
+        outer_inner_best_scores.append(float(fold_searcher.best_score_))
+
+        proba = fold_searcher.predict_proba(X_test)[:, 1]
+        oof_pred[test_idx] = proba
+        outer_scores.append(roc_auc_score(y_test, proba))
+
+    # Final hyperparameter search on the entire dataset to find the best parameters for the final model
+    final_search = GridSearchCV(
+        estimator=clone(model_to_train),
+        param_grid=param_grid,
+        cv=cv_struct["inner_cv"],
+        scoring="roc_auc",
+        n_jobs=3,
+        verbose=3,
+    )
+    final_search.fit(X_work, y)
+    best_hyperparams = final_search.best_params_
+    best_inner_score = float(final_search.best_score_)
+
+    # Train the final model on the entire dataset using the selected hyperparameters
+    final_model = clone(model_to_train).set_params(**best_hyperparams)
+    final_model.fit(X_work, y)
+
+    # Evaluate the final model on the entire dataset to get the training predictions
+    train_predictions = final_model.predict_proba(X_work)[:, 1]
 
     print(f"Best hyperparameters for final model: {best_hyperparams}")
-    print(f"Best inner-CV AUC during final training: {float(searcher.best_score_):.4f}")
+    print(f"Best inner-CV AUC during final training: {best_inner_score:.4f}")
+    print(f"Average outer-CV AUC during nested CV: {np.mean(outer_scores):.4f} ± {np.std(outer_scores):.4f}")
+    print(f"Final model AUC on entire training set: {roc_auc_score(y, train_predictions):.4f}")
 
-    return best_model, best_hyperparams, train_predictions
+    return final_model, best_hyperparams, train_predictions
 
 def define_regression_models():
     models = {
